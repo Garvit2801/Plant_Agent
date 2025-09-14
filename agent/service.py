@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import os
 import json
-import math
+import logging
+import glob
 import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -14,7 +15,9 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-# --- Try to import your planner (preferred). Provide safe fallbacks if missing.
+# ------------------------------------------------------------
+# Optional planner import (fallbacks provided if not available)
+# ------------------------------------------------------------
 try:
     from agent.planner import build_stage_plan, propose_actions, build_ui_payload
 except Exception:
@@ -88,9 +91,7 @@ except Exception:
 # Configuration / constants
 # -------------------------
 DATA_FILE = os.getenv("DATA_FILE", "data/cement_240TPD_KPI_mockup_v2.xlsx")
-CONFIG_FILE = os.getenv("CONFIG_FILE", "plant.yaml")
 SERVICE_VERSION = os.getenv("SERVICE_VERSION", "1.0.0")
-
 PORT = int(os.getenv("PORT", "8080"))
 
 USE_MOCK = int(os.getenv("USE_MOCK", "1"))           # 1 => use in-process mock plant
@@ -111,28 +112,35 @@ app.add_middleware(
 )
 
 # -------------------------
-# Models
+# Robust plant.yaml resolver
 # -------------------------
-class RoutineOptimizeReq(BaseModel):
-    snapshot: Dict[str, Any]
+def _resolve_config_path() -> str:
+    """Find plant.yaml via env or common locations and log helpful context."""
+    p = os.getenv("PLANT_CONFIG")
+    if p and os.path.exists(p):
+        logging.info(f"PLANT_CONFIG env set, using: {p}")
+        return p
+    candidates = [
+        "/app/config/plant.yaml",
+        "/app/plant.yaml",
+        "config/plant.yaml",
+        "plant.yaml",
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            logging.info(f"Found plant.yaml at: {c}")
+            return c
+    try:
+        root_listing = sorted(glob.glob("/app/**/*", recursive=True))[:50]
+        logging.error("plant.yaml not found. Sample /app listing: %s", root_listing)
+    except Exception as e:
+        logging.error("plant.yaml not found and listing failed: %s", e)
+    raise FileNotFoundError("Missing config: plant.yaml")
 
-class LoadOptimizeReq(BaseModel):
-    snapshot: Dict[str, Any]
-    direction: str = Field(..., pattern="^(up|down)$")
-    delta_pct: float = Field(..., gt=0, le=50)
-
-class ApplyStageReq(BaseModel):
-    current: Optional[Dict[str, Any]] = None
-    setpoints: Dict[str, float]
-
-class SnapshotSetReq(BaseModel):
-    setpoints: Dict[str, float]
-
-# -------------------------
-# Config cache
-# -------------------------
+# Config cache keyed by resolved path
 _config_cache: Dict[str, Any] = {}
 _config_mtime: Optional[float] = None
+_config_path: Optional[str] = None
 
 def _stat_mtime(path: str) -> Optional[float]:
     try:
@@ -141,14 +149,18 @@ def _stat_mtime(path: str) -> Optional[float]:
         return None
 
 def get_config() -> Dict[str, Any]:
-    global _config_cache, _config_mtime
-    mt = _stat_mtime(CONFIG_FILE)
+    """Load YAML once; auto-reload if the file changes."""
+    global _config_cache, _config_mtime, _config_path
+    resolved = _resolve_config_path()
+    mt = _stat_mtime(resolved)
     if not mt:
-        raise HTTPException(status_code=500, detail=f"Missing config: {CONFIG_FILE}")
-    if _config_mtime != mt or not _config_cache:
-        with open(CONFIG_FILE, "r") as f:
+        raise HTTPException(status_code=500, detail=f"Missing config: {os.path.basename(resolved)}")
+    if _config_path != resolved or _config_mtime != mt or not _config_cache:
+        with open(resolved, "r") as f:
             _config_cache = yaml.safe_load(f) or {}
         _config_mtime = mt
+        _config_path = resolved
+        logging.info("Loaded plant config keys: %s", list(_config_cache.keys()))
     return _config_cache
 
 # -------------------------
@@ -208,6 +220,24 @@ if USE_MOCK:
     threading.Thread(target=_mock_loop, daemon=True).start()
 
 # -------------------------
+# Pydantic request models
+# -------------------------
+class RoutineOptimizeReq(BaseModel):
+    snapshot: Dict[str, Any]
+
+class LoadOptimizeReq(BaseModel):
+    snapshot: Dict[str, Any]
+    direction: str = Field(..., pattern="^(up|down)$")
+    delta_pct: float = Field(..., gt=0, le=50)
+
+class ApplyStageReq(BaseModel):
+    current: Optional[Dict[str, Any]] = None
+    setpoints: Dict[str, float]
+
+class SnapshotSetReq(BaseModel):
+    setpoints: Dict[str, float]
+
+# -------------------------
 # Routes
 # -------------------------
 @app.get("/")
@@ -220,8 +250,9 @@ def root():
         "data_file": DATA_FILE,
         "data_status": status,
         "sheets": sheets,
+        "health": "/healthz",
         "endpoints": [
-            "/healthz", "/version", "/config",
+            "/healthz", "/health", "/version", "/config", "/debug/config",
             "/snapshot", "/snapshot/set",
             "/optimize/routine", "/optimize/load",
             "/actuate/apply_stage", "/actuate/rollback",
@@ -241,9 +272,34 @@ def healthz():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# NEW: friendly alias + HEAD support
+@app.get("/health")
+def health():
+    return healthz()
+
+@app.head("/healthz")
+def healthz_head():
+    try:
+        _ = get_config()
+        return {}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/config")
 def config_get():
     return get_config()
+
+@app.get("/debug/config")
+def debug_config():
+    """Helps verify resolution in Cloud Run."""
+    known = ["/app/config/plant.yaml", "/app/plant.yaml", "config/plant.yaml", "plant.yaml"]
+    return {
+        "PLANT_CONFIG_env": os.getenv("PLANT_CONFIG"),
+        "known_locations": known,
+        "exists": {p: os.path.exists(p) for p in known},
+        "resolved_path": _resolve_config_path() if os.getenv("PLANT_CONFIG") or any(os.path.exists(p) for p in known) else None,
+        "keys": list(get_config().keys()),
+    }
 
 @app.get("/snapshot")
 def snapshot():
@@ -271,7 +327,7 @@ def optimize_routine(req: RoutineOptimizeReq):
 
     s = dict(req.snapshot)
 
-    # Build supports-only energy trims (hold_in_routine respected)
+    # Build supports-only energy trims (respect hold_in_routine in config)
     recipe: Dict[str, float] = {}
     for lever, meta in levers.items():
         if meta.get("hold_in_routine"):
@@ -279,9 +335,11 @@ def optimize_routine(req: RoutineOptimizeReq):
         if lever == "separator_dp_pa":
             recipe[lever] = 600.0
         elif lever == "id_fan_flow_Nm3_h":
-            recipe[lever] = max(meta.get("min", 0), min(meta.get("max", 1e12), s.get("id_fan_flow_Nm3_h", 150000) * 0.98))
+            base = s.get("id_fan_flow_Nm3_h", 150000) * 0.98
+            recipe[lever] = max(meta.get("min", 0), min(meta.get("max", 1e12), base))
         elif lever == "cooler_airflow_Nm3_h":
-            recipe[lever] = max(meta.get("min", 0), min(meta.get("max", 1e12), s.get("cooler_airflow_Nm3_h", 220000) * 0.98))
+            base = s.get("cooler_airflow_Nm3_h", 220000) * 0.98
+            recipe[lever] = max(meta.get("min", 0), min(meta.get("max", 1e12), base))
 
     proposal_list = propose_actions(s, recipe, levers)
     proposal = proposal_list[0] if proposal_list else {}
