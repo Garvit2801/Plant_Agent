@@ -1,1 +1,42 @@
-# cloudbuild.yaml …(your content)…
+# cloudbuild.yaml
+# Builds and deploys the plant-agent to Cloud Run using Artifact Registry.
+
+timeout: "1200s"
+
+substitutions:
+  _REGION: asia-south2                 # AR & Cloud Run region
+  _REPO: plant-agent                   # Artifact Registry repo (you created earlier)
+  _IMAGE: agent                        # Image name in the repo
+  _TAG: v${SHORT_SHA}                  # Tag per commit
+  _SERVICE: plant-agent                # Cloud Run service name
+
+steps:
+  # 1) Build image
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -t
+      - asia-south2-docker.pkg.dev/$PROJECT_ID/$_REPO/$_IMAGE:$_TAG
+      - .
+
+  # 2) Push image
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - asia-south2-docker.pkg.dev/$PROJECT_ID/$_REPO/$_IMAGE:$_TAG
+
+  # 3) Deploy to Cloud Run
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - $_SERVICE
+      - --image=asia-south2-docker.pkg.dev/$PROJECT_ID/$_REPO/$_IMAGE:$_TAG
+      - --region=$_REGION
+      - --allow-unauthenticated
+      - --set-env-vars=USE_MOCK=1,MOCK_TICK_SEC=5,APPLY_ENABLED=1
+      - --platform=managed
+
+images:
+  - asia-south2-docker.pkg.dev/$PROJECT_ID/$_REPO/$_IMAGE:$_TAG
