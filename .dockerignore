@@ -8,4 +8,5 @@ __pycache__/
 .git
 .gitignore
 data/run_log.csv
+config/plant.yaml
 IGNORE
