@@ -1,0 +1,20 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.env
+.DS_Store
+
+# Build & editor
+dist/
+build/
+.vscode/
+.idea/
+
+# Data (keep small mock files only)
+data/run_log.csv
+exports/
+*.parquet
+
+# Optional: ignore large Excel if you don’t want it in git
+# data/cement_240TPD_KPI_mockup_v2.xlsx

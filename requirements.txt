@@ -1,0 +1,26 @@
+# API + config
+fastapi==0.116.1
+uvicorn==0.35.0
+pydantic==2.11.7
+pyyaml>=6.0.2
+
+# Numerics / ML
+numpy==2.3.3
+pandas==2.3.2
+scikit-learn>=1.5.0
+xgboost>=2.1.0
+lightgbm>=4.3.0
+
+# Plant I/O
+opcua==0.98.13          # <-- replaces "python-opcua"
+pymodbus>=3.6.6
+
+# Utils
+tqdm>=4.66.4
+
+# Logging
+loguru>=0.6.0
+asyncua>=0.9.123
+openpyxl==3.1.5
+requests>=2.32.0
+

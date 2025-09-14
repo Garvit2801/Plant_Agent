@@ -1,0 +1,11 @@
+# .dockerignore
+cat > .dockerignore <<'IGNORE'
+# Keep data/ so the Excel ships in the image; only ignore the run log.
+.venv
+__pycache__/
+*.pyc
+.env
+.git
+.gitignore
+data/run_log.csv
+IGNORE
