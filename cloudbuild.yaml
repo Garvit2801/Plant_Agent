@@ -40,3 +40,6 @@ steps:
 
 images:
   - asia-south2-docker.pkg.dev/$PROJECT_ID/$_REPO/$_IMAGE:$_TAG
+
+options:
+  defaultLogsBucketBehavior: REGIONAL_USER_OWNED_BUCKET
