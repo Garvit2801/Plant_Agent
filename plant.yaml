@@ -1,0 +1,45 @@
+# config/plant.yaml
+goal:
+  routine: minimize_specific_power_kwh_per_ton
+  load_change: staged_to_target_tph_then_minimize_kwhpt
+
+match_tags:
+  production_tph:            {tol_pct: 5}
+  blain_fineness_m2_per_kg:  {tol_abs: 15}
+  separator_dp_pa:           {tol_abs: 60}
+  o2_percent:                {tol_abs: 0.4}
+  id_fan_flow_Nm3_h:         {tol_pct: 5}
+  id_fan_dp_pa_meas:         {tol_abs: 150}
+  burning_zone_temp_c:       {tol_abs: 20}
+  kiln_inlet_temp_c:         {tol_abs: 15}
+  cooler_out_temp_c:         {tol_abs: 8}
+  secondary_air_temp_c:      {tol_abs: 12}
+  bagfilter_dp_pa_meas:      {tol_abs: 150}
+  cement_mill_outlet_temp_c: {tol_abs: 10}
+  id_fan_load_factor_percent:{tol_abs: 5}
+  co_ppm:                    {tol_abs: 60}
+  nox_mg_Nm3:                {tol_abs: 80}
+  stack_dust_mg_Nm3:         {tol_abs: 6}
+window_minutes: 60
+min_stability_minutes: 30
+
+levers:
+  kiln_feed_tph:         {min: 7.5,   max: 12.5,  step_pct: 3,  hold_min: 10, hold_in_routine: true}
+  separator_dp_pa:       {min: 300,   max: 1200,  step_abs: 20, hold_min: 10}
+  id_fan_flow_Nm3_h:     {min: 120000,max: 220000,step_pct: 3,  hold_min: 10, track_o2_band: [2.8, 4.5]}
+  cooler_airflow_Nm3_h:  {min: 120000,max: 350000,step_pct: 5,  hold_min: 10}
+  kiln_speed_rpm:        {min: 3.0,   max: 4.2,   step_abs: 0.05, hold_min: 15, hold_in_routine: true}
+
+constraints:
+  o2_percent:                 {min: 2.8, max: 4.5}
+  co_ppm:                     {max: 180}
+  bagfilter_dp_pa_meas:       {max: 1800}
+  cement_mill_outlet_temp_c:  {min: 90, max: 120}
+  burning_zone_temp_c:        {min: 1320, max: 1480}
+  stack_dust_mg_Nm3:          {max: 30}
+  nox_mg_Nm3:                 {max: 800}
+  id_fan_load_factor_percent: {max: 95}
+
+cadence:
+  decision_interval_min: 10
+  stages_max: 4
