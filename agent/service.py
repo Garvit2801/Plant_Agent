@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 import pandas as pd
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -97,6 +97,14 @@ PORT = int(os.getenv("PORT", "8080"))
 USE_MOCK = int(os.getenv("USE_MOCK", "1"))           # 1 => use in-process mock plant
 MOCK_TICK_SEC = float(os.getenv("MOCK_TICK_SEC", "5"))
 APPLY_ENABLED = int(os.getenv("APPLY_ENABLED", "1")) # 1 => /actuate/* mutates the mock plant
+
+# Project for BigQuery (prefer Cloud Run-provided envs)
+PROJECT_ID = (
+    os.getenv("PROJECT_ID")
+    or os.getenv("GOOGLE_CLOUD_PROJECT")
+    or os.getenv("GCP_PROJECT")
+    or ""
+)
 
 # -------------------------
 # App & CORS
@@ -238,6 +246,29 @@ class SnapshotSetReq(BaseModel):
     setpoints: Dict[str, float]
 
 # -------------------------
+# BigQuery client (optional at runtime)
+# -------------------------
+_BQ_ENABLED = False
+_BQ_ERR: Optional[str] = None
+try:
+    from google.cloud import bigquery  # type: ignore
+    _bq_client = bigquery.Client()  # project auto-detected on Cloud Run
+    _BQ_ENABLED = True
+except Exception as e:
+    _bq_client = None
+    _BQ_ENABLED = False
+    _BQ_ERR = f"BigQuery client not initialized: {e}"
+
+def _bq_table_path() -> str:
+    # Allow override via env; else default to <project>.plant_ops.snapshots
+    tbl = os.getenv("BQ_SNAPSHOTS_TABLE")
+    if tbl:
+        return tbl
+    if not PROJECT_ID:
+        raise HTTPException(status_code=500, detail="PROJECT_ID not found for BigQuery table")
+    return f"{PROJECT_ID}.plant_ops.snapshots"
+
+# -------------------------
 # Routes
 # -------------------------
 @app.get("/")
@@ -256,8 +287,9 @@ def root():
             "/snapshot", "/snapshot/set",
             "/optimize/routine", "/optimize/load",
             "/actuate/apply_stage", "/actuate/rollback",
-            "/metrics",
+            "/ingest", "/metrics",
         ],
+        "bq_enabled": _BQ_ENABLED,
     }
 
 @app.get("/version")
@@ -299,6 +331,10 @@ def debug_config():
         "exists": {p: os.path.exists(p) for p in known},
         "resolved_path": _resolve_config_path() if os.getenv("PLANT_CONFIG") or any(os.path.exists(p) for p in known) else None,
         "keys": list(get_config().keys()),
+        "bq_enabled": _BQ_ENABLED,
+        "bq_error": _BQ_ERR,
+        "bq_table": os.getenv("BQ_SNAPSHOTS_TABLE", f"{PROJECT_ID}.plant_ops.snapshots" if PROJECT_ID else None),
+        "project_id": PROJECT_ID or None,
     }
 
 @app.get("/snapshot")
@@ -431,6 +467,55 @@ def actuate_rollback():
     if USE_MOCK:
         return {"ok": True, "note": "mock: nothing to rollback"}
     return {"ok": True, "note": "Live plant rollback not implemented"}
+
+# -------------------------
+# NEW: /ingest → BigQuery
+# -------------------------
+@app.post("/ingest")
+def ingest(doc: dict = Body(default={})):
+    """
+    Upserts a single row into BigQuery table (default: <project>.plant_ops.snapshots).
+    Body may contain {"snapshot": {...}}; if absent, the current /snapshot is fetched.
+    """
+    if not _BQ_ENABLED or _bq_client is None:
+        raise HTTPException(status_code=500, detail=_BQ_ERR or "BigQuery unavailable")
+
+    try:
+        snap = doc.get("snapshot") or snapshot()
+        # basic presence check
+        required = [
+            "production_tph", "kiln_feed_tph", "separator_dp_pa",
+            "id_fan_flow_Nm3_h", "cooler_airflow_Nm3_h",
+            "kiln_speed_rpm", "o2_percent", "specific_power_kwh_per_ton",
+        ]
+        for k in required:
+            if k not in snap:
+                raise HTTPException(status_code=400, detail=f"snapshot missing field: {k}")
+
+        row = {
+            "ts": pd.Timestamp.utcnow().isoformat(),
+            "source": doc.get("source", "scheduler"),
+            "production_tph": float(snap["production_tph"]),
+            "kiln_feed_tph": float(snap["kiln_feed_tph"]),
+            "separator_dp_pa": float(snap["separator_dp_pa"]),
+            "id_fan_flow_Nm3_h": float(snap["id_fan_flow_Nm3_h"]),
+            "cooler_airflow_Nm3_h": float(snap["cooler_airflow_Nm3_h"]),
+            "kiln_speed_rpm": float(snap["kiln_speed_rpm"]),
+            "o2_percent": float(snap["o2_percent"]),
+            "specific_power_kwh_per_ton": float(snap["specific_power_kwh_per_ton"]),
+            "raw": snap,  # JSON column in BQ
+        }
+
+        table = _bq_table_path()
+        errors = _bq_client.insert_rows_json(table, [row])  # type: ignore
+        if errors:
+            # errors is a list of row errors; surface the first one
+            raise HTTPException(status_code=500, detail=f"BigQuery insert failed: {errors}")
+        return {"ok": True, "table": table}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"/ingest error: {e}")
 
 @app.get("/metrics")
 def metrics():
