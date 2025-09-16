@@ -107,6 +107,10 @@ PROJECT_ID = (
     or ""
 )
 
+# BigQuery location + model name (added)
+BQ_LOCATION = os.getenv("BQ_LOCATION", "asia-south2")
+MODEL_NAME = os.getenv("BQ_MODEL_NAME", "spower_reg")  # stable model name in dataset plant_ops
+
 # -------------------------
 # App & CORS
 # -------------------------
@@ -309,6 +313,31 @@ def _normalize_json_for_field(value: Any, field_type: Optional[str]) -> Any:
         return parsed
     return value
 
+# Added: build fully-qualified model name
+def _bq_model_fqn() -> str:
+    if not PROJECT_ID:
+        raise HTTPException(status_code=500, detail="PROJECT_ID not found for BigQuery model")
+    return f"{PROJECT_ID}.plant_ops.{MODEL_NAME}"
+
+# Added: latest snapshot from BigQuery (for non-mock use or fallback)
+def _latest_snapshot_from_bq() -> Dict[str, Any]:
+    if not _BQ_ENABLED or _bq_client is None:
+        return {}
+    table = _bq_table_path()
+    sql = f"""
+      SELECT
+        production_tph, kiln_feed_tph, separator_dp_pa,
+        id_fan_flow_Nm3_h, cooler_airflow_Nm3_h,
+        kiln_speed_rpm, o2_percent,
+        specific_power_kwh_per_ton
+      FROM `{table}`
+      WHERE production_tph IS NOT NULL AND o2_percent IS NOT NULL
+      ORDER BY ts DESC
+      LIMIT 1
+    """
+    rows = list(_bq_client.query(sql, location=BQ_LOCATION).result())
+    return dict(rows[0]) if rows else {}
+
 # -------------------------
 # Routes
 # -------------------------
@@ -329,6 +358,7 @@ def root():
             "/optimize/routine", "/optimize/load",
             "/actuate/apply_stage", "/actuate/rollback",
             "/ingest", "/metrics",
+            "/predict/spower",  # added to advertise
         ],
         "bq_enabled": _BQ_ENABLED,
     }
@@ -641,6 +671,82 @@ def ingest(doc: dict = Body(default={})):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"/ingest error: {e}")
+
+# -------------------------
+# NEW: /predict/spower → BQML (with safe fallback)
+# -------------------------
+@app.post("/predict/spower")
+def predict_spower_route(doc: dict = Body(default={})):
+    """
+    Returns predicted specific_power_kwh_per_ton using BQML model plant_ops.spower_reg.
+    Body: {"snapshot": {...}} (optional). If absent, uses mock state (if USE_MOCK) else latest BQ snapshot.
+    """
+    # Build snapshot input
+    snap = (doc.get("snapshot") or {})
+    if not snap:
+        if USE_MOCK:
+            with _state_lock:
+                snap = dict(_STATE)
+        else:
+            snap = _latest_snapshot_from_bq()
+
+    # Coerce numerics (BQ accepts NULLs if some features are missing)
+    def f(x):
+        try:
+            return float(x)
+        except Exception:
+            return None
+
+    params = {
+        "production_tph":       f(snap.get("production_tph")),
+        "kiln_feed_tph":        f(snap.get("kiln_feed_tph")),
+        "separator_dp_pa":      f(snap.get("separator_dp_pa")),
+        "id_fan_flow_Nm3_h":    f(snap.get("id_fan_flow_Nm3_h")),
+        "cooler_airflow_Nm3_h": f(snap.get("cooler_airflow_Nm3_h")),
+        "kiln_speed_rpm":       f(snap.get("kiln_speed_rpm")),
+        "o2_percent":           f(snap.get("o2_percent")),
+    }
+
+    # If BigQuery is not enabled, return mock prediction so UI still works
+    if not _BQ_ENABLED or _bq_client is None:
+        pred = {"predicted_specific_power_kwh_per_ton": predict_specific_power({**snap})}
+        return {"input": params, "prediction": pred, "note": "BQ disabled; mock prediction"}
+
+    # Build ML.PREDICT query
+    model_fqn = _bq_model_fqn()
+    from google.cloud import bigquery  # type: ignore
+
+    sql = f"""
+      SELECT * FROM ML.PREDICT(MODEL `{model_fqn}`,
+        (SELECT
+          @production_tph        AS production_tph,
+          @kiln_feed_tph         AS kiln_feed_tph,
+          @separator_dp_pa       AS separator_dp_pa,
+          @id_fan_flow_Nm3_h     AS id_fan_flow_Nm3_h,
+          @cooler_airflow_Nm3_h  AS cooler_airflow_Nm3_h,
+          @kiln_speed_rpm        AS kiln_speed_rpm,
+          @o2_percent            AS o2_percent
+        )
+      )
+    """
+    job = _bq_client.query(
+        sql,
+        location=BQ_LOCATION,
+        job_config=bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("production_tph", "FLOAT64", params["production_tph"]),
+                bigquery.ScalarQueryParameter("kiln_feed_tph", "FLOAT64", params["kiln_feed_tph"]),
+                bigquery.ScalarQueryParameter("separator_dp_pa", "FLOAT64", params["separator_dp_pa"]),
+                bigquery.ScalarQueryParameter("id_fan_flow_Nm3_h", "FLOAT64", params["id_fan_flow_Nm3_h"]),
+                bigquery.ScalarQueryParameter("cooler_airflow_Nm3_h", "FLOAT64", params["cooler_airflow_Nm3_h"]),
+                bigquery.ScalarQueryParameter("kiln_speed_rpm", "FLOAT64", params["kiln_speed_rpm"]),
+                bigquery.ScalarQueryParameter("o2_percent", "FLOAT64", params["o2_percent"]),
+            ]
+        ),
+    )
+    rows = list(job.result())
+    pred = dict(rows[0]) if rows else {}
+    return {"input": params, "prediction": pred}
 
 @app.get("/metrics")
 def metrics():
