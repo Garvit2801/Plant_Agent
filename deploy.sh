@@ -10,8 +10,10 @@ SCHED_REGION="${SCHED_REGION:-asia-south1}"        # Cloud Scheduler region
 SERVICE="${SERVICE:-plant-agent}"                  # Cloud Run service name
 
 REPO="${REPO:-plant-agent}"                        # Artifact Registry repo name
-AR_REGION="${AR_REGION:-$RUN_REGION}"              # Artifact Registry region
-IMAGE="asia-${AR_REGION}.docker.pkg.dev/${PROJECT_ID}/${REPO}/${SERVICE}"
+AR_REGION="${AR_REGION:-$RUN_REGION}"              # Artifact Registry region (e.g., asia-south2)
+AR_LOC="$AR_REGION"                                # exact location, no extra prefix
+IMAGE_HOST="${AR_LOC}-docker.pkg.dev"              # correct AR hostname
+IMAGE="${IMAGE_HOST}/${PROJECT_ID}/${REPO}/${SERVICE}"
 TAG="${TAG:-$(date +%Y%m%d-%H%M%S)}"
 IMAGE_URI="${IMAGE}:${TAG}"
 
@@ -30,22 +32,21 @@ RUN_SA="${RUN_SA:-$(gcloud iam service-accounts list --format='value(email)' \
 RUN_SA="${RUN_SA:-${PROJECT_ID}-compute@developer.gserviceaccount.com}"
 
 SCHED_SA="${SCHED_SA:-plant-agent-scheduler@${PROJECT_ID}.iam.gserviceaccount.com}"
-
-# Scheduler job name
 JOB_NAME="${JOB_NAME:-plant-agent-ingest}"
 
 echo "Project:     $PROJECT_ID"
 echo "Run region:  $RUN_REGION"
-echo "Repo:        $REPO"
+echo "AR region:   $AR_LOC"
+echo "Image host:  $IMAGE_HOST"
 echo "Image:       $IMAGE_URI"
 echo "Service:     $SERVICE"
 echo "Run SA:      $RUN_SA"
 echo "Sched SA:    $SCHED_SA"
-echo "Sched job:   $JOB_NAME"
+echo "Job Name:    $JOB_NAME"
 echo
 
 # -----------------------------
-# Enable required services
+# Enable services
 # -----------------------------
 gcloud services enable \
   run.googleapis.com \
@@ -57,23 +58,23 @@ gcloud services enable \
   logging.googleapis.com
 
 # -----------------------------
-# Ensure Artifact Registry repo
+# Artifact Registry repo
 # -----------------------------
 if ! gcloud artifacts repositories describe "$REPO" \
-  --location="asia-${AR_REGION}" >/dev/null 2>&1; then
+  --location="$AR_LOC" >/dev/null 2>&1; then
   gcloud artifacts repositories create "$REPO" \
     --repository-format=docker \
-    --location="asia-${AR_REGION}" \
+    --location="$AR_LOC" \
     --description="Container repo for ${SERVICE}"
 fi
 
 # -----------------------------
-# Build & push image (Cloud Build)
+# Build & push
 # -----------------------------
 gcloud builds submit --tag "$IMAGE_URI"
 
 # -----------------------------
-# Deploy to Cloud Run
+# Deploy Cloud Run
 # -----------------------------
 ENV_FLAGS=(
   "--set-env-vars=SERVICE_VERSION=${ENV_SERVICE_VERSION}"
@@ -83,8 +84,6 @@ ENV_FLAGS=(
   "--set-env-vars=USE_MOCK=${ENV_USE_MOCK}"
   "--set-env-vars=APPLY_ENABLED=${ENV_APPLY_ENABLED}"
 )
-
-# Optional: pass a fully-qualified BQ table override if you use it
 if [[ -n "$ENV_BQ_SNAPSHOTS_TABLE" ]]; then
   ENV_FLAGS+=("--set-env-vars=BQ_SNAPSHOTS_TABLE=${ENV_BQ_SNAPSHOTS_TABLE}")
 fi
@@ -103,13 +102,13 @@ gcloud run deploy "$SERVICE" \
   "${ENV_FLAGS[@]}"
 
 # -----------------------------
-# Fetch service URL
+# URL
 # -----------------------------
 BASE_URL="$(gcloud run services describe "$SERVICE" --region="$RUN_REGION" --format='value(status.url)')"
 echo "Service URL: $BASE_URL"
 
 # -----------------------------
-# Allow scheduler SA to invoke
+# IAM for Scheduler
 # -----------------------------
 gcloud run services add-iam-policy-binding "$SERVICE" \
   --region="$RUN_REGION" \
@@ -117,7 +116,7 @@ gcloud run services add-iam-policy-binding "$SERVICE" \
   --role="roles/run.invoker"
 
 # -----------------------------
-# Create/update Scheduler job
+# Scheduler job
 # -----------------------------
 if gcloud scheduler jobs describe "$JOB_NAME" --location="$SCHED_REGION" >/dev/null 2>&1; then
   gcloud scheduler jobs update http "$JOB_NAME" \
@@ -136,7 +135,7 @@ else
 fi
 
 # -----------------------------
-# Smoke test
+# Smoke tests
 # -----------------------------
 set +e
 echo
@@ -149,3 +148,14 @@ curl -sS -X POST "${BASE_URL}/ingest" | jq . || true
 
 echo
 echo "Done."
+
+# PROJECT_ID="my-plant-agent-123456"
+# USER_EMAIL="$(gcloud config get-value account)"
+# PROJECT_NUMBER="$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')"
+# DEFAULT_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+
+# gcloud iam service-accounts add-iam-policy-binding "$DEFAULT_SA" \
+#   --member="user:${USER_EMAIL}" \
+#   --role="roles/iam.serviceAccountUser"
+
+# ./deploy.sh
