@@ -83,6 +83,7 @@ ENV_FLAGS=(
   "--set-env-vars=BQ_LOCATION=${ENV_BQ_LOCATION}"
   "--set-env-vars=USE_MOCK=${ENV_USE_MOCK}"
   "--set-env-vars=APPLY_ENABLED=${ENV_APPLY_ENABLED}"
+  "--set-env-vars=SKIP_RAW=${ENV_SKIP_RAW:-0}
 )
 if [[ -n "$ENV_BQ_SNAPSHOTS_TABLE" ]]; then
   ENV_FLAGS+=("--set-env-vars=BQ_SNAPSHOTS_TABLE=${ENV_BQ_SNAPSHOTS_TABLE}")

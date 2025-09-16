@@ -149,7 +149,7 @@ def _resolve_config_path() -> str:
 # Config cache keyed by resolved path
 _config_cache: Dict[str, Any] = {}
 _config_mtime: Optional[float] = None
-_config_path: Optional[str] = None
+_config_path: Optional[float] = None
 
 def _stat_mtime(path: str) -> Optional[float]:
     try:
@@ -350,6 +350,19 @@ def healthz():
 def health():
     return healthz()
 
+# Aliases so every health endpoint works the same
+@app.get("/healthz")
+def healthz_get():
+    return healthz()
+
+@app.head("/healthz")
+def healthz_head_alias():
+    return healthz_head()
+
+@app.get("/_ah/health")
+def gfe_health():
+    return {"ok": True}
+
 @app.head("/healthz")
 def healthz_head():
     try:
@@ -541,8 +554,11 @@ def ingest(doc: dict = Body(default={})):
         except Exception:
             raw_field_type = None
 
+        # >>> Added: allow skipping 'raw' via env flag
+        skip_raw = os.getenv("SKIP_RAW") in ("1", "true", "yes")
+
         # Prepare row with robust timestamp and normalized 'raw'
-        row = {
+        row: Dict[str, Any] = {
             "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "source": doc.get("source", "scheduler"),
             "production_tph": float(snap["production_tph"]),
@@ -553,13 +569,73 @@ def ingest(doc: dict = Body(default={})):
             "kiln_speed_rpm": float(snap["kiln_speed_rpm"]),
             "o2_percent": float(snap["o2_percent"]),
             "specific_power_kwh_per_ton": float(snap["specific_power_kwh_per_ton"]),
-            "raw": _normalize_json_for_field(snap, raw_field_type),
         }
+        if not skip_raw:
+            row["raw"] = _normalize_json_for_field(snap, raw_field_type)
 
+        # First attempt: streaming insert (fast path)
         errors = _bq_client.insert_rows_json(table, [row])  # type: ignore
         if errors:
-            # errors is a list of row errors; surface the first one
-            raise HTTPException(status_code=500, detail=f"BigQuery insert failed: {errors}")
+            # If error looks like raw not record (schema mismatch), fall back to parameterized SQL
+            msg = json.dumps(errors)
+            need_sql_fallback = ("not a record" in msg.lower()) or ("invalid" in msg.lower())
+            if not need_sql_fallback:
+                raise HTTPException(status_code=500, detail=f"BigQuery insert failed: {errors}")
+
+            # >>> SQL fallback insert (handles JSON reliably)
+            from google.cloud import bigquery  # type: ignore
+
+            if skip_raw:
+                sql = f"""
+                    INSERT INTO `{table}` (
+                      ts, source, production_tph, kiln_feed_tph, separator_dp_pa,
+                      id_fan_flow_Nm3_h, cooler_airflow_Nm3_h, kiln_speed_rpm,
+                      o2_percent, specific_power_kwh_per_ton
+                    )
+                    VALUES (
+                      @ts, @source, @p, @kf, @dp, @idf, @caf, @ks, @o2, @sp
+                    )
+                """
+                params = [
+                    bigquery.ScalarQueryParameter("ts", "TIMESTAMP", datetime.datetime.now(datetime.timezone.utc)),
+                    bigquery.ScalarQueryParameter("source", "STRING", doc.get("source", "scheduler")),
+                    bigquery.ScalarQueryParameter("p", "FLOAT64", float(snap["production_tph"])),
+                    bigquery.ScalarQueryParameter("kf", "FLOAT64", float(snap["kiln_feed_tph"])),
+                    bigquery.ScalarQueryParameter("dp", "FLOAT64", float(snap["separator_dp_pa"])),
+                    bigquery.ScalarQueryParameter("idf", "FLOAT64", float(snap["id_fan_flow_Nm3_h"])),
+                    bigquery.ScalarQueryParameter("caf", "FLOAT64", float(snap["cooler_airflow_Nm3_h"])),
+                    bigquery.ScalarQueryParameter("ks", "FLOAT64", float(snap["kiln_speed_rpm"])),
+                    bigquery.ScalarQueryParameter("o2", "FLOAT64", float(snap["o2_percent"])),
+                    bigquery.ScalarQueryParameter("sp", "FLOAT64", float(snap["specific_power_kwh_per_ton"])),
+                ]
+            else:
+                sql = f"""
+                    INSERT INTO `{table}` (
+                      ts, source, production_tph, kiln_feed_tph, separator_dp_pa,
+                      id_fan_flow_Nm3_h, cooler_airflow_Nm3_h, kiln_speed_rpm,
+                      o2_percent, specific_power_kwh_per_ton, raw
+                    )
+                    VALUES (
+                      @ts, @source, @p, @kf, @dp, @idf, @caf, @ks, @o2, @sp, @raw
+                    )
+                """
+                params = [
+                    bigquery.ScalarQueryParameter("ts", "TIMESTAMP", datetime.datetime.now(datetime.timezone.utc)),
+                    bigquery.ScalarQueryParameter("source", "STRING", doc.get("source", "scheduler")),
+                    bigquery.ScalarQueryParameter("p", "FLOAT64", float(snap["production_tph"])),
+                    bigquery.ScalarQueryParameter("kf", "FLOAT64", float(snap["kiln_feed_tph"])),
+                    bigquery.ScalarQueryParameter("dp", "FLOAT64", float(snap["separator_dp_pa"])),
+                    bigquery.ScalarQueryParameter("idf", "FLOAT64", float(snap["id_fan_flow_Nm3_h"])),
+                    bigquery.ScalarQueryParameter("caf", "FLOAT64", float(snap["cooler_airflow_Nm3_h"])),
+                    bigquery.ScalarQueryParameter("ks", "FLOAT64", float(snap["kiln_speed_rpm"])),
+                    bigquery.ScalarQueryParameter("o2", "FLOAT64", float(snap["o2_percent"])),
+                    bigquery.ScalarQueryParameter("sp", "FLOAT64", float(snap["specific_power_kwh_per_ton"])),
+                    bigquery.ScalarQueryParameter("raw", "JSON", _normalize_json_for_field(snap, "JSON")),
+                ]
+
+            job_config = bigquery.QueryJobConfig(query_parameters=params)
+            job = _bq_client.query(sql, job_config=job_config)  # type: ignore
+            job.result()
         return {"ok": True, "table": table}
     except HTTPException:
         raise
