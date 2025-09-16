@@ -25,6 +25,7 @@ ENV_USE_MOCK="${ENV_USE_MOCK:-1}"
 ENV_APPLY_ENABLED="${ENV_APPLY_ENABLED:-1}"
 ENV_SERVICE_VERSION="${ENV_SERVICE_VERSION:-$TAG}"
 ENV_BQ_SNAPSHOTS_TABLE="${ENV_BQ_SNAPSHOTS_TABLE:-}"
+ENV_SKIP_RAW="${ENV_SKIP_RAW:-0}"
 
 # Service accounts
 RUN_SA="${RUN_SA:-$(gcloud iam service-accounts list --format='value(email)' \
@@ -83,8 +84,9 @@ ENV_FLAGS=(
   "--set-env-vars=BQ_LOCATION=${ENV_BQ_LOCATION}"
   "--set-env-vars=USE_MOCK=${ENV_USE_MOCK}"
   "--set-env-vars=APPLY_ENABLED=${ENV_APPLY_ENABLED}"
-  "--set-env-vars=SKIP_RAW=${ENV_SKIP_RAW:-0}
+  "--set-env-vars=SKIP_RAW=${ENV_SKIP_RAW}"
 )
+
 if [[ -n "$ENV_BQ_SNAPSHOTS_TABLE" ]]; then
   ENV_FLAGS+=("--set-env-vars=BQ_SNAPSHOTS_TABLE=${ENV_BQ_SNAPSHOTS_TABLE}")
 fi
@@ -141,7 +143,7 @@ fi
 set +e
 echo
 echo "Health check:"
-curl -fsS "${BASE_URL}/healthz" && echo " OK" || echo " FAILED"
+curl -fsS "${BASE_URL}/health" && echo " OK" || echo " FAILED"
 
 echo
 echo "One-shot ingest:"
@@ -149,14 +151,3 @@ curl -sS -X POST "${BASE_URL}/ingest" | jq . || true
 
 echo
 echo "Done."
-
-# PROJECT_ID="my-plant-agent-123456"
-# USER_EMAIL="$(gcloud config get-value account)"
-# PROJECT_NUMBER="$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')"
-# DEFAULT_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
-
-# gcloud iam service-accounts add-iam-policy-binding "$DEFAULT_SA" \
-#   --member="user:${USER_EMAIL}" \
-#   --role="roles/iam.serviceAccountUser"
-
-# ./deploy.sh
