@@ -7,20 +7,24 @@
 -- =========================
 -- Parameters (safe defaults)
 -- =========================
-DECLARE lookback_days INT64 DEFAULT 30;  -- number of days of recent data to train on
+DECLARE lookback_days INT64 DEFAULT 30;  -- days of recent data to train on
 
 -- =========================
 -- Train (stable model name)
 -- =========================
 CREATE OR REPLACE MODEL `${PROJECT_ID}.plant_ops.spower_reg`
 OPTIONS (
-  model_type = 'XGBOOST_REGRESSOR',
+  model_type = 'BOOSTED_TREE_REGRESSOR',
   input_label_cols = ['specific_power_kwh_per_ton'],
   data_split_method = 'AUTO_SPLIT',
   max_iterations = 200,
-  tree_method = 'HIST',
   early_stop = TRUE,
   enable_global_explain = TRUE,
+  -- You can tune these if desired (all optional and supported):
+  -- max_tree_depth = 6,
+  -- subsample = 0.8,
+  -- l1_reg = 0.0,
+  -- l2_reg = 0.0,
   labels = [
     ('trained_at', CAST(CURRENT_TIMESTAMP() AS STRING)),
     ('lookback_days', CAST(lookback_days AS STRING))
