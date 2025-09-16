@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 import pandas as pd
+import datetime
 from fastapi import FastAPI, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -268,6 +269,46 @@ def _bq_table_path() -> str:
         raise HTTPException(status_code=500, detail="PROJECT_ID not found for BigQuery table")
     return f"{PROJECT_ID}.plant_ops.snapshots"
 
+def _normalize_json_for_field(value: Any, field_type: Optional[str]) -> Any:
+    """
+    Ensure we pass a valid JSON/object for BigQuery.
+    - For JSON: allow dict/list; try to parse strings; fallback to structured wrapper.
+    - For RECORD: must be dict (matching subfields) or a JSON string that parses to dict.
+    """
+    if isinstance(value, (dict, list)):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            if field_type == "RECORD" and not isinstance(parsed, dict):
+                raise ValueError("RECORD field requires an object")
+            return parsed
+        except Exception:
+            if field_type == "JSON":
+                return {"value": value}
+            raise HTTPException(
+                status_code=400,
+                detail="Field 'raw' is RECORD and requires an object (e.g., JSON object). "
+                       "Provide a dict body or a JSON string that parses to an object."
+            )
+    if field_type == "JSON":
+        return value
+    if field_type == "RECORD":
+        try:
+            parsed = json.loads(json.dumps(value, default=str))
+        except Exception:
+            raise HTTPException(
+                status_code=400,
+                detail="Unable to coerce 'raw' into an object for RECORD field."
+            )
+        if not isinstance(parsed, dict):
+            raise HTTPException(
+                status_code=400,
+                detail="Field 'raw' is RECORD and requires an object (dict)."
+            )
+        return parsed
+    return value
+
 # -------------------------
 # Routes
 # -------------------------
@@ -492,8 +533,17 @@ def ingest(doc: dict = Body(default={})):
             if k not in snap:
                 raise HTTPException(status_code=400, detail=f"snapshot missing field: {k}")
 
+        table = _bq_table_path()
+        # Introspect schema to decide how to format 'raw'
+        try:
+            tbl_obj = _bq_client.get_table(table)  # type: ignore
+            raw_field_type = next((f.field_type for f in tbl_obj.schema if f.name == "raw"), None)
+        except Exception:
+            raw_field_type = None
+
+        # Prepare row with robust timestamp and normalized 'raw'
         row = {
-            "ts": pd.Timestamp.utcnow().isoformat(),
+            "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "source": doc.get("source", "scheduler"),
             "production_tph": float(snap["production_tph"]),
             "kiln_feed_tph": float(snap["kiln_feed_tph"]),
@@ -503,10 +553,9 @@ def ingest(doc: dict = Body(default={})):
             "kiln_speed_rpm": float(snap["kiln_speed_rpm"]),
             "o2_percent": float(snap["o2_percent"]),
             "specific_power_kwh_per_ton": float(snap["specific_power_kwh_per_ton"]),
-            "raw": snap,  # JSON column in BQ
+            "raw": _normalize_json_for_field(snap, raw_field_type),
         }
 
-        table = _bq_table_path()
         errors = _bq_client.insert_rows_json(table, [row])  # type: ignore
         if errors:
             # errors is a list of row errors; surface the first one
