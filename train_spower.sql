@@ -1,6 +1,7 @@
+-- train_spower.sql (hardcoded project)
 DECLARE lookback_days INT64 DEFAULT 30;
 
-CREATE OR REPLACE MODEL `${PROJECT_ID}.plant_ops.spower_reg`
+CREATE OR REPLACE MODEL `my-plant-agent-123456.plant_ops.spower_reg`
 OPTIONS (
   model_type = 'LINEAR_REG',
   input_label_cols = ['specific_power_kwh_per_ton'],
@@ -15,7 +16,7 @@ SELECT
   cooler_airflow_Nm3_h,
   kiln_speed_rpm,
   o2_percent
-FROM `${PROJECT_ID}.plant_ops.snapshots`
+FROM `my-plant-agent-123456.plant_ops.snapshots_current`
 WHERE
   ts >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL lookback_days DAY)
   AND specific_power_kwh_per_ton IS NOT NULL
@@ -24,7 +25,7 @@ WHERE
 ;
 
 SELECT 'EVALUATE' AS section, *
-FROM ML.EVALUATE(MODEL `${PROJECT_ID}.plant_ops.spower_reg`);
+FROM ML.EVALUATE(MODEL `my-plant-agent-123456.plant_ops.spower_reg`);
 
-SELECT * FROM ML.WEIGHTS(MODEL `${PROJECT_ID}.plant_ops.spower_reg`)
+SELECT * FROM ML.WEIGHTS(MODEL `my-plant-agent-123456.plant_ops.spower_reg`)
 ORDER BY ABS(weight) DESC;

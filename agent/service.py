@@ -358,7 +358,7 @@ def root():
             "/optimize/routine", "/optimize/load",
             "/actuate/apply_stage", "/actuate/rollback",
             "/ingest", "/metrics",
-            "/predict/spower",  # added to advertise
+            "/predict/spower",
         ],
         "bq_enabled": _BQ_ENABLED,
     }
@@ -405,10 +405,22 @@ def healthz_head():
 def config_get():
     return get_config()
 
+# -------------------------
+# UPDATED: /debug/config (effective project & table reporting)
+# -------------------------
 @app.get("/debug/config")
 def debug_config():
     """Helps verify resolution in Cloud Run."""
     known = ["/app/config/plant.yaml", "/app/plant.yaml", "config/plant.yaml", "plant.yaml"]
+
+    # Compute effective BQ table & project safely
+    try:
+        effective_table = _bq_table_path()
+    except Exception:
+        effective_table = None
+
+    resolved_proj = PROJECT_ID or (getattr(_bq_client, "project", None) if _bq_client else None)
+
     return {
         "PLANT_CONFIG_env": os.getenv("PLANT_CONFIG"),
         "known_locations": known,
@@ -417,8 +429,10 @@ def debug_config():
         "keys": list(get_config().keys()),
         "bq_enabled": _BQ_ENABLED,
         "bq_error": _BQ_ERR,
-        "bq_table": os.getenv("BQ_SNAPSHOTS_TABLE", f"{PROJECT_ID}.plant_ops.snapshots" if PROJECT_ID else None),
-        "project_id": PROJECT_ID or None,
+        "bq_table_env": os.getenv("BQ_SNAPSHOTS_TABLE"),
+        "bq_table": effective_table,          # <-- effective value now
+        "project_id_env": os.getenv("PROJECT_ID"),
+        "project_id_effective": resolved_proj # <-- effective project now
     }
 
 @app.get("/snapshot")
@@ -454,10 +468,10 @@ def optimize_routine(req: RoutineOptimizeReq):
             continue
         if lever == "separator_dp_pa":
             recipe[lever] = 600.0
-        elif lever == "id_fan_flow_Nm3_h":
+        elif "id_fan_flow_Nm3_h" == lever:
             base = s.get("id_fan_flow_Nm3_h", 150000) * 0.98
             recipe[lever] = max(meta.get("min", 0), min(meta.get("max", 1e12), base))
-        elif lever == "cooler_airflow_Nm3_h":
+        elif "cooler_airflow_Nm3_h" == lever:
             base = s.get("cooler_airflow_Nm3_h", 220000) * 0.98
             recipe[lever] = max(meta.get("min", 0), min(meta.get("max", 1e12), base))
 
@@ -553,12 +567,12 @@ def actuate_rollback():
     return {"ok": True, "note": "Live plant rollback not implemented"}
 
 # -------------------------
-# NEW: /ingest → BigQuery
+# /ingest → BigQuery
 # -------------------------
 @app.post("/ingest")
 def ingest(doc: dict = Body(default={})):
     """
-    Upserts a single row into BigQuery table (default: <project>.plant_ops.snapshots).
+    Upserts a single row into BigQuery table.
     Body may contain {"snapshot": {...}}; if absent, the current /snapshot is fetched.
     """
     if not _BQ_ENABLED or _bq_client is None:
@@ -584,7 +598,7 @@ def ingest(doc: dict = Body(default={})):
         except Exception:
             raw_field_type = None
 
-        # >>> Added: allow skipping 'raw' via env flag
+        # Allow skipping 'raw' via env flag
         skip_raw = os.getenv("SKIP_RAW") in ("1", "true", "yes")
 
         # Prepare row with robust timestamp and normalized 'raw'
@@ -606,15 +620,13 @@ def ingest(doc: dict = Body(default={})):
         # First attempt: streaming insert (fast path)
         errors = _bq_client.insert_rows_json(table, [row])  # type: ignore
         if errors:
-            # If error looks like raw not record (schema mismatch), fall back to parameterized SQL
+            # If error looks like schema mismatch, fall back to parameterized SQL
             msg = json.dumps(errors)
             need_sql_fallback = ("not a record" in msg.lower()) or ("invalid" in msg.lower())
             if not need_sql_fallback:
                 raise HTTPException(status_code=500, detail=f"BigQuery insert failed: {errors}")
 
-            # >>> SQL fallback insert (handles JSON reliably)
             from google.cloud import bigquery  # type: ignore
-
             if skip_raw:
                 sql = f"""
                     INSERT INTO `{table}` (
@@ -673,7 +685,7 @@ def ingest(doc: dict = Body(default={})):
         raise HTTPException(status_code=500, detail=f"/ingest error: {e}")
 
 # -------------------------
-# NEW: /predict/spower → BQML (with safe fallback)
+# /predict/spower → BQML (with safe fallback)
 # -------------------------
 @app.post("/predict/spower")
 def predict_spower_route(doc: dict = Body(default={})):
@@ -690,7 +702,7 @@ def predict_spower_route(doc: dict = Body(default={})):
         else:
             snap = _latest_snapshot_from_bq()
 
-    # Coerce numerics (BQ accepts NULLs if some features are missing)
+    # Coerce numerics
     def f(x):
         try:
             return float(x)

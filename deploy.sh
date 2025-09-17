@@ -24,7 +24,10 @@ ENV_BQ_LOCATION="${ENV_BQ_LOCATION:-asia-south2}"
 ENV_USE_MOCK="${ENV_USE_MOCK:-1}"
 ENV_APPLY_ENABLED="${ENV_APPLY_ENABLED:-1}"
 ENV_SERVICE_VERSION="${ENV_SERVICE_VERSION:-$TAG}"
-ENV_BQ_SNAPSHOTS_TABLE="${ENV_BQ_SNAPSHOTS_TABLE:-}"
+ENV_BQ_MODEL_NAME="${ENV_BQ_MODEL_NAME:-spower_reg}"
+
+# Default the snapshots table to the v2 partitioned table if not provided
+ENV_BQ_SNAPSHOTS_TABLE="${ENV_BQ_SNAPSHOTS_TABLE:-${PROJECT_ID}.${ENV_DATASET}.snapshots_v2}"
 ENV_SKIP_RAW="${ENV_SKIP_RAW:-0}"
 
 # Service accounts
@@ -56,6 +59,7 @@ gcloud services enable \
   bigquery.googleapis.com \
   bigquerydatatransfer.googleapis.com \
   cloudscheduler.googleapis.com \
+  iam.googleapis.com \
   logging.googleapis.com
 
 # -----------------------------
@@ -85,11 +89,9 @@ ENV_FLAGS=(
   "--set-env-vars=USE_MOCK=${ENV_USE_MOCK}"
   "--set-env-vars=APPLY_ENABLED=${ENV_APPLY_ENABLED}"
   "--set-env-vars=SKIP_RAW=${ENV_SKIP_RAW}"
+  "--set-env-vars=BQ_MODEL_NAME=${ENV_BQ_MODEL_NAME}"
+  "--set-env-vars=BQ_SNAPSHOTS_TABLE=${ENV_BQ_SNAPSHOTS_TABLE}"
 )
-
-if [[ -n "$ENV_BQ_SNAPSHOTS_TABLE" ]]; then
-  ENV_FLAGS+=("--set-env-vars=BQ_SNAPSHOTS_TABLE=${ENV_BQ_SNAPSHOTS_TABLE}")
-fi
 
 gcloud run deploy "$SERVICE" \
   --project="$PROJECT_ID" \
@@ -111,15 +113,37 @@ BASE_URL="$(gcloud run services describe "$SERVICE" --region="$RUN_REGION" --for
 echo "Service URL: $BASE_URL"
 
 # -----------------------------
-# IAM for Scheduler
+# Create/refresh view: snapshots_current -> snapshots_v2
 # -----------------------------
+bq query --use_legacy_sql=false --location="$ENV_BQ_LOCATION" \
+"CREATE OR REPLACE VIEW \`${PROJECT_ID}.${ENV_DATASET}.snapshots_current\` AS
+ SELECT * FROM \`${PROJECT_ID}.${ENV_DATASET}.snapshots_v2\`;"
+
+# -----------------------------
+# Optional: Train (or re-train) the BQML model from snapshots_current
+# -----------------------------
+if [[ -f "train_spower.sql" ]]; then
+  echo "Training model ${ENV_BQ_MODEL_NAME} from train_spower.sql ..."
+  # Ensure the SQL references ${PROJECT_ID} placeholders; envsubst will replace them.
+  env PROJECT_ID="$PROJECT_ID" envsubst < train_spower.sql | \
+    bq query --use_legacy_sql=false --location="$ENV_BQ_LOCATION"
+else
+  echo "NOTE: train_spower.sql not found; skipping training step."
+fi
+
+# -----------------------------
+# Ensure Scheduler SA exists & has invoke rights
+# -----------------------------
+gcloud iam service-accounts describe "$SCHED_SA" >/dev/null 2>&1 || \
+  gcloud iam service-accounts create "$(echo "$SCHED_SA" | cut -d@ -f1)" --display-name="Plant Agent Scheduler"
+
 gcloud run services add-iam-policy-binding "$SERVICE" \
   --region="$RUN_REGION" \
   --member="serviceAccount:${SCHED_SA}" \
   --role="roles/run.invoker"
 
 # -----------------------------
-# Scheduler job
+# Scheduler job (POST {} to /ingest every 5m, JSON headers)
 # -----------------------------
 if gcloud scheduler jobs describe "$JOB_NAME" --location="$SCHED_REGION" >/dev/null 2>&1; then
   gcloud scheduler jobs update http "$JOB_NAME" \
@@ -127,15 +151,22 @@ if gcloud scheduler jobs describe "$JOB_NAME" --location="$SCHED_REGION" >/dev/n
     --schedule="*/5 * * * *" \
     --uri="${BASE_URL}/ingest" \
     --http-method=POST \
-    --oidc-service-account-email="${SCHED_SA}"
+    --oidc-service-account-email="${SCHED_SA}" \
+    --headers="Content-Type=application/json" \
+    --message-body='{}'
 else
   gcloud scheduler jobs create http "$JOB_NAME" \
     --location="$SCHED_REGION" \
     --schedule="*/5 * * * *" \
     --uri="${BASE_URL}/ingest" \
     --http-method=POST \
-    --oidc-service-account-email="${SCHED_SA}"
+    --oidc-service-account-email="${SCHED_SA}" \
+    --headers="Content-Type=application/json" \
+    --message-body='{}'
 fi
+
+# Trigger once now
+gcloud scheduler jobs run "$JOB_NAME" --location="$SCHED_REGION" || true
 
 # -----------------------------
 # Smoke tests
@@ -145,9 +176,34 @@ echo
 echo "Health check:"
 curl -fsS "${BASE_URL}/health" && echo " OK" || echo " FAILED"
 
+# Authenticated /predict test via SA impersonation (best-effort)
+echo
+echo "Predict sample (auth as Scheduler SA):"
+gcloud iam service-accounts add-iam-policy-binding "$SCHED_SA" \
+  --member="user:$(gcloud config get-value account)" \
+  --role="roles/iam.serviceAccountTokenCreator" >/dev/null 2>&1
+
+ID_TOKEN="$(gcloud auth print-identity-token --impersonate-service-account="$SCHED_SA" --audiences="$BASE_URL" 2>/dev/null || true)"
+
+if [[ -n "${ID_TOKEN}" ]]; then
+  curl -sS -X POST "${BASE_URL}/predict/spower" \
+    -H "Authorization: Bearer ${ID_TOKEN}" \
+    -H "Content-Type: application/json" \
+    -d '{"snapshot":{"production_tph":120,"kiln_feed_tph":118,"separator_dp_pa":450,"id_fan_flow_Nm3_h":180000,"cooler_airflow_Nm3_h":200000,"kiln_speed_rpm":4.5,"o2_percent":2.1}}' | jq . || true
+else
+  echo "Skipping auth call (could not mint ID token)."
+fi
+
 echo
 echo "One-shot ingest:"
-curl -sS -X POST "${BASE_URL}/ingest" | jq . || true
+curl -sS -X POST "${BASE_URL}/ingest" -H "Content-Type: application/json" -d '{}' | jq . || true
+
+echo
+echo "Recent rows (snapshots_v2):"
+bq query --use_legacy_sql=false --location="$ENV_BQ_LOCATION" \
+"SELECT ts, source, o2_percent
+ FROM \`${PROJECT_ID}.${ENV_DATASET}.snapshots_v2\`
+ ORDER BY ts DESC LIMIT 5" || true
 
 echo
 echo "Done."
