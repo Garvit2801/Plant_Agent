@@ -79,7 +79,7 @@ fi
 gcloud builds submit --tag "$IMAGE_URI"
 
 # -----------------------------
-# Deploy Cloud Run
+# Deploy Cloud Run (with retry for version conflicts)
 # -----------------------------
 ENV_FLAGS=(
   "--set-env-vars=SERVICE_VERSION=${ENV_SERVICE_VERSION}"
@@ -93,18 +93,34 @@ ENV_FLAGS=(
   "--set-env-vars=BQ_SNAPSHOTS_TABLE=${ENV_BQ_SNAPSHOTS_TABLE}"
 )
 
-gcloud run deploy "$SERVICE" \
-  --project="$PROJECT_ID" \
-  --region="$RUN_REGION" \
-  --image="$IMAGE_URI" \
-  --service-account="$RUN_SA" \
-  --allow-unauthenticated \
-  --platform=managed \
-  --memory=1Gi \
-  --cpu=1 \
-  --concurrency=80 \
-  --timeout=300 \
-  "${ENV_FLAGS[@]}"
+deploy_with_retry() {
+  local attempts=0 max=3
+  while (( attempts < max )); do
+    if gcloud run deploy "$SERVICE" \
+      --project="$PROJECT_ID" \
+      --region="$RUN_REGION" \
+      --image="$IMAGE_URI" \
+      --service-account="$RUN_SA" \
+      --allow-unauthenticated \
+      --platform=managed \
+      --memory=1Gi \
+      --cpu=1 \
+      --concurrency=80 \
+      --timeout=300 \
+      "${ENV_FLAGS[@]}"; then
+      return 0
+    fi
+    rc=$?
+    echo "Deploy failed (exit $rc). Refreshing service and retrying..."
+    gcloud run services describe "$SERVICE" --region="$RUN_REGION" >/dev/null 2>&1 || true
+    sleep 3
+    attempts=$((attempts+1))
+  done
+  echo "Deploy failed after $max attempts."
+  return 1
+}
+
+deploy_with_retry
 
 # -----------------------------
 # URL
@@ -124,7 +140,6 @@ bq query --use_legacy_sql=false --location="$ENV_BQ_LOCATION" \
 # -----------------------------
 if [[ -f "train_spower.sql" ]]; then
   echo "Training model ${ENV_BQ_MODEL_NAME} from train_spower.sql ..."
-  # Ensure the SQL references ${PROJECT_ID} placeholders; envsubst will replace them.
   env PROJECT_ID="$PROJECT_ID" envsubst < train_spower.sql | \
     bq query --use_legacy_sql=false --location="$ENV_BQ_LOCATION"
 else
@@ -132,35 +147,60 @@ else
 fi
 
 # -----------------------------
-# Ensure Scheduler SA exists & has invoke rights
+# Ensure Scheduler SA exists & has rights
 # -----------------------------
 gcloud iam service-accounts describe "$SCHED_SA" >/dev/null 2>&1 || \
   gcloud iam service-accounts create "$(echo "$SCHED_SA" | cut -d@ -f1)" --display-name="Plant Agent Scheduler"
 
+# Allow Scheduler SA to invoke Cloud Run
 gcloud run services add-iam-policy-binding "$SERVICE" \
   --region="$RUN_REGION" \
   --member="serviceAccount:${SCHED_SA}" \
   --role="roles/run.invoker"
 
+# Allow Cloud Scheduler's service agent to mint OIDC tokens for your Scheduler SA
+PROJECT_NUMBER="$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')"
+CLOUDSCHED_SA="service-${PROJECT_NUMBER}@gcp-sa-cloudscheduler.iam.gserviceaccount.com"
+gcloud iam service-accounts add-iam-policy-binding "$SCHED_SA" \
+  --member="serviceAccount:${CLOUDSCHED_SA}" \
+  --role="roles/iam.serviceAccountTokenCreator" >/dev/null
+
 # -----------------------------
-# Scheduler job (POST {} to /ingest every 5m, JSON headers)
+# Scheduler job (POST {} to /ingest every 5m, OIDC + JSON)
 # -----------------------------
 if gcloud scheduler jobs describe "$JOB_NAME" --location="$SCHED_REGION" >/dev/null 2>&1; then
+  # UPDATE existing job — use --update-headers
   gcloud scheduler jobs update http "$JOB_NAME" \
     --location="$SCHED_REGION" \
     --schedule="*/5 * * * *" \
     --uri="${BASE_URL}/ingest" \
     --http-method=POST \
     --oidc-service-account-email="${SCHED_SA}" \
-    --headers="Content-Type=application/json" \
-    --message-body='{}'
+    --oidc-token-audience="${BASE_URL}" \
+    --update-headers="Content-Type=application/json" \
+    --message-body='{}' \
+  || {
+    echo "Update failed; recreating job to ensure OIDC is set..."
+    gcloud scheduler jobs delete "$JOB_NAME" --location="$SCHED_REGION" --quiet || true
+    gcloud scheduler jobs create http "$JOB_NAME" \
+      --location="$SCHED_REGION" \
+      --schedule="*/5 * * * *" \
+      --uri="${BASE_URL}/ingest" \
+      --http-method=POST \
+      --oidc-service-account-email="${SCHED_SA}" \
+      --oidc-token-audience="${BASE_URL}" \
+      --headers="Content-Type=application/json" \
+      --message-body='{}'
+  }
 else
+  # CREATE new job — use --headers
   gcloud scheduler jobs create http "$JOB_NAME" \
     --location="$SCHED_REGION" \
     --schedule="*/5 * * * *" \
     --uri="${BASE_URL}/ingest" \
     --http-method=POST \
     --oidc-service-account-email="${SCHED_SA}" \
+    --oidc-token-audience="${BASE_URL}" \
     --headers="Content-Type=application/json" \
     --message-body='{}'
 fi
