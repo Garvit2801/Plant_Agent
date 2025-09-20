@@ -208,6 +208,7 @@ def predict_specific_power(snapshot: Dict[str, Any]) -> float:
 # -------------------------
 _state_lock = threading.Lock()
 _STATE: Dict[str, float] = {
+    # Process values (PVs)
     "production_tph": 10.0,
     "kiln_feed_tph": 10.0,
     "separator_dp_pa": 620.0,
@@ -217,24 +218,83 @@ _STATE: Dict[str, float] = {
     "o2_percent": 3.3,
     "specific_power_kwh_per_ton": 12.5,
 }
+# Control setpoints (SPs). These are the “targets” the loop chases.
+_STATE.setdefault("sp", {
+    "kiln_feed_tph": _STATE["kiln_feed_tph"],
+    "separator_dp_pa": _STATE["separator_dp_pa"],
+    "id_fan_flow_Nm3_h": _STATE["id_fan_flow_Nm3_h"],
+    "cooler_airflow_Nm3_h": _STATE["cooler_airflow_Nm3_h"],
+    "kiln_speed_rpm": _STATE["kiln_speed_rpm"],
+})
+
+def _physics_tick(state: Dict[str, float], dt_sec: float) -> None:
+    """
+    Simple mock dynamics:
+      - PVs move toward SPs with smoothing.
+      - production_tph follows kiln_feed SP with a time constant (and optional O2 gating).
+      - O2 depends on ID fan flow (around nominal).
+      - kWh/t improves with higher production, worsens with high O2 and ΔP.
+    """
+    sp = state.get("sp", {})
+    if not sp:
+        return
+
+    cfg = get_config()
+    levers: Dict[str, Any] = cfg.get("levers", {})
+
+    # 1) Move controlled PVs toward their setpoints
+    follow_alpha = min(1.0, dt_sec / 8.0)  # time constant ~8s
+    for k in ("kiln_feed_tph", "separator_dp_pa", "id_fan_flow_Nm3_h", "cooler_airflow_Nm3_h", "kiln_speed_rpm"):
+        if k in sp:
+            lo = levers.get(k, {}).get("min", -1e12)
+            hi = levers.get(k, {}).get("max", 1e12)
+            target = clamp(float(sp[k]), lo, hi)
+            state[k] += follow_alpha * (target - state[k])
+
+    # 2) Production follows kiln_feed setpoint with inertia, clamped by lever bounds
+    tau_prod = 20.0  # seconds
+    prod_alpha = min(1.0, dt_sec / tau_prod)
+    desired_prod = float(sp.get("kiln_feed_tph", state["kiln_feed_tph"])) * 1.00  # yield 1.0
+    # Optional safety gating: if O2 not in band, prevent upward ramp
+    o2_band = (2.8, 4.5)
+    if not (o2_band[0] <= state["o2_percent"] <= o2_band[1]):
+        desired_prod = min(desired_prod, state["production_tph"])
+    # Clamp by lever bounds if present
+    prod_lo = levers.get("production_tph", {}).get("min", 0.0) or 0.0
+    prod_hi = levers.get("production_tph", {}).get("max", 1e12)
+    desired_prod = clamp(desired_prod, prod_lo, prod_hi)
+    state["production_tph"] += prod_alpha * (desired_prod - state["production_tph"])
+
+    # 3) O2 ≈ f(ID fan flow)
+    o2_nom = 2.6 + 0.000003 * (sp.get("id_fan_flow_Nm3_h", state["id_fan_flow_Nm3_h"]) - 150_000.0)
+    o2_alpha = min(1.0, dt_sec / 5.0)
+    state["o2_percent"] += o2_alpha * (o2_nom - state["o2_percent"])
+    state["o2_percent"] = clamp(state["o2_percent"], 2.0, 5.0)
+
+    # 4) Specific power depends on production, ΔP, O2 (smoothly)
+    k_base = (
+        12.2
+        - 0.25 * (state["production_tph"] - 10.0)          # better with higher production
+        + 0.001 * (sp.get("separator_dp_pa", state["separator_dp_pa"]) - 620.0)
+        + 0.15  * (state["o2_percent"] - 2.6)
+    )
+    k_alpha = min(1.0, dt_sec / 10.0)
+    state["specific_power_kwh_per_ton"] += k_alpha * (k_base - state["specific_power_kwh_per_ton"])
+    state["specific_power_kwh_per_ton"] = round(state["specific_power_kwh_per_ton"], 3)
 
 def _physics_step(state: Dict[str, float]) -> None:
-    # O2 varies with ID fan flow (toy model)
-    idflow = state["id_fan_flow_Nm3_h"]
-    o2 = 2.5 + (idflow - 140000.0) / 100000.0
-    state["o2_percent"] = clamp(o2, 2.2, 5.0)
-
-    # Specific power weakly depends on flows and dp (toy model)
-    base = 12.0 + (state["separator_dp_pa"] - 600.0) / 4000.0
-    base += (state["id_fan_flow_Nm3_h"] - 150000.0) / 600000.0
-    base += (state["cooler_airflow_Nm3_h"] - 220000.0) / 800000.0
-    state["specific_power_kwh_per_ton"] = round(base, 3)
+    """Backward-compatible one-shot step (kept for /snapshot/set)."""
+    _physics_tick(state, dt_sec=MOCK_TICK_SEC)
 
 def _mock_loop():
+    last = time.monotonic()
     while True:
         time.sleep(MOCK_TICK_SEC)
+        now = time.monotonic()
+        dt = max(0.001, now - last)
+        last = now
         with _state_lock:
-            _physics_step(_STATE)
+            _physics_tick(_STATE, dt)
 
 if USE_MOCK:
     threading.Thread(target=_mock_loop, daemon=True).start()
@@ -251,8 +311,24 @@ class LoadOptimizeReq(BaseModel):
     delta_pct: float = Field(..., gt=0, le=50)
 
 class ApplyStageReq(BaseModel):
+    # original fields
     current: Optional[Dict[str, Any]] = None
-    setpoints: Dict[str, float]
+    setpoints: Optional[Dict[str, float]] = None
+    # extra flexible shapes
+    stage: Optional[Dict[str, Any]] = None
+    proposal: Optional[Dict[str, float]] = None
+    proposed_setpoints: Optional[Dict[str, float]] = None
+
+    def extract_setpoints(self) -> Dict[str, float]:
+        if isinstance(self.setpoints, dict):
+            return {k: float(v) for k, v in self.setpoints.items()}
+        if isinstance(self.stage, dict) and isinstance(self.stage.get("setpoints"), dict):
+            return {k: float(v) for k, v in self.stage["setpoints"].items()}
+        if isinstance(self.proposal, dict):
+            return {k: float(v) for k, v in self.proposal.items()}
+        if isinstance(self.proposed_setpoints, dict):
+            return {k: float(v) for k, v in self.proposed_setpoints.items()}
+        return {}
 
 class SnapshotSetReq(BaseModel):
     setpoints: Dict[str, float]
@@ -446,7 +522,17 @@ def debug_config():
 def snapshot():
     if USE_MOCK:
         with _state_lock:
-            return dict(_STATE)
+            # Return PVs only (keep SPs internal), but you can expose for debugging if needed
+            return {
+                "production_tph": _STATE["production_tph"],
+                "kiln_feed_tph": _STATE["kiln_feed_tph"],
+                "separator_dp_pa": _STATE["separator_dp_pa"],
+                "id_fan_flow_Nm3_h": _STATE["id_fan_flow_Nm3_h"],
+                "cooler_airflow_Nm3_h": _STATE["cooler_airflow_Nm3_h"],
+                "kiln_speed_rpm": _STATE["kiln_speed_rpm"],
+                "o2_percent": _STATE["o2_percent"],
+                "specific_power_kwh_per_ton": _STATE["specific_power_kwh_per_ton"],
+            }
     raise HTTPException(status_code=501, detail="Live plant connectors not configured")
 
 @app.post("/snapshot/set")
@@ -547,21 +633,47 @@ def optimize_load(req: LoadOptimizeReq):
     }
 
 @app.post("/actuate/apply_stage")
-def actuate_apply_stage(req: ApplyStageReq):
+def actuate_apply_stage(req: ApplyStageReq = Body(default={})):
+    """
+    Accepts multiple shapes:
+      - {"setpoints": {...}}
+      - {"stage": {"setpoints": {...}}}
+      - {"proposal": {...}}
+      - {"proposed_setpoints": {...}}
+      - {"current": {...}}  # optional passthrough
+    """
     if not APPLY_ENABLED:
         return {"ok": True, "note": "APPLY_ENABLED=0; dry-run"}
 
-    setpts = req.setpoints or {}
+    setpts = req.extract_setpoints()
+    if not isinstance(setpts, dict) or not setpts:
+        raise HTTPException(status_code=422, detail="No setpoints provided")
+
     if USE_MOCK:
+        # Respect lever limits from config
+        cfg = get_config()
+        levers: Dict[str, Any] = cfg.get("levers", {})
         with _state_lock:
+            sp = _STATE.setdefault("sp", {})
             for k, v in setpts.items():
-                if k not in _STATE:
-                    continue
-                cur = float(_STATE[k])
-                tgt = float(v)
-                nxt = cur + (tgt - cur) * 0.9
-                _STATE[k] = round(nxt, 12)
+                if k not in sp:
+                    # only apply known control keys
+                    if k not in ("kiln_feed_tph","separator_dp_pa","id_fan_flow_Nm3_h","cooler_airflow_Nm3_h","kiln_speed_rpm"):
+                    # silently ignore unknowns; you can raise 400 if desired
+                        continue
+                    sp[k] = float(_STATE.get(k, v))
+                lo = levers.get(k, {}).get("min", -1e12)
+                hi = levers.get(k, {}).get("max", 1e12)
+                sp[k] = clamp(float(v), lo, hi)
+
+            # Nudge PVs a bit immediately for responsiveness; background loop will continue
+            for k in ("kiln_feed_tph","separator_dp_pa","id_fan_flow_Nm3_h","cooler_airflow_Nm3_h","kiln_speed_rpm"):
+                if k in sp:
+                    cur = float(_STATE[k])
+                    tgt = float(sp[k])
+                    _STATE[k] = cur + 0.5*(tgt - cur)
             _physics_step(_STATE)
+
         return {"ok": True}
 
     # TODO: wire to real plant (OPC UA / Modbus)
@@ -773,6 +885,8 @@ def metrics():
     if USE_MOCK:
         with _state_lock:
             s = dict(_STATE)
+            # don’t expose SPs by default
+            s.pop("sp", None)
     else:
         s = {}
     cfg = get_config()
