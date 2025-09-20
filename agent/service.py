@@ -64,7 +64,7 @@ except Exception:
             if not moved:
                 break
             checks = [
-                "O2 in [2.8, 4.5] %",
+                "O2 in [2.5, 4.5] %",
                 "CO < 180 ppm",
                 "Bagfilter ΔP < 1800 Pa",
                 "Mill outlet temp 90–120 °C",
@@ -122,7 +122,6 @@ UI_ORIGINS = [
     # "http://localhost:3000",       # ← keep this while developing locally (optional)
 ]
 
-# Replace permissive CORS with the stricter UI_ORIGINS-based config
 app.add_middleware(
     CORSMiddleware,
     allow_origins=UI_ORIGINS,
@@ -135,7 +134,6 @@ app.add_middleware(
 # Robust plant.yaml resolver
 # -------------------------
 def _resolve_config_path() -> str:
-    """Find plant.yaml via env or common locations and log helpful context."""
     p = os.getenv("PLANT_CONFIG")
     if p and os.path.exists(p):
         logging.info(f"PLANT_CONFIG env set, using: {p}")
@@ -157,7 +155,6 @@ def _resolve_config_path() -> str:
         logging.error("plant.yaml not found and listing failed: %s", e)
     raise FileNotFoundError("Missing config: plant.yaml")
 
-# Config cache keyed by resolved path
 _config_cache: Dict[str, Any] = {}
 _config_mtime: Optional[float] = None
 _config_path: Optional[float] = None
@@ -169,7 +166,6 @@ def _stat_mtime(path: str) -> Optional[float]:
         return None
 
 def get_config() -> Dict[str, Any]:
-    """Load YAML once; auto-reload if the file changes."""
     global _config_cache, _config_mtime, _config_path
     resolved = _resolve_config_path()
     mt = _stat_mtime(resolved)
@@ -199,7 +195,6 @@ def clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
 
 def predict_specific_power(snapshot: Dict[str, Any]) -> float:
-    """Light-weight placeholder: pretend a small improvement."""
     cur = float(snapshot.get("specific_power_kwh_per_ton", 12.5))
     return round(cur * 0.99, 3)
 
@@ -208,7 +203,7 @@ def predict_specific_power(snapshot: Dict[str, Any]) -> float:
 # -------------------------
 _state_lock = threading.Lock()
 _STATE: Dict[str, float] = {
-    # Process values (PVs)
+    # PVs
     "production_tph": 10.0,
     "kiln_feed_tph": 10.0,
     "separator_dp_pa": 620.0,
@@ -218,7 +213,7 @@ _STATE: Dict[str, float] = {
     "o2_percent": 3.3,
     "specific_power_kwh_per_ton": 12.5,
 }
-# Control setpoints (SPs). These are the “targets” the loop chases.
+# Control setpoints (SPs) the loop will chase
 _STATE.setdefault("sp", {
     "kiln_feed_tph": _STATE["kiln_feed_tph"],
     "separator_dp_pa": _STATE["separator_dp_pa"],
@@ -229,11 +224,11 @@ _STATE.setdefault("sp", {
 
 def _physics_tick(state: Dict[str, float], dt_sec: float) -> None:
     """
-    Simple mock dynamics:
-      - PVs move toward SPs with smoothing.
-      - production_tph follows kiln_feed SP with a time constant (and optional O2 gating).
-      - O2 depends on ID fan flow (around nominal).
-      - kWh/t improves with higher production, worsens with high O2 and ΔP.
+    Mock dynamics:
+      - PVs move toward SPs.
+      - production_tph follows kiln_feed SP (first-order).
+      - O2 depends on ID fan flow.
+      - kWh/t depends on production, ΔP, O2.
     """
     sp = state.get("sp", {})
     if not sp:
@@ -242,8 +237,8 @@ def _physics_tick(state: Dict[str, float], dt_sec: float) -> None:
     cfg = get_config()
     levers: Dict[str, Any] = cfg.get("levers", {})
 
-    # 1) Move controlled PVs toward their setpoints
-    follow_alpha = min(1.0, dt_sec / 8.0)  # time constant ~8s
+    # 1) PVs → SPs
+    follow_alpha = min(1.0, dt_sec / 8.0)
     for k in ("kiln_feed_tph", "separator_dp_pa", "id_fan_flow_Nm3_h", "cooler_airflow_Nm3_h", "kiln_speed_rpm"):
         if k in sp:
             lo = levers.get(k, {}).get("min", -1e12)
@@ -251,30 +246,27 @@ def _physics_tick(state: Dict[str, float], dt_sec: float) -> None:
             target = clamp(float(sp[k]), lo, hi)
             state[k] += follow_alpha * (target - state[k])
 
-    # 2) Production follows kiln_feed setpoint with inertia, clamped by lever bounds
-    tau_prod = 20.0  # seconds
+    # 2) production_tph tracks kiln_feed SP
+    tau_prod = 20.0
     prod_alpha = min(1.0, dt_sec / tau_prod)
-    desired_prod = float(sp.get("kiln_feed_tph", state["kiln_feed_tph"])) * 1.00  # yield 1.0
-    # Optional safety gating: if O2 not in band, prevent upward ramp
-    o2_band = (2.8, 4.5)
-    if not (o2_band[0] <= state["o2_percent"] <= o2_band[1]):
+    desired_prod = float(sp.get("kiln_feed_tph", state["kiln_feed_tph"])) * 1.00
+    if not (2.5 <= state["o2_percent"] <= 4.5):  # optional gating
         desired_prod = min(desired_prod, state["production_tph"])
-    # Clamp by lever bounds if present
     prod_lo = levers.get("production_tph", {}).get("min", 0.0) or 0.0
     prod_hi = levers.get("production_tph", {}).get("max", 1e12)
     desired_prod = clamp(desired_prod, prod_lo, prod_hi)
     state["production_tph"] += prod_alpha * (desired_prod - state["production_tph"])
 
-    # 3) O2 ≈ f(ID fan flow)
+    # 3) O2 vs ID fan flow (nominal)
     o2_nom = 2.6 + 0.000003 * (sp.get("id_fan_flow_Nm3_h", state["id_fan_flow_Nm3_h"]) - 150_000.0)
     o2_alpha = min(1.0, dt_sec / 5.0)
     state["o2_percent"] += o2_alpha * (o2_nom - state["o2_percent"])
     state["o2_percent"] = clamp(state["o2_percent"], 2.0, 5.0)
 
-    # 4) Specific power depends on production, ΔP, O2 (smoothly)
+    # 4) Specific power
     k_base = (
         12.2
-        - 0.25 * (state["production_tph"] - 10.0)          # better with higher production
+        - 0.25 * (state["production_tph"] - 10.0)
         + 0.001 * (sp.get("separator_dp_pa", state["separator_dp_pa"]) - 620.0)
         + 0.15  * (state["o2_percent"] - 2.6)
     )
@@ -283,7 +275,6 @@ def _physics_tick(state: Dict[str, float], dt_sec: float) -> None:
     state["specific_power_kwh_per_ton"] = round(state["specific_power_kwh_per_ton"], 3)
 
 def _physics_step(state: Dict[str, float]) -> None:
-    """Backward-compatible one-shot step (kept for /snapshot/set)."""
     _physics_tick(state, dt_sec=MOCK_TICK_SEC)
 
 def _mock_loop():
@@ -311,10 +302,8 @@ class LoadOptimizeReq(BaseModel):
     delta_pct: float = Field(..., gt=0, le=50)
 
 class ApplyStageReq(BaseModel):
-    # original fields
     current: Optional[Dict[str, Any]] = None
     setpoints: Optional[Dict[str, float]] = None
-    # extra flexible shapes
     stage: Optional[Dict[str, Any]] = None
     proposal: Optional[Dict[str, float]] = None
     proposed_setpoints: Optional[Dict[str, float]] = None
@@ -340,7 +329,7 @@ _BQ_ENABLED = False
 _BQ_ERR: Optional[str] = None
 try:
     from google.cloud import bigquery  # type: ignore
-    _bq_client = bigquery.Client()  # project auto-detected on Cloud Run
+    _bq_client = bigquery.Client()
     _BQ_ENABLED = True
 except Exception as e:
     _bq_client = None
@@ -348,7 +337,6 @@ except Exception as e:
     _BQ_ERR = f"BigQuery client not initialized: {e}"
 
 def _bq_table_path() -> str:
-    # Allow override via env; else default to <project>.plant_ops.snapshots
     tbl = os.getenv("BQ_SNAPSHOTS_TABLE")
     if tbl:
         return tbl
@@ -357,11 +345,6 @@ def _bq_table_path() -> str:
     return f"{PROJECT_ID}.plant_ops.snapshots"
 
 def _normalize_json_for_field(value: Any, field_type: Optional[str]) -> Any:
-    """
-    Ensure we pass a valid JSON/object for BigQuery.
-    - For JSON: allow dict/list; try to parse strings; fallback to structured wrapper.
-    - For RECORD: must be dict (matching subfields) or a JSON string that parses to dict.
-    """
     if isinstance(value, (dict, list)):
         return value
     if isinstance(value, str):
@@ -384,25 +367,17 @@ def _normalize_json_for_field(value: Any, field_type: Optional[str]) -> Any:
         try:
             parsed = json.loads(json.dumps(value, default=str))
         except Exception:
-            raise HTTPException(
-                status_code=400,
-                detail="Unable to coerce 'raw' into an object for RECORD field."
-            )
+            raise HTTPException(status_code=400, detail="Unable to coerce 'raw' into an object for RECORD field.")
         if not isinstance(parsed, dict):
-            raise HTTPException(
-                status_code=400,
-                detail="Field 'raw' is RECORD and requires an object (dict)."
-            )
+            raise HTTPException(status_code=400, detail="Field 'raw' is RECORD and requires an object (dict).")
         return parsed
     return value
 
-# Added: build fully-qualified model name
 def _bq_model_fqn() -> str:
     if not PROJECT_ID:
         raise HTTPException(status_code=500, detail="PROJECT_ID not found for BigQuery model")
     return f"{PROJECT_ID}.plant_ops.{MODEL_NAME}"
 
-# Added: latest snapshot from BigQuery (for non-mock use or fallback)
 def _latest_snapshot_from_bq() -> Dict[str, Any]:
     if not _BQ_ENABLED or _bq_client is None:
         return {}
@@ -458,19 +433,9 @@ def healthz():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# NEW: friendly alias + HEAD support
 @app.get("/health")
 def health():
     return healthz()
-
-# Aliases so every health endpoint works the same
-@app.get("/healthz")
-def healthz_get():
-    return healthz()
-
-@app.head("/healthz")
-def healthz_head_alias():
-    return healthz_head()
 
 @app.get("/_ah/health")
 def gfe_health():
@@ -488,22 +453,14 @@ def healthz_head():
 def config_get():
     return get_config()
 
-# -------------------------
-# UPDATED: /debug/config (effective project & table reporting)
-# -------------------------
 @app.get("/debug/config")
 def debug_config():
-    """Helps verify resolution in Cloud Run."""
     known = ["/app/config/plant.yaml", "/app/plant.yaml", "config/plant.yaml", "plant.yaml"]
-
-    # Compute effective BQ table & project safely
     try:
         effective_table = _bq_table_path()
     except Exception:
         effective_table = None
-
     resolved_proj = PROJECT_ID or (getattr(_bq_client, "project", None) if _bq_client else None)
-
     return {
         "PLANT_CONFIG_env": os.getenv("PLANT_CONFIG"),
         "known_locations": known,
@@ -513,16 +470,15 @@ def debug_config():
         "bq_enabled": _BQ_ENABLED,
         "bq_error": _BQ_ERR,
         "bq_table_env": os.getenv("BQ_SNAPSHOTS_TABLE"),
-        "bq_table": effective_table,          # <-- effective value now
+        "bq_table": effective_table,
         "project_id_env": os.getenv("PROJECT_ID"),
-        "project_id_effective": resolved_proj # <-- effective project now
+        "project_id_effective": resolved_proj
     }
 
 @app.get("/snapshot")
 def snapshot():
     if USE_MOCK:
         with _state_lock:
-            # Return PVs only (keep SPs internal), but you can expose for debugging if needed
             return {
                 "production_tph": _STATE["production_tph"],
                 "kiln_feed_tph": _STATE["kiln_feed_tph"],
@@ -537,7 +493,6 @@ def snapshot():
 
 @app.post("/snapshot/set")
 def snapshot_set(req: SnapshotSetReq):
-    """Manually nudge mock values (testing dashboards/flows)."""
     if not USE_MOCK:
         raise HTTPException(status_code=405, detail="Not allowed on live plant")
     with _state_lock:
@@ -551,10 +506,8 @@ def snapshot_set(req: SnapshotSetReq):
 def optimize_routine(req: RoutineOptimizeReq):
     cfg = get_config()
     levers: Dict[str, Any] = cfg.get("levers", {})
-
     s = dict(req.snapshot)
 
-    # Build supports-only energy trims (respect hold_in_routine in config)
     recipe: Dict[str, float] = {}
     for lever, meta in levers.items():
         if meta.get("hold_in_routine"):
@@ -596,21 +549,16 @@ def optimize_load(req: LoadOptimizeReq):
     target_tph = float(s["production_tph"]) * (1.0 + sign * req.delta_pct / 100.0)
 
     targets: Dict[str, float] = {}
-
     if "kiln_feed_tph" in s and "kiln_feed_tph" in levers:
         targets["kiln_feed_tph"] = target_tph
-
     if "separator_dp_pa" in s and "separator_dp_pa" in levers:
         targets["separator_dp_pa"] = 660.0 if req.direction == "up" else 600.0
-
     if "id_fan_flow_Nm3_h" in s and "id_fan_flow_Nm3_h" in levers:
         scale = 1.04 if req.direction == "up" else 0.97
         targets["id_fan_flow_Nm3_h"] = s["id_fan_flow_Nm3_h"] * scale
-
     if "cooler_airflow_Nm3_h" in s and "cooler_airflow_Nm3_h" in levers:
         scale = 1.08 if req.direction == "up" else 0.95
         targets["cooler_airflow_Nm3_h"] = s["cooler_airflow_Nm3_h"] * scale
-
     if "kiln_speed_rpm" in s and "kiln_speed_rpm" in levers:
         if req.direction == "up":
             targets["kiln_speed_rpm"] = min(levers["kiln_speed_rpm"].get("max", 4.2), s["kiln_speed_rpm"] + 0.072)
@@ -650,33 +598,28 @@ def actuate_apply_stage(req: ApplyStageReq = Body(default={})):
         raise HTTPException(status_code=422, detail="No setpoints provided")
 
     if USE_MOCK:
-        # Respect lever limits from config
         cfg = get_config()
         levers: Dict[str, Any] = cfg.get("levers", {})
         with _state_lock:
             sp = _STATE.setdefault("sp", {})
             for k, v in setpts.items():
-                if k not in sp:
-                    # only apply known control keys
-                    if k not in ("kiln_feed_tph","separator_dp_pa","id_fan_flow_Nm3_h","cooler_airflow_Nm3_h","kiln_speed_rpm"):
-                    # silently ignore unknowns; you can raise 400 if desired
-                        continue
-                    sp[k] = float(_STATE.get(k, v))
+                if k not in ("kiln_feed_tph","separator_dp_pa","id_fan_flow_Nm3_h","cooler_airflow_Nm3_h","kiln_speed_rpm"):
+                    continue
                 lo = levers.get(k, {}).get("min", -1e12)
                 hi = levers.get(k, {}).get("max", 1e12)
                 sp[k] = clamp(float(v), lo, hi)
 
-            # Nudge PVs a bit immediately for responsiveness; background loop will continue
+            # immediate nudge for responsiveness
             for k in ("kiln_feed_tph","separator_dp_pa","id_fan_flow_Nm3_h","cooler_airflow_Nm3_h","kiln_speed_rpm"):
                 if k in sp:
                     cur = float(_STATE[k])
                     tgt = float(sp[k])
                     _STATE[k] = cur + 0.5*(tgt - cur)
-            _physics_step(_STATE)
+
+            _physics_tick(_STATE, dt_sec=MOCK_TICK_SEC)
 
         return {"ok": True}
 
-    # TODO: wire to real plant (OPC UA / Modbus)
     return {"ok": True, "note": "Live plant write path not implemented"}
 
 @app.post("/actuate/rollback")
@@ -690,16 +633,11 @@ def actuate_rollback():
 # -------------------------
 @app.post("/ingest")
 def ingest(doc: dict = Body(default={})):
-    """
-    Upserts a single row into BigQuery table.
-    Body may contain {"snapshot": {...}}; if absent, the current /snapshot is fetched.
-    """
     if not _BQ_ENABLED or _bq_client is None:
         raise HTTPException(status_code=500, detail=_BQ_ERR or "BigQuery unavailable")
 
     try:
         snap = doc.get("snapshot") or snapshot()
-        # basic presence check
         required = [
             "production_tph", "kiln_feed_tph", "separator_dp_pa",
             "id_fan_flow_Nm3_h", "cooler_airflow_Nm3_h",
@@ -710,17 +648,14 @@ def ingest(doc: dict = Body(default={})):
                 raise HTTPException(status_code=400, detail=f"snapshot missing field: {k}")
 
         table = _bq_table_path()
-        # Introspect schema to decide how to format 'raw'
         try:
             tbl_obj = _bq_client.get_table(table)  # type: ignore
             raw_field_type = next((f.field_type for f in tbl_obj.schema if f.name == "raw"), None)
         except Exception:
             raw_field_type = None
 
-        # Allow skipping 'raw' via env flag
         skip_raw = os.getenv("SKIP_RAW") in ("1", "true", "yes")
 
-        # Prepare row with robust timestamp and normalized 'raw'
         row: Dict[str, Any] = {
             "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "source": doc.get("source", "scheduler"),
@@ -736,10 +671,8 @@ def ingest(doc: dict = Body(default={})):
         if not skip_raw:
             row["raw"] = _normalize_json_for_field(snap, raw_field_type)
 
-        # First attempt: streaming insert (fast path)
         errors = _bq_client.insert_rows_json(table, [row])  # type: ignore
         if errors:
-            # If error looks like schema mismatch, fall back to parameterized SQL
             msg = json.dumps(errors)
             need_sql_fallback = ("not a record" in msg.lower()) or ("invalid" in msg.lower())
             if not need_sql_fallback:
@@ -753,9 +686,7 @@ def ingest(doc: dict = Body(default={})):
                       id_fan_flow_Nm3_h, cooler_airflow_Nm3_h, kiln_speed_rpm,
                       o2_percent, specific_power_kwh_per_ton
                     )
-                    VALUES (
-                      @ts, @source, @p, @kf, @dp, @idf, @caf, @ks, @o2, @sp
-                    )
+                    VALUES (@ts,@source,@p,@kf,@dp,@idf,@caf,@ks,@o2,@sp)
                 """
                 params = [
                     bigquery.ScalarQueryParameter("ts", "TIMESTAMP", datetime.datetime.now(datetime.timezone.utc)),
@@ -776,9 +707,7 @@ def ingest(doc: dict = Body(default={})):
                       id_fan_flow_Nm3_h, cooler_airflow_Nm3_h, kiln_speed_rpm,
                       o2_percent, specific_power_kwh_per_ton, raw
                     )
-                    VALUES (
-                      @ts, @source, @p, @kf, @dp, @idf, @caf, @ks, @o2, @sp, @raw
-                    )
+                    VALUES (@ts,@source,@p,@kf,@dp,@idf,@caf,@ks,@o2,@sp,@raw)
                 """
                 params = [
                     bigquery.ScalarQueryParameter("ts", "TIMESTAMP", datetime.datetime.now(datetime.timezone.utc)),
@@ -793,7 +722,6 @@ def ingest(doc: dict = Body(default={})):
                     bigquery.ScalarQueryParameter("sp", "FLOAT64", float(snap["specific_power_kwh_per_ton"])),
                     bigquery.ScalarQueryParameter("raw", "JSON", _normalize_json_for_field(snap, "JSON")),
                 ]
-
             job_config = bigquery.QueryJobConfig(query_parameters=params)
             job = _bq_client.query(sql, job_config=job_config)  # type: ignore
             job.result()
@@ -808,11 +736,6 @@ def ingest(doc: dict = Body(default={})):
 # -------------------------
 @app.post("/predict/spower")
 def predict_spower_route(doc: dict = Body(default={})):
-    """
-    Returns predicted specific_power_kwh_per_ton using BQML model plant_ops.spower_reg.
-    Body: {"snapshot": {...}} (optional). If absent, uses mock state (if USE_MOCK) else latest BQ snapshot.
-    """
-    # Build snapshot input
     snap = (doc.get("snapshot") or {})
     if not snap:
         if USE_MOCK:
@@ -821,7 +744,6 @@ def predict_spower_route(doc: dict = Body(default={})):
         else:
             snap = _latest_snapshot_from_bq()
 
-    # Coerce numerics
     def f(x):
         try:
             return float(x)
@@ -838,12 +760,10 @@ def predict_spower_route(doc: dict = Body(default={})):
         "o2_percent":           f(snap.get("o2_percent")),
     }
 
-    # If BigQuery is not enabled, return mock prediction so UI still works
     if not _BQ_ENABLED or _bq_client is None:
         pred = {"predicted_specific_power_kwh_per_ton": predict_specific_power({**snap})}
         return {"input": params, "prediction": pred, "note": "BQ disabled; mock prediction"}
 
-    # Build ML.PREDICT query
     model_fqn = _bq_model_fqn()
     from google.cloud import bigquery  # type: ignore
 
@@ -881,11 +801,9 @@ def predict_spower_route(doc: dict = Body(default={})):
 
 @app.get("/metrics")
 def metrics():
-    """Tiny JSON metrics for dashboards (Grafana/Cloud Run custom)."""
     if USE_MOCK:
         with _state_lock:
             s = dict(_STATE)
-            # don’t expose SPs by default
             s.pop("sp", None)
     else:
         s = {}
