@@ -7,6 +7,7 @@ import logging
 import glob
 import threading
 import time
+import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
@@ -15,6 +16,8 @@ import datetime
 from fastapi import FastAPI, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
 # ------------------------------------------------------------
 # Optional planner import (fallbacks provided if not available)
@@ -95,11 +98,11 @@ DATA_FILE = os.getenv("DATA_FILE", "data/cement_240TPD_KPI_mockup_v2.xlsx")
 SERVICE_VERSION = os.getenv("SERVICE_VERSION", "1.0.0")
 PORT = int(os.getenv("PORT", "8080"))
 
-USE_MOCK = int(os.getenv("USE_MOCK", "1"))           # 1 => use in-process mock plant
+USE_MOCK = int(os.getenv("USE_MOCK", "1"))
 MOCK_TICK_SEC = float(os.getenv("MOCK_TICK_SEC", "5"))
-APPLY_ENABLED = int(os.getenv("APPLY_ENABLED", "1")) # 1 => /actuate/* mutates the mock plant
+APPLY_ENABLED = int(os.getenv("APPLY_ENABLED", "1"))
 
-# Project for BigQuery (prefer Cloud Run-provided envs)
+# Project (prefer explicit env)
 PROJECT_ID = (
     os.getenv("PROJECT_ID")
     or os.getenv("GOOGLE_CLOUD_PROJECT")
@@ -107,21 +110,24 @@ PROJECT_ID = (
     or ""
 )
 
-# BigQuery location + model name (added)
 BQ_LOCATION = os.getenv("BQ_LOCATION", "asia-south2")
-MODEL_NAME = os.getenv("BQ_MODEL_NAME", "spower_reg")  # stable model name in dataset plant_ops
+MODEL_NAME = os.getenv("BQ_MODEL_NAME", "spower_reg")
+
+# Table envs (optional; if unset, we derive from project at runtime)
+BQ_SNAPSHOTS_TABLE_ENV = os.getenv("BQ_SNAPSHOTS_TABLE")
+BQ_PLANS_TABLE_ENV     = os.getenv("BQ_PLANS_TABLE")
+BQ_ACTS_TABLE_ENV      = os.getenv("BQ_ACTUATIONS_TABLE")
+BQ_ROUTINE_TABLE_ENV   = os.getenv("BQ_ROUTINE_TABLE")
 
 # -------------------------
 # App & CORS
 # -------------------------
 app = FastAPI(title="Plant Agent API", version=SERVICE_VERSION)
 
-# UI origins list (use your real UI URL; keep localhost optional for dev)
 UI_ORIGINS = [
-    "https://your-ui.example.com",   # ← your real UI origin (include https)
-    # "http://localhost:3000",       # ← keep this while developing locally (optional)
+    "https://your-ui.example.com",
+    # "http://localhost:3000",
 ]
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=UI_ORIGINS,
@@ -138,12 +144,7 @@ def _resolve_config_path() -> str:
     if p and os.path.exists(p):
         logging.info(f"PLANT_CONFIG env set, using: {p}")
         return p
-    candidates = [
-        "/app/config/plant.yaml",
-        "/app/plant.yaml",
-        "config/plant.yaml",
-        "plant.yaml",
-    ]
+    candidates = ["/app/config/plant.yaml", "/app/plant.yaml", "config/plant.yaml", "plant.yaml"]
     for c in candidates:
         if os.path.exists(c):
             logging.info(f"Found plant.yaml at: {c}")
@@ -157,7 +158,7 @@ def _resolve_config_path() -> str:
 
 _config_cache: Dict[str, Any] = {}
 _config_mtime: Optional[float] = None
-_config_path: Optional[float] = None
+_config_path: Optional[str] = None
 
 def _stat_mtime(path: str) -> Optional[float]:
     try:
@@ -191,6 +192,9 @@ def ensure_data_present() -> Tuple[str, List[str]]:
 # -------------------------
 # Helpers
 # -------------------------
+def _now_ts() -> datetime.datetime:
+    return datetime.datetime.now(datetime.timezone.utc)
+
 def clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
 
@@ -198,12 +202,33 @@ def predict_specific_power(snapshot: Dict[str, Any]) -> float:
     cur = float(snapshot.get("specific_power_kwh_per_ton", 12.5))
     return round(cur * 0.99, 3)
 
+KPI_KEYS = [
+    "production_tph", "kiln_feed_tph", "separator_dp_pa",
+    "id_fan_flow_Nm3_h", "cooler_airflow_Nm3_h",
+    "kiln_speed_rpm", "o2_percent", "specific_power_kwh_per_ton"
+]
+
+def _diff_kpis(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Optional[float]]:
+    out: Dict[str, Optional[float]] = {}
+    for k in KPI_KEYS:
+        va = a.get(k)
+        vb = b.get(k)
+        try:
+            out[k] = (float(vb) - float(va)) if va is not None and vb is not None else None
+        except Exception:
+            out[k] = None
+    out["ts"] = _now_ts().isoformat()
+    return out
+
+def _as_json_string(v: Any) -> str:
+    """Serialize dict/list/etc to a compact JSON literal string."""
+    return json.dumps(v, separators=(",", ":"), ensure_ascii=False)
+
 # -------------------------
-# Mock plant state & thread
+# Mock plant state & thread (with SPs)
 # -------------------------
 _state_lock = threading.Lock()
 _STATE: Dict[str, float] = {
-    # PVs
     "production_tph": 10.0,
     "kiln_feed_tph": 10.0,
     "separator_dp_pa": 620.0,
@@ -213,7 +238,6 @@ _STATE: Dict[str, float] = {
     "o2_percent": 3.3,
     "specific_power_kwh_per_ton": 12.5,
 }
-# Control setpoints (SPs) the loop will chase
 _STATE.setdefault("sp", {
     "kiln_feed_tph": _STATE["kiln_feed_tph"],
     "separator_dp_pa": _STATE["separator_dp_pa"],
@@ -223,13 +247,6 @@ _STATE.setdefault("sp", {
 })
 
 def _physics_tick(state: Dict[str, float], dt_sec: float) -> None:
-    """
-    Mock dynamics:
-      - PVs move toward SPs.
-      - production_tph follows kiln_feed SP (first-order).
-      - O2 depends on ID fan flow.
-      - kWh/t depends on production, ΔP, O2.
-    """
     sp = state.get("sp", {})
     if not sp:
         return
@@ -250,14 +267,14 @@ def _physics_tick(state: Dict[str, float], dt_sec: float) -> None:
     tau_prod = 20.0
     prod_alpha = min(1.0, dt_sec / tau_prod)
     desired_prod = float(sp.get("kiln_feed_tph", state["kiln_feed_tph"])) * 1.00
-    if not (2.5 <= state["o2_percent"] <= 4.5):  # optional gating
+    if not (2.5 <= state["o2_percent"] <= 4.5):
         desired_prod = min(desired_prod, state["production_tph"])
     prod_lo = levers.get("production_tph", {}).get("min", 0.0) or 0.0
     prod_hi = levers.get("production_tph", {}).get("max", 1e12)
     desired_prod = clamp(desired_prod, prod_lo, prod_hi)
     state["production_tph"] += prod_alpha * (desired_prod - state["production_tph"])
 
-    # 3) O2 vs ID fan flow (nominal)
+    # 3) O2 vs ID fan flow
     o2_nom = 2.6 + 0.000003 * (sp.get("id_fan_flow_Nm3_h", state["id_fan_flow_Nm3_h"]) - 150_000.0)
     o2_alpha = min(1.0, dt_sec / 5.0)
     state["o2_percent"] += o2_alpha * (o2_nom - state["o2_percent"])
@@ -295,11 +312,14 @@ if USE_MOCK:
 # -------------------------
 class RoutineOptimizeReq(BaseModel):
     snapshot: Dict[str, Any]
+    targets: Optional[Dict[str, Any]] = None
+    constraints: Optional[Dict[str, Any]] = None
 
 class LoadOptimizeReq(BaseModel):
     snapshot: Dict[str, Any]
     direction: str = Field(..., pattern="^(up|down)$")
     delta_pct: float = Field(..., gt=0, le=50)
+    steps: Optional[int] = None
 
 class ApplyStageReq(BaseModel):
     current: Optional[Dict[str, Any]] = None
@@ -307,6 +327,10 @@ class ApplyStageReq(BaseModel):
     stage: Optional[Dict[str, Any]] = None
     proposal: Optional[Dict[str, float]] = None
     proposed_setpoints: Optional[Dict[str, float]] = None
+
+    plan_id: Optional[str] = None
+    mode: Optional[str] = None
+    stage_index: Optional[int] = None
 
     def extract_setpoints(self) -> Dict[str, float]:
         if isinstance(self.setpoints, dict):
@@ -336,52 +360,36 @@ except Exception as e:
     _BQ_ENABLED = False
     _BQ_ERR = f"BigQuery client not initialized: {e}"
 
-def _bq_table_path() -> str:
-    tbl = os.getenv("BQ_SNAPSHOTS_TABLE")
-    if tbl:
-        return tbl
-    if not PROJECT_ID:
-        raise HTTPException(status_code=500, detail="PROJECT_ID not found for BigQuery table")
-    return f"{PROJECT_ID}.plant_ops.snapshots"
+# ---------- Effective project & table FQNs ----------
+def _effective_project() -> str:
+    if PROJECT_ID:
+        return PROJECT_ID
+    if _bq_client and getattr(_bq_client, "project", None):
+        return _bq_client.project  # type: ignore[attr-defined]
+    raise HTTPException(status_code=500, detail="PROJECT_ID not found for BigQuery")
 
-def _normalize_json_for_field(value: Any, field_type: Optional[str]) -> Any:
-    if isinstance(value, (dict, list)):
-        return value
-    if isinstance(value, str):
-        try:
-            parsed = json.loads(value)
-            if field_type == "RECORD" and not isinstance(parsed, dict):
-                raise ValueError("RECORD field requires an object")
-            return parsed
-        except Exception:
-            if field_type == "JSON":
-                return {"value": value}
-            raise HTTPException(
-                status_code=400,
-                detail="Field 'raw' is RECORD and requires an object (e.g., JSON object). "
-                       "Provide a dict body or a JSON string that parses to an object."
-            )
-    if field_type == "JSON":
-        return value
-    if field_type == "RECORD":
-        try:
-            parsed = json.loads(json.dumps(value, default=str))
-        except Exception:
-            raise HTTPException(status_code=400, detail="Unable to coerce 'raw' into an object for RECORD field.")
-        if not isinstance(parsed, dict):
-            raise HTTPException(status_code=400, detail="Field 'raw' is RECORD and requires an object (dict).")
-        return parsed
-    return value
+def _snapshots_table() -> str:
+    return BQ_SNAPSHOTS_TABLE_ENV or f"{_effective_project()}.plant_ops.snapshots"
+
+def _plans_table() -> str:
+    return BQ_PLANS_TABLE_ENV or f"{_effective_project()}.plant_ops.plans_v2"
+
+def _acts_table() -> str:
+    return BQ_ACTS_TABLE_ENV or f"{_effective_project()}.plant_ops.actuations_v2"
+
+def _routine_table() -> str:
+    return BQ_ROUTINE_TABLE_ENV or f"{_effective_project()}.plant_ops.routine_suggestions_v2"
+
+def _bq_table_path() -> str:  # snapshots legacy helper
+    return _snapshots_table()
 
 def _bq_model_fqn() -> str:
-    if not PROJECT_ID:
-        raise HTTPException(status_code=500, detail="PROJECT_ID not found for BigQuery model")
-    return f"{PROJECT_ID}.plant_ops.{MODEL_NAME}"
+    return f"{_effective_project()}.plant_ops.{MODEL_NAME}"
 
 def _latest_snapshot_from_bq() -> Dict[str, Any]:
     if not _BQ_ENABLED or _bq_client is None:
         return {}
-    table = _bq_table_path()
+    table = _snapshots_table()
     sql = f"""
       SELECT
         production_tph, kiln_feed_tph, separator_dp_pa,
@@ -395,6 +403,110 @@ def _latest_snapshot_from_bq() -> Dict[str, Any]:
     """
     rows = list(_bq_client.query(sql, location=BQ_LOCATION).result())
     return dict(rows[0]) if rows else {}
+
+# ---------- Flexible BQ helpers & recent-attempt memory ----------
+_BQ_RECENT: List[Dict[str, Any]] = []
+
+def _bq_get_schema(table_fqn: str) -> Dict[str, str]:
+    try:
+        tbl = _bq_client.get_table(table_fqn)  # type: ignore
+        return {f.name: f.field_type for f in tbl.schema}
+    except Exception:
+        return {}
+
+def _coerce_for_field(value: Any, field_type: str):
+    if value is None:
+        return None
+    try:
+        if field_type == "TIMESTAMP":
+            if isinstance(value, datetime.datetime):
+                return value.isoformat()
+            return str(value)
+        if field_type == "INT64":
+            return int(value)
+        if field_type in ("FLOAT", "FLOAT64", "NUMERIC", "BIGNUMERIC"):
+            return float(value)
+        if field_type == "BOOL":
+            return bool(value)
+        if field_type == "JSON":
+            # ✅ BigQuery streaming expects JSON values as JSON-encoded strings
+            if isinstance(value, (dict, list)):
+                return json.dumps(value, separators=(",", ":"))
+            if isinstance(value, (int, float, bool)) or value is None:
+                return json.dumps(value)
+            # assume it's already a JSON string
+            return str(value)
+        if field_type == "RECORD":
+            # RECORD can take a dict; try to parse strings into dicts
+            if isinstance(value, (dict, list)):
+                return value
+            try:
+                parsed = json.loads(value)
+                return parsed
+            except Exception:
+                # last resort: wrap as {"value": "..."} so it's still an object
+                return {"value": value}
+        if field_type == "STRING":
+            return json.dumps(value, default=str) if isinstance(value, (dict, list)) else str(value)
+        return value
+    except Exception:
+        return None
+
+
+def _normalize_json_for_field(value: Any, field_type: Optional[str]) -> Any:
+    if isinstance(value, (dict, list)):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            if field_type == "RECORD" and not isinstance(parsed, dict):
+                raise ValueError("RECORD field requires an object")
+            return parsed
+        except Exception:
+            if field_type == "JSON":
+                return {"value": value}
+            raise
+    if field_type == "JSON":
+        return value
+    if field_type == "RECORD":
+        try:
+            parsed = json.loads(json.dumps(value, default=str))
+        except Exception:
+            raise
+        if not isinstance(parsed, dict):
+            raise ValueError("RECORD field requires an object (dict)")
+        return parsed
+    return value
+
+def _bq_insert_flexible(table_fqn: Optional[str], payload: Dict[str, Any]) -> Optional[str]:
+    if not _BQ_ENABLED or _bq_client is None or not table_fqn:
+        return "BQ disabled or table not configured"
+    schema = _bq_get_schema(table_fqn)
+    if not schema:
+        return f"Schema not found for {table_fqn}"
+    row: Dict[str, Any] = {}
+    for k, v in payload.items():
+        if k in schema:
+            row[k] = _coerce_for_field(v, schema[k])
+    try:
+        errors = _bq_client.insert_rows_json(table_fqn, [row])  # type: ignore
+        if errors:
+            return json.dumps(errors)
+        return None
+    except Exception as e:
+        return str(e)
+
+def _remember_bq_attempt(op: str, table: Optional[str], payload_keys: List[str], err: Optional[str]):
+    _BQ_RECENT.append({
+        "ts": _now_ts().isoformat(),
+        "op": op,
+        "table": table,
+        "payload_keys": payload_keys,
+        "error": err,
+        "ok": err is None,
+    })
+    if len(_BQ_RECENT) > 50:
+        del _BQ_RECENT[:-50]
 
 # -------------------------
 # Routes
@@ -411,7 +523,8 @@ def root():
         "sheets": sheets,
         "health": "/healthz",
         "endpoints": [
-            "/healthz", "/health", "/version", "/config", "/debug/config",
+            "/healthz", "/health", "/version", "/config",
+            "/debug/config", "/debug/tables", "/debug/bq_recent",
             "/snapshot", "/snapshot/set",
             "/optimize/routine", "/optimize/load",
             "/actuate/apply_stage", "/actuate/rollback",
@@ -460,7 +573,10 @@ def debug_config():
         effective_table = _bq_table_path()
     except Exception:
         effective_table = None
-    resolved_proj = PROJECT_ID or (getattr(_bq_client, "project", None) if _bq_client else None)
+    try:
+        proj_eff = _effective_project()
+    except Exception:
+        proj_eff = None
     return {
         "PLANT_CONFIG_env": os.getenv("PLANT_CONFIG"),
         "known_locations": known,
@@ -469,26 +585,53 @@ def debug_config():
         "keys": list(get_config().keys()),
         "bq_enabled": _BQ_ENABLED,
         "bq_error": _BQ_ERR,
-        "bq_table_env": os.getenv("BQ_SNAPSHOTS_TABLE"),
-        "bq_table": effective_table,
+        "bq_table_env": BQ_SNAPSHOTS_TABLE_ENV,
+        "bq_table_effective": effective_table,
         "project_id_env": os.getenv("PROJECT_ID"),
-        "project_id_effective": resolved_proj
+        "project_id_effective": proj_eff,
+    }
+
+@app.get("/debug/tables")
+def debug_tables():
+    try:
+        proj = _effective_project()
+    except Exception as e:
+        proj = f"(error: {e})"
+    return {
+        "effective_project": proj,
+        "snapshots_table": _snapshots_table(),
+        "plans_table": _plans_table(),
+        "actuations_table": _acts_table(),
+        "routine_table": _routine_table(),
+        "bq_enabled": _BQ_ENABLED,
+        "bq_location": BQ_LOCATION,
+    }
+
+@app.get("/debug/bq_recent")
+def debug_bq_recent():
+    return {
+        "recent": list(reversed(_BQ_RECENT))[:10],
+        "schemas": {
+            "snapshots": _bq_get_schema(_snapshots_table()) if _BQ_ENABLED else {},
+            "plans_v2": _bq_get_schema(_plans_table()) if _BQ_ENABLED else {},
+            "actuations_v2": _bq_get_schema(_acts_table()) if _BQ_ENABLED else {},
+            "routine_suggestions_v2": _bq_get_schema(_routine_table()) if _BQ_ENABLED else {},
+        },
+        "tables": {
+            "snapshots": _snapshots_table(),
+            "plans": _plans_table(),
+            "acts": _acts_table(),
+            "routine": _routine_table(),
+        },
+        "enabled": _BQ_ENABLED,
+        "bq_error": _BQ_ERR,
     }
 
 @app.get("/snapshot")
 def snapshot():
     if USE_MOCK:
         with _state_lock:
-            return {
-                "production_tph": _STATE["production_tph"],
-                "kiln_feed_tph": _STATE["kiln_feed_tph"],
-                "separator_dp_pa": _STATE["separator_dp_pa"],
-                "id_fan_flow_Nm3_h": _STATE["id_fan_flow_Nm3_h"],
-                "cooler_airflow_Nm3_h": _STATE["cooler_airflow_Nm3_h"],
-                "kiln_speed_rpm": _STATE["kiln_speed_rpm"],
-                "o2_percent": _STATE["o2_percent"],
-                "specific_power_kwh_per_ton": _STATE["specific_power_kwh_per_ton"],
-            }
+            return {k: v for k, v in _STATE.items() if k != "sp"}
     raise HTTPException(status_code=501, detail="Live plant connectors not configured")
 
 @app.post("/snapshot/set")
@@ -500,8 +643,11 @@ def snapshot_set(req: SnapshotSetReq):
             if k in _STATE and isinstance(v, (int, float)):
                 _STATE[k] = float(v)
         _physics_step(_STATE)
-    return {"ok": True, "state": dict(_STATE)}
+    return {"ok": True, "state": {k: v for k, v in _STATE.items() if k != "sp"}}
 
+# -------------------------
+# Optimize (Routine) + Suggestion logging
+# -------------------------
 @app.post("/optimize/routine")
 def optimize_routine(req: RoutineOptimizeReq):
     cfg = get_config()
@@ -514,10 +660,10 @@ def optimize_routine(req: RoutineOptimizeReq):
             continue
         if lever == "separator_dp_pa":
             recipe[lever] = 600.0
-        elif "id_fan_flow_Nm3_h" == lever:
+        elif lever == "id_fan_flow_Nm3_h":
             base = s.get("id_fan_flow_Nm3_h", 150000) * 0.98
             recipe[lever] = max(meta.get("min", 0), min(meta.get("max", 1e12), base))
-        elif "cooler_airflow_Nm3_h" == lever:
+        elif lever == "cooler_airflow_Nm3_h":
             base = s.get("cooler_airflow_Nm3_h", 220000) * 0.98
             recipe[lever] = max(meta.get("min", 0), min(meta.get("max", 1e12), base))
 
@@ -525,7 +671,7 @@ def optimize_routine(req: RoutineOptimizeReq):
     proposal = proposal_list[0] if proposal_list else {}
 
     pred = {"specific_power_kwh_per_ton": predict_specific_power(s)}
-    return {
+    payload = {
         "mode": "routine",
         "current": s,
         "predicted_after": pred,
@@ -534,6 +680,38 @@ def optimize_routine(req: RoutineOptimizeReq):
         "match_info": {"candidates_used": 2008},
     }
 
+    tbl = _routine_table()
+    err = None
+    if _BQ_ENABLED and tbl:
+        # Coerce 'proposed_setpoints' to JSON string if the column is JSON
+        schema = _bq_get_schema(tbl)
+        proposed = proposal
+        if schema.get("proposed_setpoints") == "JSON" and isinstance(proposal, (dict, list)):
+            proposed = _as_json_string(proposal)
+
+        suggestion_row = {
+            "suggestion_id": str(uuid.uuid4()),
+            "created_at": _now_ts(),
+            "snapshot": s,
+            "proposed_setpoints": proposed,
+            "predicted_after": pred,
+            "targets": req.targets,
+            "constraints": req.constraints,
+            "mode": "routine",
+        }
+        err = _bq_insert_flexible(tbl, suggestion_row)
+        _remember_bq_attempt("routine_insert", tbl, list(suggestion_row.keys()), err)
+        if err:
+            logging.warning("routine_suggestions_v2 insert error: %s", err)
+    else:
+        logging.info("Skipping routine suggestion logging: BQ_ENABLED=%s, table=%s", _BQ_ENABLED, tbl)
+
+    payload["bq_log"] = {"table": tbl, "insert_error": err}
+    return payload
+
+# -------------------------
+# Optimize (Load Up/Down) + Plan Logging
+# -------------------------
 @app.post("/optimize/load")
 def optimize_load(req: LoadOptimizeReq):
     cfg = get_config()
@@ -565,10 +743,14 @@ def optimize_load(req: LoadOptimizeReq):
         else:
             targets["kiln_speed_rpm"] = s["kiln_speed_rpm"]
 
-    stages = build_stage_plan(s, targets, levers, stages_max=stages_max)
+    stages = build_stage_plan(s, targets, levers, stages_max=req.steps or stages_max)
     pred = {"specific_power_kwh_per_ton": predict_specific_power(s)}
 
-    return {
+    plan_id = str(uuid.uuid4())
+    created_at = _now_ts()
+    payload = {
+        "plan_id": plan_id,
+        "created_at": created_at.isoformat(),
         "mode": f"load_{req.direction}",
         "current": s,
         "predicted_after": pred,
@@ -580,15 +762,51 @@ def optimize_load(req: LoadOptimizeReq):
         "steps_cfg": levers,
     }
 
+    tbl = _plans_table()
+    err = None
+    if _BQ_ENABLED and tbl:
+        # Convert nested stages[].setpoints to JSON string (table defines it as JSON)
+        stages_bq: List[Dict[str, Any]] = []
+        for stg in stages:
+            sp = stg.get("setpoints")
+            sp_out = _as_json_string(sp) if isinstance(sp, (dict, list)) else sp
+            stages_bq.append({
+                "name": stg.get("name"),
+                "setpoints": sp_out,
+                "checks": stg.get("checks"),
+            })
+
+        plan_row = {
+            "plan_id": plan_id,
+            "created_at": created_at,
+            "mode": f"load_{req.direction}",
+            "direction": req.direction,
+            "delta_pct": float(req.delta_pct),
+            "steps": int(req.steps) if req.steps else None,
+            "snapshot": s,
+            "targets": targets,
+            "stages": stages_bq,   # << important fix
+            "predicted_after": pred,
+        }
+        err = _bq_insert_flexible(tbl, plan_row)
+        _remember_bq_attempt("plan_insert", tbl, list(plan_row.keys()), err)
+        if err:
+            logging.warning("plans_v2 insert error: %s", err)
+    else:
+        logging.info("Skipping plan log: BQ_ENABLED=%s, table=%s", _BQ_ENABLED, tbl)
+
+    payload["bq_log"] = {"table": tbl, "insert_error": err}
+    return payload
+
+# -------------------------
+# Actuation (apply stage) + Actuation Logging
+# -------------------------
 @app.post("/actuate/apply_stage")
 def actuate_apply_stage(req: ApplyStageReq = Body(default={})):
     """
-    Accepts multiple shapes:
-      - {"setpoints": {...}}
-      - {"stage": {"setpoints": {...}}}
-      - {"proposal": {...}}
-      - {"proposed_setpoints": {...}}
-      - {"current": {...}}  # optional passthrough
+    Accepts:
+      - {"setpoints": {...}} OR {"stage": {"setpoints": {...}}} OR {"proposal": {...}} OR {"proposed_setpoints": {...}}
+      - Optional metadata: plan_id, mode, stage_index
     """
     if not APPLY_ENABLED:
         return {"ok": True, "note": "APPLY_ENABLED=0; dry-run"}
@@ -597,6 +815,12 @@ def actuate_apply_stage(req: ApplyStageReq = Body(default={})):
     if not isinstance(setpts, dict) or not setpts:
         raise HTTPException(status_code=422, detail="No setpoints provided")
 
+    # capture before snapshot
+    if USE_MOCK:
+        with _state_lock:
+            before = {k: v for k, v in _STATE.items() if k != "sp"}
+
+    # apply to mock
     if USE_MOCK:
         cfg = get_config()
         levers: Dict[str, Any] = cfg.get("levers", {})
@@ -609,7 +833,7 @@ def actuate_apply_stage(req: ApplyStageReq = Body(default={})):
                 hi = levers.get(k, {}).get("max", 1e12)
                 sp[k] = clamp(float(v), lo, hi)
 
-            # immediate nudge for responsiveness
+            # immediate nudge
             for k in ("kiln_feed_tph","separator_dp_pa","id_fan_flow_Nm3_h","cooler_airflow_Nm3_h","kiln_speed_rpm"):
                 if k in sp:
                     cur = float(_STATE[k])
@@ -617,10 +841,54 @@ def actuate_apply_stage(req: ApplyStageReq = Body(default={})):
                     _STATE[k] = cur + 0.5*(tgt - cur)
 
             _physics_tick(_STATE, dt_sec=MOCK_TICK_SEC)
+            after = {k: v for k, v in _STATE.items() if k != "sp"}
+    else:
+        before = {}
+        after = {}
 
-        return {"ok": True}
+    applied_at = _now_ts()
 
-    return {"ok": True, "note": "Live plant write path not implemented"}
+    # log to BQ
+    tbl = _acts_table()
+    err = None
+    if _BQ_ENABLED and tbl:
+        schema = _bq_get_schema(tbl)
+
+        def _maybe_stringify(val: Any, col: str):
+            # If the column is not a STRUCT/RECORD, stringify dicts/lists to a compact JSON string
+            col_type = schema.get(col)
+            if isinstance(val, (dict, list)) and col_type != "RECORD":
+                return _as_json_string(val)
+            return val
+        # If 'setpoints' column is JSON, serialize dict to JSON string
+        setpoints_for_bq: Any = setpts
+
+        stage_name = (req.stage or {}).get("name") if isinstance(req.stage, dict) else None
+        deltas_obj = _diff_kpis(before, after) if before and after else None
+        before_for_bq = _maybe_stringify(before,  "before")
+        after_for_bq  = _maybe_stringify(after,   "after")
+        deltas_for_bq = _maybe_stringify(deltas_obj, "deltas")
+
+
+        act_row = {
+            "applied_at": _now_ts(),
+            "mode": req.mode,
+            "plan_id": req.plan_id,
+            "stage_index": req.stage_index,
+            "stage_name": stage_name,
+            "setpoints": setpoints_for_bq,
+            "before": before_for_bq,
+            "after": after_for_bq,
+            "deltas": deltas_for_bq,
+        }
+        err = _bq_insert_flexible(tbl, act_row)
+        _remember_bq_attempt("actuation_insert", tbl, list(act_row.keys()), err)
+        if err:
+            logging.warning("actuations_v2 insert error: %s", err)
+    else:
+        logging.info("Skipping actuation log: BQ_ENABLED=%s, table=%s", _BQ_ENABLED, tbl)
+
+    return {"ok": True, "bq_log": {"table": tbl, "insert_error": err}}
 
 @app.post("/actuate/rollback")
 def actuate_rollback():
@@ -629,7 +897,7 @@ def actuate_rollback():
     return {"ok": True, "note": "Live plant rollback not implemented"}
 
 # -------------------------
-# /ingest → BigQuery
+# /ingest → BigQuery (snapshots)
 # -------------------------
 @app.post("/ingest")
 def ingest(doc: dict = Body(default={})):
@@ -647,7 +915,7 @@ def ingest(doc: dict = Body(default={})):
             if k not in snap:
                 raise HTTPException(status_code=400, detail=f"snapshot missing field: {k}")
 
-        table = _bq_table_path()
+        table = _snapshots_table()
         try:
             tbl_obj = _bq_client.get_table(table)  # type: ignore
             raw_field_type = next((f.field_type for f in tbl_obj.schema if f.name == "raw"), None)
@@ -657,7 +925,7 @@ def ingest(doc: dict = Body(default={})):
         skip_raw = os.getenv("SKIP_RAW") in ("1", "true", "yes")
 
         row: Dict[str, Any] = {
-            "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "ts": _now_ts().isoformat(),
             "source": doc.get("source", "scheduler"),
             "production_tph": float(snap["production_tph"]),
             "kiln_feed_tph": float(snap["kiln_feed_tph"]),
@@ -689,7 +957,7 @@ def ingest(doc: dict = Body(default={})):
                     VALUES (@ts,@source,@p,@kf,@dp,@idf,@caf,@ks,@o2,@sp)
                 """
                 params = [
-                    bigquery.ScalarQueryParameter("ts", "TIMESTAMP", datetime.datetime.now(datetime.timezone.utc)),
+                    bigquery.ScalarQueryParameter("ts", "TIMESTAMP", _now_ts()),
                     bigquery.ScalarQueryParameter("source", "STRING", doc.get("source", "scheduler")),
                     bigquery.ScalarQueryParameter("p", "FLOAT64", float(snap["production_tph"])),
                     bigquery.ScalarQueryParameter("kf", "FLOAT64", float(snap["kiln_feed_tph"])),
@@ -710,7 +978,7 @@ def ingest(doc: dict = Body(default={})):
                     VALUES (@ts,@source,@p,@kf,@dp,@idf,@caf,@ks,@o2,@sp,@raw)
                 """
                 params = [
-                    bigquery.ScalarQueryParameter("ts", "TIMESTAMP", datetime.datetime.now(datetime.timezone.utc)),
+                    bigquery.ScalarQueryParameter("ts", "TIMESTAMP", _now_ts()),
                     bigquery.ScalarQueryParameter("source", "STRING", doc.get("source", "scheduler")),
                     bigquery.ScalarQueryParameter("p", "FLOAT64", float(snap["production_tph"])),
                     bigquery.ScalarQueryParameter("kf", "FLOAT64", float(snap["kiln_feed_tph"])),
@@ -740,7 +1008,7 @@ def predict_spower_route(doc: dict = Body(default={})):
     if not snap:
         if USE_MOCK:
             with _state_lock:
-                snap = dict(_STATE)
+                snap = {k: v for k, v in _STATE.items() if k != "sp"}
         else:
             snap = _latest_snapshot_from_bq()
 
@@ -764,11 +1032,9 @@ def predict_spower_route(doc: dict = Body(default={})):
         pred = {"predicted_specific_power_kwh_per_ton": predict_specific_power({**snap})}
         return {"input": params, "prediction": pred, "note": "BQ disabled; mock prediction"}
 
-    model_fqn = _bq_model_fqn()
     from google.cloud import bigquery  # type: ignore
-
     sql = f"""
-      SELECT * FROM ML.PREDICT(MODEL `{model_fqn}`,
+      SELECT * FROM ML.PREDICT(MODEL `{_bq_model_fqn()}`,
         (SELECT
           @production_tph        AS production_tph,
           @kiln_feed_tph         AS kiln_feed_tph,
@@ -803,8 +1069,7 @@ def predict_spower_route(doc: dict = Body(default={})):
 def metrics():
     if USE_MOCK:
         with _state_lock:
-            s = dict(_STATE)
-            s.pop("sp", None)
+            s = {k: v for k, v in _STATE.items() if k != "sp"}
     else:
         s = {}
     cfg = get_config()
