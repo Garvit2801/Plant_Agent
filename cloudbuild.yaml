@@ -1,45 +1,137 @@
 # cloudbuild.yaml
-# Builds and deploys the plant-agent to Cloud Run using Artifact Registry.
-
 timeout: "1200s"
 
 substitutions:
-  _REGION: asia-south2                 # AR & Cloud Run region
-  _REPO: plant-agent                   # Artifact Registry repo (you created earlier)
-  _IMAGE: agent                        # Image name in the repo
-  _TAG: v${SHORT_SHA}                  # Tag per commit
-  _SERVICE: plant-agent                # Cloud Run service name
+  _REGION: asia-south2
+  _REPO: plant-agent
+  _IMAGE: agent
+  _SERVICE: plant-agent
 
 steps:
   # 1) Build image
-  - name: gcr.io/cloud-builders/docker
+  - id: build
+    name: gcr.io/cloud-builders/docker
     args:
       - build
       - -t
-      - asia-south2-docker.pkg.dev/$PROJECT_ID/$_REPO/$_IMAGE:$_TAG
+      - asia-south2-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_IMAGE}:v$BUILD_ID
       - .
 
   # 2) Push image
-  - name: gcr.io/cloud-builders/docker
+  - id: push
+    name: gcr.io/cloud-builders/docker
     args:
       - push
-      - asia-south2-docker.pkg.dev/$PROJECT_ID/$_REPO/$_IMAGE:$_TAG
+      - asia-south2-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_IMAGE}:v$BUILD_ID
 
-  # 3) Deploy to Cloud Run
-  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+  # 3) Deploy to Cloud Run (inject PROJECT_ID so BQ paths resolve)
+  - id: deploy
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
     entrypoint: gcloud
     args:
       - run
       - deploy
-      - $_SERVICE
-      - --image=asia-south2-docker.pkg.dev/$PROJECT_ID/$_REPO/$_IMAGE:$_TAG
-      - --region=$_REGION
+      - ${_SERVICE}
+      - --image=asia-south2-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_IMAGE}:v$BUILD_ID
+      - --region=${_REGION}
       - --allow-unauthenticated
-      - --set-env-vars=USE_MOCK=1,MOCK_TICK_SEC=5,APPLY_ENABLED=1
+      - --set-env-vars=USE_MOCK=1,MOCK_TICK_SEC=5,APPLY_ENABLED=1,PROJECT_ID=$PROJECT_ID,BQ_LOCATION=asia-south2,BQ_MODEL_NAME=spower_reg
       - --platform=managed
+      - --quiet
+
+  # 4) Smoke tests (ingress-aware + readiness retry; /predict non-fatal if BQ not ready)
+  - id: smoke-tests
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: bash
+    args:
+      - -ceu
+      - |
+        set -euo pipefail
+
+        region="${_REGION}"
+        service="${_SERVICE}"
+
+        base_url="$(gcloud run services describe "$service" --region="$region" --format='value(status.url)')"
+        ingress="$(gcloud run services describe "$service" --region="$region" --format='value(metadata.annotations["run.googleapis.com/ingress"])')"
+
+        echo "base_url=$base_url"
+        echo "ingress=$ingress"
+
+        if [[ -z "$base_url" ]]; then
+          echo "❌ base_url empty (check service/region and run.viewer on the service for the Cloud Build SA)"
+          exit 1
+        fi
+
+        # If not publicly reachable from Cloud Build, skip HTTP tests.
+        if [[ "$ingress" == "internal" || "$ingress" == "internal-and-cloud-load-balancing" ]]; then
+          echo "ℹ️ ingress='$ingress' → skipping HTTP smoke tests."
+          exit 0
+        fi
+
+        # Helper: return HTTP code
+        get_code() { curl -sS -o /dev/null -w '%{http_code}' "$1" || echo "000"; }
+
+        # --- Readiness retry for /health (unauth → auth) ---
+        auth_header=""
+        tries=60    # up to ~5 minutes (60 * 5s)
+        while (( tries-- )); do
+          code="$(get_code "$base_url/health")"
+          if [[ "$code" == "200" ]]; then break; fi
+          if [[ -z "$auth_header" ]]; then
+            id_token="$(gcloud auth print-identity-token --audiences="$base_url")" || true
+            [[ -n "${id_token:-}" ]] && auth_header="Authorization: Bearer $id_token"
+          fi
+          if [[ -n "$auth_header" ]]; then
+            code="$(curl -sS -o /dev/null -w '%{http_code}' -H "$auth_header" "$base_url/health" || true)"
+            [[ "$code" == "200" ]] && break
+          fi
+          sleep 5
+        done
+
+        if [[ "$code" != "200" ]]; then
+          echo "❌ /health not ready (last code=$code). Body (if auth available):"
+          [[ -n "$auth_header" ]] && curl -sS -H "$auth_header" "$base_url/health" || curl -sS "$base_url/health" || true
+          exit 1
+        fi
+        echo "✅ /health OK"
+
+        # /debug/config → decide /ingest
+        dbg="$(curl -sS ${auth_header:+-H "$auth_header"} "$base_url/debug/config" || true)"
+        echo "debug/config: $dbg"
+        bq_enabled="$(printf '%s' "$dbg" | grep -o '"bq_enabled":[[:space:]]*\(true\|false\)' | awk -F: '{gsub(/[[:space:]]*/,"",$2); print $2}')"
+
+        # /ingest (only if BigQuery enabled by service)
+        if [[ "$bq_enabled" == "true" ]]; then
+          echo "Running /ingest"
+          code="$(curl -sS -o /tmp/ingest.json -w '%{http_code}' -H "Content-Type: application/json" ${auth_header:+-H "$auth_header"} -X POST "$base_url/ingest" -d '{}' || true)"
+          body="$(cat /tmp/ingest.json || true)"
+          echo "ingest response ($code): $body"
+          if [[ "$code" == "200" ]] && echo "$body" | grep -q '"ok":[[:space:]]*true'; then
+            echo "✅ /ingest OK"
+          else
+            echo "⚠️  /ingest not ok:true — continuing (BQ table/dataset may not exist yet)."
+          fi
+        else
+          echo "ℹ️ BigQuery disabled → skipping /ingest"
+        fi
+
+        # /predict/spower (non-fatal if BQ model not ready)
+        echo "Running /predict/spower"
+        pred_payload='{"snapshot":{"production_tph":120,"kiln_feed_tph":118,"separator_dp_pa":450,"id_fan_flow_Nm3_h":180000,"cooler_airflow_Nm3_h":200000,"kiln_speed_rpm":4.5,"o2_percent":2.1}}'
+        pcode="$(curl -sS -o /tmp/predict.json -w '%{http_code}' -H "Content-Type: application/json" ${auth_header:+-H "$auth_header"} -X POST "$base_url/predict/spower" -d "$pred_payload" || true)"
+        pbody="$(cat /tmp/predict.json || true)"
+        echo "predict response ($pcode): $pbody"
+
+        if [[ "$pcode" == "200" ]] && echo "$pbody" | grep -q '"predicted_specific_power_kwh_per_ton"'; then
+          echo "✅ /predict/spower OK"
+        else
+          echo "⚠️  /predict/spower did not return prediction (likely BQ model missing). Not failing the build."
+        fi
+
+        echo "✅ Smoke tests completed."
 
 images:
-  - asia-south2-docker.pkg.dev/$PROJECT_ID/$_REPO/$_IMAGE:$_TAG
+  - asia-south2-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_IMAGE}:v$BUILD_ID
 
 options:
   defaultLogsBucketBehavior: REGIONAL_USER_OWNED_BUCKET
