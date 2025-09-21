@@ -133,6 +133,8 @@ UI_ORIGINS = [
     "http://localhost:5173",
     "http://localhost:3000",
     "https://your-ui.example.com",
+    "https://garvit2801.github.io",
+    "https://garvit2801.github.io/Plant_Agent",
 ]
 app.add_middleware(
     CORSMiddleware,
