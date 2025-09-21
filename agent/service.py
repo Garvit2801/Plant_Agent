@@ -114,10 +114,11 @@ BQ_LOCATION = os.getenv("BQ_LOCATION", "asia-south2")
 MODEL_NAME = os.getenv("BQ_MODEL_NAME", "spower_reg")
 
 # Table envs (optional; if unset, we derive from project at runtime)
-BQ_SNAPSHOTS_TABLE_ENV = os.getenv("BQ_SNAPSHOTS_TABLE")
-BQ_PLANS_TABLE_ENV     = os.getenv("BQ_PLANS_TABLE")
-BQ_ACTS_TABLE_ENV      = os.getenv("BQ_ACTUATIONS_TABLE")
-BQ_ROUTINE_TABLE_ENV   = os.getenv("BQ_ROUTINE_TABLE")
+BQ_SNAPSHOTS_TABLE_ENV   = os.getenv("BQ_SNAPSHOTS_TABLE")
+BQ_PLANS_TABLE_ENV       = os.getenv("BQ_PLANS_TABLE")
+BQ_ACTS_TABLE_ENV        = os.getenv("BQ_ACTUATIONS_TABLE")
+BQ_ROUTINE_TABLE_ENV     = os.getenv("BQ_ROUTINE_TABLE")
+BQ_SUGGESTIONS_TABLE_ENV = os.getenv("BQ_SUGGESTIONS_TABLE")  # NEW
 
 # -------------------------
 # App & CORS
@@ -224,6 +225,29 @@ def _as_json_string(v: Any) -> str:
     """Serialize dict/list/etc to a compact JSON literal string."""
     return json.dumps(v, separators=(",", ":"), ensure_ascii=False)
 
+def _format_suggestion_text(lever: str, current: Optional[float], proposed: Optional[float],
+                            delta_pct: Optional[float], cmin: Optional[float], cmax: Optional[float]) -> str:
+    def _fmt(x: Optional[float]) -> str:
+        try:
+            return f"{float(x):.3f}"
+        except Exception:
+            return "N/A"
+
+    if delta_pct is None or current in (None, 0) or proposed is None:
+        base = f"{lever}: set to {_fmt(proposed)}"
+    elif delta_pct > 0:
+        base = f"Increase {lever} by ~{abs(round(delta_pct,1))}% to {_fmt(proposed)}"
+    elif delta_pct < 0:
+        base = f"Reduce {lever} by ~{abs(round(delta_pct,1))}% to {_fmt(proposed)}"
+    else:
+        base = f"Hold {lever} at {_fmt(proposed)}"
+    bounds = ""
+    if cmin is not None or cmax is not None:
+        lo = f"{cmin:.3f}" if cmin is not None else "−∞"
+        hi = f"{cmax:.3f}" if cmax is not None else "+∞"
+        bounds = f" (bounds {lo}…{hi})"
+    return base + bounds
+
 # -------------------------
 # Mock plant state & thread (with SPs)
 # -------------------------
@@ -311,15 +335,25 @@ if USE_MOCK:
 # Pydantic request models
 # -------------------------
 class RoutineOptimizeReq(BaseModel):
-    snapshot: Dict[str, Any]
+    # snapshot is optional; if missing we auto-pull from mock/BQ (scheduler-friendly)
+    snapshot: Optional[Dict[str, Any]] = None
     targets: Optional[Dict[str, Any]] = None
     constraints: Optional[Dict[str, Any]] = None
+    # automation flags
+    apply_top: Optional[bool] = False
+    log_suggestions: Optional[bool] = True
 
 class LoadOptimizeReq(BaseModel):
-    snapshot: Dict[str, Any]
-    direction: str = Field(..., pattern="^(up|down)$")
-    delta_pct: float = Field(..., gt=0, le=50)
+    # snapshot optional; if missing we auto-pull from mock/BQ
+    snapshot: Optional[Dict[str, Any]] = None
+    # direction optional; inferred from target/base if omitted
+    direction: Optional[str] = Field(None, pattern="^(up|down)$")
+    # support percent OR absolute change OR explicit target
+    delta_pct: Optional[float] = Field(None, gt=0, le=50)
+    delta_abs: Optional[float] = None
+    target_tph: Optional[float] = None
     steps: Optional[int] = None
+    constraints: Optional[Dict[str, Any]] = None
 
 class ApplyStageReq(BaseModel):
     current: Optional[Dict[str, Any]] = None
@@ -379,6 +413,9 @@ def _acts_table() -> str:
 
 def _routine_table() -> str:
     return BQ_ROUTINE_TABLE_ENV or f"{_effective_project()}.plant_ops.routine_suggestions_v2"
+
+def _suggestions_table() -> str:
+    return BQ_SUGGESTIONS_TABLE_ENV or f"{_effective_project()}.plant_ops.suggestions_v1"
 
 def _bq_table_path() -> str:  # snapshots legacy helper
     return _snapshots_table()
@@ -509,6 +546,99 @@ def _remember_bq_attempt(op: str, table: Optional[str], payload_keys: List[str],
         del _BQ_RECENT[:-50]
 
 # -------------------------
+# Internal helpers: apply setpoints (reused by routes)
+# -------------------------
+def _apply_setpoints_internal(setpts: Dict[str, float],
+                              mode: Optional[str] = None,
+                              plan_id: Optional[str] = None,
+                              stage_index: Optional[int] = None,
+                              stage_name: Optional[str] = None) -> Dict[str, Any]:
+    """Apply setpoints to mock state and log to BigQuery. Returns actuation result."""
+    if not APPLY_ENABLED:
+        return {"ok": True, "note": "APPLY_ENABLED=0; dry-run"}
+
+    if not isinstance(setpts, dict) or not setpts:
+        raise HTTPException(status_code=422, detail="No setpoints provided")
+
+    # capture before snapshot
+    if USE_MOCK:
+        with _state_lock:
+            before = {k: v for k, v in _STATE.items() if k != "sp"}
+    else:
+        before = {}
+
+    # apply to mock
+    if USE_MOCK:
+        cfg = get_config()
+        levers: Dict[str, Any] = cfg.get("levers", {})
+        with _state_lock:
+            sp = _STATE.setdefault("sp", {})
+            for k, v in setpts.items():
+                if k not in ("kiln_feed_tph","separator_dp_pa","id_fan_flow_Nm3_h","cooler_airflow_Nm3_h","kiln_speed_rpm"):
+                    continue
+                lo = levers.get(k, {}).get("min", -1e12)
+                hi = levers.get(k, {}).get("max", 1e12)
+                sp[k] = clamp(float(v), lo, hi)
+
+            # immediate nudge
+            for k in ("kiln_feed_tph","separator_dp_pa","id_fan_flow_Nm3_h","cooler_airflow_Nm3_h","kiln_speed_rpm"):
+                if k in sp:
+                    cur = float(_STATE[k])
+                    tgt = float(sp[k])
+                    _STATE[k] = cur + 0.5*(tgt - cur)
+
+            _physics_tick(_STATE, dt_sec=MOCK_TICK_SEC)
+            after = {k: v for k, v in _STATE.items() if k != "sp"}
+    else:
+        after = {}
+
+    applied_at = _now_ts()
+
+    # log to BQ
+    tbl = _acts_table()
+    err = None
+    if _BQ_ENABLED and tbl:
+        schema = _bq_get_schema(tbl)
+
+        def _maybe_stringify(val: Any, col: str):
+            # If the column is not a STRUCT/RECORD, stringify dicts/lists to a compact JSON string
+            col_type = schema.get(col)
+            if isinstance(val, (dict, list)) and col_type != "RECORD":
+                return _as_json_string(val)
+            return val
+
+        deltas_obj = _diff_kpis(before, after) if before and after else None
+        before_for_bq = _maybe_stringify(before,  "before")
+        after_for_bq  = _maybe_stringify(after,   "after")
+        deltas_for_bq = _maybe_stringify(deltas_obj, "deltas")
+
+        act_row = {
+            "applied_at": applied_at,
+            "mode": mode,
+            "plan_id": plan_id,
+            "stage_index": stage_index,
+            "stage_name": stage_name,
+            "setpoints": setpts,
+            "before": before_for_bq,
+            "after": after_for_bq,
+            "deltas": deltas_for_bq,
+        }
+        err = _bq_insert_flexible(tbl, act_row)
+        _remember_bq_attempt("actuation_insert", tbl, list(act_row.keys()), err)
+        if err:
+            logging.warning("actuations_v2 insert error: %s", err)
+    else:
+        logging.info("Skipping actuation log: BQ_ENABLED=%s, table=%s", _BQ_ENABLED, tbl)
+
+    return {
+        "ok": True,
+        "applied_at": applied_at.isoformat(),
+        "before": before if isinstance(before, dict) else None,
+        "after": after if isinstance(after, dict) else None,
+        "bq_log": {"table": tbl, "insert_error": err},
+    }
+
+# -------------------------
 # Routes
 # -------------------------
 @app.get("/")
@@ -523,10 +653,10 @@ def root():
         "sheets": sheets,
         "health": "/healthz",
         "endpoints": [
-            "/healthz", "/health", "/version", "/config",
+            "/healthz", "/health", "/_ah/health", "/version", "/config",
             "/debug/config", "/debug/tables", "/debug/bq_recent",
             "/snapshot", "/snapshot/set",
-            "/optimize/routine", "/optimize/load",
+            "/optimize/routine", "/optimize/load", "/cron/routine",
             "/actuate/apply_stage", "/actuate/rollback",
             "/ingest", "/metrics",
             "/predict/spower",
@@ -603,6 +733,7 @@ def debug_tables():
         "plans_table": _plans_table(),
         "actuations_table": _acts_table(),
         "routine_table": _routine_table(),
+        "suggestions_table": _suggestions_table(),
         "bq_enabled": _BQ_ENABLED,
         "bq_location": BQ_LOCATION,
     }
@@ -616,12 +747,14 @@ def debug_bq_recent():
             "plans_v2": _bq_get_schema(_plans_table()) if _BQ_ENABLED else {},
             "actuations_v2": _bq_get_schema(_acts_table()) if _BQ_ENABLED else {},
             "routine_suggestions_v2": _bq_get_schema(_routine_table()) if _BQ_ENABLED else {},
+            "suggestions_v1": _bq_get_schema(_suggestions_table()) if _BQ_ENABLED else {},
         },
         "tables": {
             "snapshots": _snapshots_table(),
             "plans": _plans_table(),
             "acts": _acts_table(),
             "routine": _routine_table(),
+            "suggestions": _suggestions_table(),
         },
         "enabled": _BQ_ENABLED,
         "bq_error": _BQ_ERR,
@@ -646,14 +779,85 @@ def snapshot_set(req: SnapshotSetReq):
     return {"ok": True, "state": {k: v for k, v in _STATE.items() if k != "sp"}}
 
 # -------------------------
-# Optimize (Routine) + Suggestion logging
+# Optimize (Routine) + Suggestion logging + optional auto-apply
 # -------------------------
+def _insert_suggestions_rows(suggestion_id: str,
+                             created_at: datetime.datetime,
+                             current: Dict[str, Any],
+                             proposed_setpoints: Dict[str, Any],
+                             constraints: Optional[Dict[str, Any]],
+                             prediction_after: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Insert per-lever rows into suggestions_v1, returns an aggregate log dict."""
+    tbl = _suggestions_table()
+    err_any: Optional[str] = None
+    count = 0
+    for lever, proposed in (proposed_setpoints or {}).items():
+        cur = current.get(lever)
+        try:
+            cur_f = float(cur) if cur is not None else None
+        except Exception:
+            cur_f = None
+        try:
+            prop_f = float(proposed) if proposed is not None else None
+        except Exception:
+            prop_f = None
+        delta_abs = (prop_f - cur_f) if (cur_f is not None and prop_f is not None) else None
+        delta_pct = ((prop_f - cur_f) / cur_f * 100.0) if (cur_f not in (None, 0) and prop_f is not None) else None
+
+        cmin = cmax = None
+        if isinstance(constraints, dict):
+            cmeta = constraints.get(lever, {})
+            if isinstance(cmeta, dict):
+                cmin = cmeta.get("min")
+                cmax = cmeta.get("max")
+
+        suggestion_text = _format_suggestion_text(lever, cur_f, prop_f, delta_pct, cmin, cmax)
+
+        row = {
+            "suggestion_row_id": str(uuid.uuid4()),
+            "suggestion_id": suggestion_id,
+            "created_at": created_at,
+            "source": "routine",
+            "lever": lever,
+            "current_value": cur_f,
+            "proposed_value": prop_f,
+            "delta_abs": delta_abs,
+            "delta_pct": delta_pct,
+            "constraint_min": cmin,
+            "constraint_max": cmax,
+            "confidence": None,
+            "suggestion_text": suggestion_text,
+            "proposed_setpoints": proposed_setpoints,  # whole JSON for traceability
+            "snapshot_before": current,
+            "prediction_after": prediction_after or None,
+        }
+        if _BQ_ENABLED and tbl:
+            err = _bq_insert_flexible(tbl, row)
+            _remember_bq_attempt("suggestion_insert", tbl, list(row.keys()), err)
+            if err:
+                logging.warning("suggestions_v1 insert error: %s", err)
+                err_any = err
+        count += 1
+    return {"table": tbl, "insert_error": err_any, "rows_inserted": count}
+
 @app.post("/optimize/routine")
 def optimize_routine(req: RoutineOptimizeReq):
+    # Obtain snapshot (supports scheduler: body may omit snapshot)
+    if req.snapshot and isinstance(req.snapshot, dict):
+        s = dict(req.snapshot)
+    else:
+        if USE_MOCK:
+            with _state_lock:
+                s = {k: v for k, v in _STATE.items() if k != "sp"}
+        else:
+            s = _latest_snapshot_from_bq()
+        if not s:
+            raise HTTPException(status_code=422, detail="No snapshot provided and none available")
+
     cfg = get_config()
     levers: Dict[str, Any] = cfg.get("levers", {})
-    s = dict(req.snapshot)
 
+    # Build routine "recipe" respecting hold_in_routine
     recipe: Dict[str, float] = {}
     for lever, meta in levers.items():
         if meta.get("hold_in_routine"):
@@ -680,18 +884,20 @@ def optimize_routine(req: RoutineOptimizeReq):
         "match_info": {"candidates_used": 2008},
     }
 
+    # Log to routine_suggestions_v2
     tbl = _routine_table()
     err = None
+    suggestion_id = str(uuid.uuid4())
+    created_at = _now_ts()
     if _BQ_ENABLED and tbl:
-        # Coerce 'proposed_setpoints' to JSON string if the column is JSON
         schema = _bq_get_schema(tbl)
         proposed = proposal
         if schema.get("proposed_setpoints") == "JSON" and isinstance(proposal, (dict, list)):
             proposed = _as_json_string(proposal)
 
         suggestion_row = {
-            "suggestion_id": str(uuid.uuid4()),
-            "created_at": _now_ts(),
+            "suggestion_id": suggestion_id,
+            "created_at": created_at,
             "snapshot": s,
             "proposed_setpoints": proposed,
             "predicted_after": pred,
@@ -706,39 +912,115 @@ def optimize_routine(req: RoutineOptimizeReq):
     else:
         logging.info("Skipping routine suggestion logging: BQ_ENABLED=%s, table=%s", _BQ_ENABLED, tbl)
 
+    # Insert normalized suggestions (one row per lever)
+    sugg_log = None
+    if req.log_suggestions:
+        try:
+            sugg_log = _insert_suggestions_rows(suggestion_id, created_at, s, proposal, req.constraints or {}, pred)
+        except Exception as e:
+            logging.warning("suggestions_v1 insert exception: %s", e)
+            sugg_log = {"table": _suggestions_table(), "insert_error": str(e), "rows_inserted": 0}
+
+    # Optional auto-apply of the top proposal
+    actuation = None
+    applied = False
+    if req.apply_top and isinstance(proposal, dict) and proposal:
+        try:
+            actuation = _apply_setpoints_internal(proposal, mode="routine", plan_id=None,
+                                                  stage_index=None, stage_name="routine_auto_apply")
+            applied = True and (actuation.get("bq_log", {}).get("insert_error") is None)
+        except HTTPException as e:
+            logging.warning("Auto-apply failed: %s", e.detail)
+            actuation = {"ok": False, "error": e.detail}
+        except Exception as e:
+            logging.warning("Auto-apply exception: %s", e)
+            actuation = {"ok": False, "error": str(e)}
+
     payload["bq_log"] = {"table": tbl, "insert_error": err}
+    if sugg_log:
+        payload["suggestions_log"] = sugg_log
+    payload["applied"] = bool(applied)
+    if actuation:
+        payload["actuation"] = actuation
+    payload["suggestion_id"] = suggestion_id
+    payload["created_at"] = created_at.isoformat()
     return payload
+
+# Convenience alias for Scheduler if you prefer a fixed path
+@app.post("/cron/routine")
+def cron_routine(body: dict = Body(default={})):
+    req = RoutineOptimizeReq(
+        snapshot=body.get("snapshot"),
+        targets=body.get("targets"),
+        constraints=body.get("constraints"),
+        apply_top=bool(body.get("apply_top", True)),
+        log_suggestions=bool(body.get("log_suggestions", True)),
+    )
+    return optimize_routine(req)
 
 # -------------------------
 # Optimize (Load Up/Down) + Plan Logging
 # -------------------------
 @app.post("/optimize/load")
 def optimize_load(req: LoadOptimizeReq):
+    # Obtain snapshot (supports scheduler / convenience)
+    if req.snapshot and isinstance(req.snapshot, dict):
+        s = dict(req.snapshot)
+    else:
+        if USE_MOCK:
+            with _state_lock:
+                s = {k: v for k, v in _STATE.items() if k != "sp"}
+        else:
+            s = _latest_snapshot_from_bq()
+        if not s:
+            raise HTTPException(status_code=422, detail="No snapshot provided and none available")
+
     cfg = get_config()
     levers: Dict[str, Any] = cfg.get("levers", {})
     cadence: Dict[str, Any] = cfg.get("cadence", {})
     stages_max = int(cadence.get("stages_max", 4))
 
-    s = dict(req.snapshot)
     if "production_tph" not in s or s["production_tph"] <= 0:
         raise HTTPException(status_code=422, detail="snapshot.production_tph is required and > 0")
 
-    sign = 1.0 if req.direction == "up" else -1.0
-    target_tph = float(s["production_tph"]) * (1.0 + sign * req.delta_pct / 100.0)
+    base_prod = float(s["production_tph"])
+    # Normalize desired target production
+    target: Optional[float] = None
+    if req.target_tph is not None:
+        target = float(req.target_tph)
+    elif req.delta_abs is not None:
+        target = base_prod + float(req.delta_abs)
+    elif req.delta_pct is not None:
+        # if direction unknown, infer "up" by default; we'll recompute direction later from target/base
+        pct = float(req.delta_pct)
+        dir_factor = 1.0 if (req.direction or "up") == "up" else -1.0
+        target = base_prod * (1.0 + dir_factor * pct / 100.0)
+    else:
+        raise HTTPException(status_code=422, detail="Provide one of target_tph, delta_abs, or delta_pct")
 
+    # Determine direction if not given
+    direction = req.direction
+    if direction is None:
+        direction = "up" if target > base_prod else "down"
+
+    # Compute realized deltas for logging
+    delta_abs_calc = target - base_prod
+    delta_pct_calc = (target / base_prod - 1.0) * 100.0 if base_prod else None
+
+    # Build lever targets
     targets: Dict[str, float] = {}
     if "kiln_feed_tph" in s and "kiln_feed_tph" in levers:
-        targets["kiln_feed_tph"] = target_tph
+        targets["kiln_feed_tph"] = target
     if "separator_dp_pa" in s and "separator_dp_pa" in levers:
-        targets["separator_dp_pa"] = 660.0 if req.direction == "up" else 600.0
+        targets["separator_dp_pa"] = 660.0 if direction == "up" else 600.0
     if "id_fan_flow_Nm3_h" in s and "id_fan_flow_Nm3_h" in levers:
-        scale = 1.04 if req.direction == "up" else 0.97
+        scale = 1.04 if direction == "up" else 0.97
         targets["id_fan_flow_Nm3_h"] = s["id_fan_flow_Nm3_h"] * scale
     if "cooler_airflow_Nm3_h" in s and "cooler_airflow_Nm3_h" in levers:
-        scale = 1.08 if req.direction == "up" else 0.95
+        scale = 1.08 if direction == "up" else 0.95
         targets["cooler_airflow_Nm3_h"] = s["cooler_airflow_Nm3_h"] * scale
     if "kiln_speed_rpm" in s and "kiln_speed_rpm" in levers:
-        if req.direction == "up":
+        if direction == "up":
             targets["kiln_speed_rpm"] = min(levers["kiln_speed_rpm"].get("max", 4.2), s["kiln_speed_rpm"] + 0.072)
         else:
             targets["kiln_speed_rpm"] = s["kiln_speed_rpm"]
@@ -751,17 +1033,29 @@ def optimize_load(req: LoadOptimizeReq):
     payload = {
         "plan_id": plan_id,
         "created_at": created_at.isoformat(),
-        "mode": f"load_{req.direction}",
+        "mode": f"load_{direction}",
         "current": s,
         "predicted_after": pred,
         "actions": {"apply_stage": True, "apply_all": True, "rollback": True},
         "stages": stages,
-        "target": {"production_tph": round(target_tph, 3), "delta_pct": req.delta_pct},
+        "target": {
+            "production_tph": round(target, 3),
+            "delta_pct": round(delta_pct_calc, 3) if delta_pct_calc is not None else None,
+            "delta_abs": round(delta_abs_calc, 3) if delta_abs_calc is not None else None,
+            "requested": {
+                "direction": req.direction,
+                "delta_pct": req.delta_pct,
+                "delta_abs": req.delta_abs,
+                "target_tph": req.target_tph,
+                "steps": req.steps
+            }
+        },
         "match_info": {"candidates_used": 391},
         "targets": {k: (round(v, 3) if isinstance(v, (int, float)) else v) for k, v in targets.items()},
         "steps_cfg": levers,
     }
 
+    # Log the plan
     tbl = _plans_table()
     err = None
     if _BQ_ENABLED and tbl:
@@ -779,14 +1073,17 @@ def optimize_load(req: LoadOptimizeReq):
         plan_row = {
             "plan_id": plan_id,
             "created_at": created_at,
-            "mode": f"load_{req.direction}",
-            "direction": req.direction,
-            "delta_pct": float(req.delta_pct),
+            "mode": f"load_{direction}",
+            "direction": direction,
+            "delta_pct": float(delta_pct_calc) if delta_pct_calc is not None else None,
             "steps": int(req.steps) if req.steps else None,
             "snapshot": s,
             "targets": targets,
-            "stages": stages_bq,   # << important fix
+            "stages": stages_bq,
             "predicted_after": pred,
+            # These extra fields will be ignored if not present in schema:
+            "target_tph": float(req.target_tph) if req.target_tph is not None else None,
+            "delta_abs": float(req.delta_abs) if req.delta_abs is not None else None,
         }
         err = _bq_insert_flexible(tbl, plan_row)
         _remember_bq_attempt("plan_insert", tbl, list(plan_row.keys()), err)
@@ -808,87 +1105,15 @@ def actuate_apply_stage(req: ApplyStageReq = Body(default={})):
       - {"setpoints": {...}} OR {"stage": {"setpoints": {...}}} OR {"proposal": {...}} OR {"proposed_setpoints": {...}}
       - Optional metadata: plan_id, mode, stage_index
     """
-    if not APPLY_ENABLED:
-        return {"ok": True, "note": "APPLY_ENABLED=0; dry-run"}
-
     setpts = req.extract_setpoints()
-    if not isinstance(setpts, dict) or not setpts:
-        raise HTTPException(status_code=422, detail="No setpoints provided")
-
-    # capture before snapshot
-    if USE_MOCK:
-        with _state_lock:
-            before = {k: v for k, v in _STATE.items() if k != "sp"}
-
-    # apply to mock
-    if USE_MOCK:
-        cfg = get_config()
-        levers: Dict[str, Any] = cfg.get("levers", {})
-        with _state_lock:
-            sp = _STATE.setdefault("sp", {})
-            for k, v in setpts.items():
-                if k not in ("kiln_feed_tph","separator_dp_pa","id_fan_flow_Nm3_h","cooler_airflow_Nm3_h","kiln_speed_rpm"):
-                    continue
-                lo = levers.get(k, {}).get("min", -1e12)
-                hi = levers.get(k, {}).get("max", 1e12)
-                sp[k] = clamp(float(v), lo, hi)
-
-            # immediate nudge
-            for k in ("kiln_feed_tph","separator_dp_pa","id_fan_flow_Nm3_h","cooler_airflow_Nm3_h","kiln_speed_rpm"):
-                if k in sp:
-                    cur = float(_STATE[k])
-                    tgt = float(sp[k])
-                    _STATE[k] = cur + 0.5*(tgt - cur)
-
-            _physics_tick(_STATE, dt_sec=MOCK_TICK_SEC)
-            after = {k: v for k, v in _STATE.items() if k != "sp"}
-    else:
-        before = {}
-        after = {}
-
-    applied_at = _now_ts()
-
-    # log to BQ
-    tbl = _acts_table()
-    err = None
-    if _BQ_ENABLED and tbl:
-        schema = _bq_get_schema(tbl)
-
-        def _maybe_stringify(val: Any, col: str):
-            # If the column is not a STRUCT/RECORD, stringify dicts/lists to a compact JSON string
-            col_type = schema.get(col)
-            if isinstance(val, (dict, list)) and col_type != "RECORD":
-                return _as_json_string(val)
-            return val
-        # If 'setpoints' column is JSON, serialize dict to JSON string
-        setpoints_for_bq: Any = setpts
-
-        stage_name = (req.stage or {}).get("name") if isinstance(req.stage, dict) else None
-        deltas_obj = _diff_kpis(before, after) if before and after else None
-        before_for_bq = _maybe_stringify(before,  "before")
-        after_for_bq  = _maybe_stringify(after,   "after")
-        deltas_for_bq = _maybe_stringify(deltas_obj, "deltas")
-
-
-        act_row = {
-            "applied_at": _now_ts(),
-            "mode": req.mode,
-            "plan_id": req.plan_id,
-            "stage_index": req.stage_index,
-            "stage_name": stage_name,
-            "setpoints": setpoints_for_bq,
-            "before": before_for_bq,
-            "after": after_for_bq,
-            "deltas": deltas_for_bq,
-        }
-        err = _bq_insert_flexible(tbl, act_row)
-        _remember_bq_attempt("actuation_insert", tbl, list(act_row.keys()), err)
-        if err:
-            logging.warning("actuations_v2 insert error: %s", err)
-    else:
-        logging.info("Skipping actuation log: BQ_ENABLED=%s, table=%s", _BQ_ENABLED, tbl)
-
-    return {"ok": True, "bq_log": {"table": tbl, "insert_error": err}}
+    res = _apply_setpoints_internal(
+        setpts=setpts,
+        mode=req.mode,
+        plan_id=req.plan_id,
+        stage_index=req.stage_index,
+        stage_name=(req.stage or {}).get("name") if isinstance(req.stage, dict) else None
+    )
+    return res
 
 @app.post("/actuate/rollback")
 def actuate_rollback():

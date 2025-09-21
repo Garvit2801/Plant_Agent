@@ -3,11 +3,24 @@ timeout: "1200s"
 
 substitutions:
   _REGION: asia-south2
+  _REGION_SCHED: asia-south1
   _REPO: plant-agent
   _IMAGE: agent
   _SERVICE: plant-agent
+  _BQ_LOCATION: asia-south2
 
 steps:
+  # 0) (Optional) show versions and auth
+  - id: env-check
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: bash
+    args:
+      - -ceu
+      - |
+        echo "PROJECT_ID=$PROJECT_ID"
+        gcloud --version
+        bq version || true
+
   # 1) Build image
   - id: build
     name: gcr.io/cloud-builders/docker
@@ -24,7 +37,37 @@ steps:
       - push
       - asia-south2-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_IMAGE}:v$BUILD_ID
 
-  # 3) Deploy to Cloud Run (inject PROJECT_ID so BQ paths resolve)
+  # 3) Apply BigQuery SQL (tables/UDF/views)
+  #    Runs files under sql/ddl then sql/views in lexical order.
+  - id: bq-apply-sql
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: bash
+    args:
+      - -ceu
+      - |
+        set -euo pipefail
+        PROJECT_ID="${PROJECT_ID:?}"
+        BQ_LOCATION="${_BQ_LOCATION}"
+        echo "Applying SQL to project=$PROJECT_ID location=$BQ_LOCATION"
+
+        # Ensure dataset exists
+        bq --location="$BQ_LOCATION" --project_id="$PROJECT_ID" mk --dataset plant_ops || true
+
+        run_dir () {
+          local dir="$1"
+          if [[ -d "$dir" ]]; then
+            for f in $(ls -1 "$dir"/*.sql 2>/dev/null | sort); do
+              echo ">>> bq apply: $f"
+              bq --location="$BQ_LOCATION" --project_id="$PROJECT_ID" query --nouse_legacy_sql < "$f"
+            done
+          fi
+        }
+
+        # Order: DDL (tables, UDFs) → views
+        run_dir sql/ddl
+        run_dir sql/views
+
+  # 4) Deploy to Cloud Run (inject table envs so service logs cleanly)
   - id: deploy
     name: gcr.io/google.com/cloudsdktool/cloud-sdk
     entrypoint: gcloud
@@ -35,12 +78,13 @@ steps:
       - --image=asia-south2-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_IMAGE}:v$BUILD_ID
       - --region=${_REGION}
       - --allow-unauthenticated
-      - --set-env-vars=USE_MOCK=1,MOCK_TICK_SEC=5,APPLY_ENABLED=1,PROJECT_ID=$PROJECT_ID,BQ_LOCATION=asia-south2,BQ_MODEL_NAME=spower_reg
       - --platform=managed
       - --quiet
+      - --set-env-vars=USE_MOCK=1,MOCK_TICK_SEC=5,APPLY_ENABLED=1,PROJECT_ID=$PROJECT_ID,BQ_LOCATION=${_BQ_LOCATION},BQ_MODEL_NAME=spower_reg,BQ_SNAPSHOTS_TABLE=$PROJECT_ID.plant_ops.snapshots,BQ_PLANS_TABLE=$PROJECT_ID.plant_ops.plans_v2,BQ_ACTUATIONS_TABLE=$PROJECT_ID.plant_ops.actuations_v2,BQ_ROUTINE_TABLE=$PROJECT_ID.plant_ops.routine_suggestions_v2
 
-  # 4) Smoke tests (ingress-aware + readiness retry; /predict non-fatal if BQ not ready)
+  # 5) Smoke tests (ingress-aware + readiness retry; /predict non-fatal if BQ not ready)
   - id: smoke-tests
+    waitFor: ["deploy"]
     name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
     entrypoint: bash
     args:
@@ -58,7 +102,7 @@ steps:
         echo "ingress=$ingress"
 
         if [[ -z "$base_url" ]]; then
-          echo "❌ base_url empty (check service/region and run.viewer on the service for the Cloud Build SA)"
+          echo "❌ base_url empty (check service/region and run.viewer on the Cloud Build SA)"
           exit 1
         fi
 
@@ -71,7 +115,7 @@ steps:
         # Helper: return HTTP code
         get_code() { curl -sS -o /dev/null -w '%{http_code}' "$1" || echo "000"; }
 
-        # --- Readiness retry for /health (unauth → auth) ---
+        # Readiness retry for /health (unauth → try OIDC)
         auth_header=""
         tries=60    # up to ~5 minutes (60 * 5s)
         while (( tries-- )); do
@@ -109,7 +153,7 @@ steps:
           if [[ "$code" == "200" ]] && echo "$body" | grep -q '"ok":[[:space:]]*true'; then
             echo "✅ /ingest OK"
           else
-            echo "⚠️  /ingest not ok:true — continuing (BQ table/dataset may not exist yet)."
+            echo "⚠️  /ingest not ok:true — continuing (tables/model may not exist yet)."
           fi
         else
           echo "ℹ️ BigQuery disabled → skipping /ingest"
@@ -129,6 +173,64 @@ steps:
         fi
 
         echo "✅ Smoke tests completed."
+
+  # 6) Ensure hourly Cloud Scheduler job (idempotent) + grant invoker
+  - id: ensure-scheduler
+    waitFor: ["smoke-tests"]
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: bash
+    args:
+      - -ceu
+      - |
+        set -euo pipefail
+        REGION_RUN="${_REGION}"
+        REGION_SCHED="${_REGION_SCHED}"
+        SERVICE="${_SERVICE}"
+        PROJECT_ID="${PROJECT_ID:?}"
+
+        BASE_URL="$(gcloud run services describe "$SERVICE" --region="$REGION_RUN" --format='value(status.url)')"
+        [[ -z "$BASE_URL" ]] && { echo "No base URL for service $SERVICE"; exit 1; }
+
+        # Derive scheduler SA (or set via substitution if you prefer)
+        SCHED_SA="plant-agent-scheduler@${PROJECT_ID}.iam.gserviceaccount.com"
+
+        # Allow Scheduler SA to get OIDC tokens and invoke the service
+        gcloud iam service-accounts add-iam-policy-binding "$SCHED_SA" \
+          --member="serviceAccount:$SCHED_SA" \
+          --role="roles/iam.serviceAccountTokenCreator" --project "$PROJECT_ID" || true
+
+        gcloud run services add-iam-policy-binding "$SERVICE" \
+          --region="$REGION_RUN" \
+          --member="serviceAccount:$SCHED_SA" \
+          --role="roles/run.invoker" || true
+
+        JOB="plant-agent-routine-hourly"
+        BODY='{"apply_top":true,"log_suggestions":true,"constraints":{"o2_percent":{"min":2.3,"max":4.5}}}'
+
+        # Create or update the job to hit /optimize/routine hourly with OIDC
+        if gcloud scheduler jobs describe "$JOB" --location="$REGION_SCHED" >/dev/null 2>&1; then
+          echo "Updating existing scheduler job $JOB"
+          gcloud scheduler jobs update http "$JOB" \
+            --location="$REGION_SCHED" \
+            --schedule="0 * * * *" \
+            --uri="${BASE_URL}/optimize/routine" \
+            --http-method=POST \
+            --oidc-service-account-email="$SCHED_SA" \
+            --oidc-token-audience="$BASE_URL" \
+            --headers=Content-Type=application/json \
+            --message-body="$BODY"
+        else
+          echo "Creating scheduler job $JOB"
+          gcloud scheduler jobs create http "$JOB" \
+            --location="$REGION_SCHED" \
+            --schedule="0 * * * *" \
+            --uri="${BASE_URL}/optimize/routine" \
+            --http-method=POST \
+            --oidc-service-account-email="$SCHED_SA" \
+            --oidc-token-audience="$BASE_URL" \
+            --headers=Content-Type=application/json \
+            --message-body="$BODY"
+        fi
 
 images:
   - asia-south2-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_IMAGE}:v$BUILD_ID
