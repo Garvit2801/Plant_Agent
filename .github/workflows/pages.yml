@@ -1,6 +1,10 @@
-name: Debug Pages Build
+mkdir -p .github/workflows
+cat > .github/workflows/pages.yml <<'YAML'
+name: Deploy UI to GitHub Pages
 
 on:
+  push:
+    branches: [ main ]
   workflow_dispatch:
 
 permissions:
@@ -8,17 +12,15 @@ permissions:
   pages: write
   id-token: write
 
+concurrency:
+  group: "pages"
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Print tree
-        run: |
-          pwd
-          ls -la
-          find . -maxdepth 3 -name package.json -o -name package-lock.json -o -name dist -type d
 
       - uses: actions/setup-node@v4
         with:
@@ -26,24 +28,16 @@ jobs:
           cache: npm
           cache-dependency-path: package-lock.json
 
-      - name: npm ci
-        run: |
-          set -euxo pipefail
-          npm ci --no-audit --no-fund
-          npm -v
-          node -v
+      - name: Install deps
+        run: npm ci
 
       - name: Build
-        run: |
-          set -euxo pipefail
-          npm run build
-          ls -la dist || true
+        run: npm run build
 
-      - name: Add SPA fallback (ignore if no dist)
-        run: |
-          if [ -d dist ]; then cp dist/index.html dist/404.html || true; fi
+      - name: Add SPA fallback
+        run: cp dist/index.html dist/404.html || true
 
-      - name: Upload artifact (fail if dist missing)
+      - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
           path: dist
@@ -57,3 +51,4 @@ jobs:
     steps:
       - id: deployment
         uses: actions/deploy-pages@v4
+YAML
