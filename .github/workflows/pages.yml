@@ -1,8 +1,6 @@
-name: Deploy UI to GitHub Pages
+name: Debug Pages Build
 
 on:
-  push:
-    branches: [ main ]
   workflow_dispatch:
 
 permissions:
@@ -10,38 +8,45 @@ permissions:
   pages: write
   id-token: write
 
-concurrency:
-  group: "pages"
-  cancel-in-progress: true
-
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
+      - name: Print tree
+        run: |
+          pwd
+          ls -la
+          find . -maxdepth 3 -name package.json -o -name package-lock.json -o -name dist -type d
+
       - uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: npm
-          cache-dependency-path: frontend/package-lock.json
+          cache-dependency-path: package-lock.json
 
-      - name: Install deps
-        working-directory: frontend
-        run: npm ci
+      - name: npm ci
+        run: |
+          set -euxo pipefail
+          npm ci --no-audit --no-fund
+          npm -v
+          node -v
 
       - name: Build
-        working-directory: frontend
-        run: npm run build
+        run: |
+          set -euxo pipefail
+          npm run build
+          ls -la dist || true
 
-      - name: Add SPA fallback
-        working-directory: frontend
-        run: cp dist/index.html dist/404.html
+      - name: Add SPA fallback (ignore if no dist)
+        run: |
+          if [ -d dist ]; then cp dist/index.html dist/404.html || true; fi
 
-      - name: Upload artifact
+      - name: Upload artifact (fail if dist missing)
         uses: actions/upload-pages-artifact@v3
         with:
-          path: frontend/dist
+          path: dist
 
   deploy:
     needs: build
