@@ -2,8 +2,7 @@ name: Deploy UI to GitHub Pages
 
 on:
   push:
-    branches:
-      - main
+    branches: [ main ]
   workflow_dispatch:
 
 permissions:
@@ -21,38 +20,54 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Detect where package.json is
+      - name: Detect package directory
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+          for d in . agent/ui frontend ui web app client; do
+            if [ -f "$d/package.json" ]; then
+              echo "pkg_dir=$d" >> "$GITHUB_OUTPUT"
+              echo "Detected package dir: $d"
+              exit 0
+            fi
+          done
+          echo "❌ No package.json found in ., agent/ui, frontend, ui, web, app, or client"
+          exit 1
+
       - uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: npm
-          cache-dependency-path: package-lock.json
+          cache-dependency-path: ${{ steps.detect.outputs.pkg_dir }}/package-lock.json
 
       - name: Install deps
+        working-directory: ${{ steps.detect.outputs.pkg_dir }}
         run: |
           set -euxo pipefail
-          if [ ! -f package-lock.json ]; then
-            npm install --package-lock-only
-          fi
+          [ -f package-lock.json ] || npm install --package-lock-only
           npm ci --no-audit --no-fund
 
       - name: Build
+        working-directory: ${{ steps.detect.outputs.pkg_dir }}
         run: |
           set -euxo pipefail
           if ! jq -e '.scripts.build' package.json >/dev/null 2>&1; then
-            echo "❌ No 'build' script in package.json. Add one (e.g., \"build\": \"vite build\")."
+            echo "❌ No 'build' script in package.json (add e.g. \"build\": \"vite build\")"
             jq '.scripts' package.json || true
             exit 1
           fi
           npm run build
 
-      # Detect common output folders: dist (Vite), build (CRA), .output/public (Nitro/Next export), out (Next export)
       - name: Detect build output folder
         id: out
+        working-directory: ${{ steps.detect.outputs.pkg_dir }}
         run: |
           set -euo pipefail
           for d in dist build .output/public out; do
             if [ -d "$d" ]; then
-              echo "build_dir=$d" >> "$GITHUB_OUTPUT"
+              echo "build_dir=${{ steps.detect.outputs.pkg_dir }}/$d" >> "$GITHUB_OUTPUT"
               echo "Detected build dir: $d"
               exit 0
             fi
