@@ -2,9 +2,10 @@ mkdir -p .github/workflows
 cat > .github/workflows/pages.yml <<'YAML'
 name: Deploy UI to GitHub Pages
 
-on:
+'on':
   push:
-    branches: [ main ]
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
@@ -13,7 +14,7 @@ permissions:
   id-token: write
 
 concurrency:
-  group: "pages"
+  group: pages
   cancel-in-progress: true
 
 jobs:
@@ -52,3 +53,4 @@ jobs:
       - id: deployment
         uses: actions/deploy-pages@v4
 YAML
+
