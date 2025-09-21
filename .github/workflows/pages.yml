@@ -21,25 +21,88 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Detect where package.json lives (root vs frontend/)
+      - name: Detect package directory
+        id: detect
+        run: |
+          set -euo pipefail
+          if [ -f package.json ]; then
+            echo "pkg_dir=." >> "$GITHUB_OUTPUT"
+          elif [ -f frontend/package.json ]; then
+            echo "pkg_dir=frontend" >> "$GITHUB_OUTPUT"
+          else
+            echo "❌ No package.json found at repo root or in frontend/. Add it or adjust this workflow."
+            exit 1
+          fi
+          echo "Detected package dir: $(cat "$GITHUB_OUTPUT")"
+
+      - name: Print tree & basics
+        run: |
+          set -euo pipefail
+          echo "Runner: $(uname -a)"
+          echo "PWD: $PWD"
+          echo "::group::Top-level tree"
+          ls -la
+          echo "::endgroup::"
+          echo "::group::Find package.json / lock"
+          find . -maxdepth 3 -name package.json -o -name package-lock.json
+          echo "::endgroup::"
+
       - uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: npm
-          cache-dependency-path: package-lock.json
+          cache-dependency-path: ${{ steps.detect.outputs.pkg_dir }}/package-lock.json
 
       - name: Install deps
-        run: npm ci
+        working-directory: ${{ steps.detect.outputs.pkg_dir }}
+        run: |
+          set -euxo pipefail
+          if [ ! -f package-lock.json ]; then
+            echo "No package-lock.json found. Creating one for caching."
+            npm install --package-lock-only
+          fi
+          npm ci --no-audit --no-fund
 
       - name: Build
-        run: npm run build
+        working-directory: ${{ steps.detect.outputs.pkg_dir }}
+        run: |
+          set -euxo pipefail
+          if ! jq -e '.scripts.build' package.json >/dev/null 2>&1; then
+            echo "❌ No 'build' script in package.json. Add it (e.g., \"build\": \"vite build\" or CRA)."
+            jq '.scripts' package.json || true
+            exit 1
+          fi
+          npm run build
 
-      - name: Add SPA fallback
-        run: cp dist/index.html dist/404.html || true
+      # Work out which folder the build produced
+      - name: Detect build output folder
+        id: out
+        working-directory: ${{ steps.detect.outputs.pkg_dir }}
+        run: |
+          set -euo pipefail
+          for d in dist build .output/public out; do
+            if [ -d "$d" ]; then
+              echo "build_dir=${{ steps.detect.outputs.pkg_dir }}/$d" >> "$GITHUB_OUTPUT"
+              echo "Detected build dir: $d"
+              exit 0
+            fi
+          done
+          echo "❌ No build output folder found (tried: dist, build, .output/public, out)."
+          echo "Check your tool's output dir or update the workflow."
+          exit 1
+
+      - name: Add SPA fallback (optional)
+        run: |
+          set -euo pipefail
+          if [ -f "${{ steps.out.outputs.build_dir }}/index.html" ]; then
+            cp "${{ steps.out.outputs.build_dir }}/index.html" "${{ steps.out.outputs.build_dir }}/404.html" || true
+          fi
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: dist
+          path: ${{ steps.out.outputs.build_dir }}
 
   deploy:
     needs: build
