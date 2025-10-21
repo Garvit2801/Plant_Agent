@@ -14,7 +14,7 @@ from collections import deque
 import yaml
 import pandas as pd
 import datetime
-from fastapi import FastAPI, HTTPException, Body, Query
+from fastapi import FastAPI, HTTPException, Body, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -143,6 +143,30 @@ app.add_middleware(
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
 )
+
+@app.options("/cron/routine")
+def options_cron_routine():
+    return Response(
+        status_code=204,
+        headers={
+            "Allow": "POST, OPTIONS",
+            "Access-Control-Allow-Methods": "POST, OPTIONS",
+            "Access-Control-Allow-Headers": "authorization, content-type",
+            "Access-Control-Allow-Origin": "*",  # tighten to your UI origin in prod
+        },
+    )
+
+@app.options("/optimize/routine")
+def options_optimize_routine():
+    return Response(
+        status_code=204,
+        headers={
+            "Allow": "POST, OPTIONS",
+            "Access-Control-Allow-Methods": "POST, OPTIONS",
+            "Access-Control-Allow-Headers": "authorization, content-type",
+            "Access-Control-Allow-Origin": "*",
+        },
+    )
 
 # -------------------------
 # Robust plant.yaml resolver

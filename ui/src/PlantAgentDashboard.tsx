@@ -103,6 +103,16 @@ function safeNum(n: any): number | undefined {
   return Number.isFinite(x) ? x : undefined;
 }
 
+function normalizeBase(u: string) {
+  if (!u) return "";
+  let s = u.trim();
+  // drop trailing slashes
+  s = s.replace(/\/+$/, "");
+  // if someone pasted ".../snapshot" remove it; our code appends paths
+  s = s.replace(/\/snapshot$/i, "");
+  return s;
+}
+
 function formatSuggestionText(
   lever: string,
   current: number | undefined,
@@ -178,8 +188,26 @@ function useMeasure() {
   return { ref, ...size };
 }
 
+/** Try a list of path candidates and return the first successful JSON */
+async function tryFetchJSON(base: string, headers: Record<string, string>, paths: string[]) {
+  let lastErr: any;
+  for (const p of paths) {
+    try {
+      const r = await fetch(`${base}${p}`, { headers });
+      if (r.ok) return { response: r, json: await r.json() };
+      // Accept any non-404 as a terminal error so we surface the status
+      if (r.status !== 404) throw new Error(`${p} ${r.status}`);
+      lastErr = new Error(`${p} 404`);
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr ?? new Error("No candidate path succeeded");
+}
+
 export default function PlantAgentDashboard() {
-  const [base, setBase] = useLocalStorage(LS_KEYS.BASE, "");
+  const [baseRaw, setBaseRaw] = useLocalStorage(LS_KEYS.BASE, "");
+  const base = useMemo(() => normalizeBase(baseRaw), [baseRaw]);
   const [token, setToken] = useLocalStorage(LS_KEYS.TOKEN, "");
   const [autoPoll, setAutoPoll] = useLocalStorage(LS_KEYS.AUTOPOLL, "1");
 
@@ -196,11 +224,24 @@ export default function PlantAgentDashboard() {
   const fetchHealth = useCallback(async () => {
     setErrorMsg("");
     try {
-      const r = await fetch(`${base}/health`, { headers });
-      setHealth(`${r.status}`);
-      const v = await fetch(`${base}/version`, { headers });
-      const j = await v.json();
-      setVer(j.version ?? "");
+      // Try common health endpoints (root + snapshot + healthz)
+      const healthCandidates = [`/health`, `/snapshot/health`, `/healthz`];
+      let healthResp: Response | null = null;
+      for (const p of healthCandidates) {
+        try {
+          const rr = await fetch(`${base}${p}`, { headers });
+          healthResp = rr;
+          if (rr.ok || rr.status !== 404) break;
+        } catch {
+          /* try next */
+        }
+      }
+      if (!healthResp) throw new Error("No response");
+      setHealth(`${healthResp.status}`);
+
+      // Version: try root first, then /snapshot/version
+      const { json: verJson } = await tryFetchJSON(base, headers, [`/version`, `/snapshot/version`]);
+      setVer(verJson.version ?? "");
     } catch (e: any) {
       setHealth("error");
       setErrorMsg(e?.message || "Failed to reach /health");
@@ -252,12 +293,10 @@ export default function PlantAgentDashboard() {
     if (!base) return;
     setErrorMsg("");
     try {
-      const r = await fetch(`${base}/trends?minutes=60&limit=120`, { headers });
-      if (!r.ok) {
-        if (r.status === 404) return;
-        throw new Error(`/trends ${r.status}`);
-      }
-      const data = await r.json();
+      const { json: data } = await tryFetchJSON(base, headers, [
+        `/trends?minutes=60&limit=120`,
+        `/snapshot/trends?minutes=60&limit=120`,
+      ]);
       if (Array.isArray(data)) {
         const mapped: TrendPoint[] = data
           .map((row: any) => ({
@@ -281,10 +320,15 @@ export default function PlantAgentDashboard() {
 
   useEffect(() => {
     if (!base) return;
+    // hint if user pasted .../snapshot as base
+    if (/\/snapshot\/?$/i.test(baseRaw)) {
+      setErrorMsg((m) => m || "Tip: remove '/snapshot' from the API Base URL; the app adds paths itself.");
+    }
     fetchHealth();
     fetchTrends();
     fetchSnapshot();
-  }, [base]); // eslint-disable-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [base]);
 
   useEffect(() => {
     const enabled = autoPoll === "1";
@@ -307,9 +351,8 @@ export default function PlantAgentDashboard() {
   const getMetrics = useCallback(async () => {
     setErrorMsg("");
     try {
-      const r = await fetch(`${base}/metrics`, { headers });
-      if (!r.ok) throw new Error(`/metrics ${r.status}`);
-      setMetrics(await r.json());
+      const { json } = await tryFetchJSON(base, headers, [`/metrics`, `/snapshot/metrics`]);
+      setMetrics(json);
     } catch (e: any) {
       setErrorMsg(e?.message || "Failed to fetch metrics");
     }
@@ -338,7 +381,12 @@ export default function PlantAgentDashboard() {
       const s0 = (await fetchSnapshotFast()) ?? snap;
       if (s0) setRoutineBefore({ ...s0 });
 
-      const r = await fetch(`${base}/optimize/routine`, { method: "POST", headers, body: JSON.stringify(body) });
+      const r = await fetch(`${base}/optimize/routine`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) throw new Error(`/optimize/routine ${r.status}`);
       const j: RoutineResp = await r.json();
       setRoutineOut(j);
 
@@ -359,7 +407,12 @@ export default function PlantAgentDashboard() {
     setErrorMsg("");
     try {
       const body = { proposal: routineOut.proposed_setpoints, mode: "routine" };
-      const r = await fetch(`${base}/actuate/apply_stage`, { method: "POST", headers, body: JSON.stringify(body) });
+      const r = await fetch(`${base}/actuate/apply_stage`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) throw new Error(`/actuate/apply_stage ${r.status}`);
       const j: ApplyResp = await r.json();
 
       if (j.after) {
@@ -413,7 +466,12 @@ export default function PlantAgentDashboard() {
       if (loadMode === "abs") body.delta_abs = Number(val);
       if (loadMode === "target") body.target_tph = Number(val);
 
-      const r = await fetch(`${base}/optimize/load`, { method: "POST", headers, body: JSON.stringify(body) });
+      const r = await fetch(`${base}/optimize/load`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) throw new Error(`/optimize/load ${r.status}`);
       const j: LoadResp = await r.json();
       setLoadOut(j);
 
@@ -431,7 +489,12 @@ export default function PlantAgentDashboard() {
       setErrorMsg("");
       try {
         const body = { stage: loadOut.stages[i], mode: loadOut.mode, plan_id: loadOut.plan_id, stage_index: i };
-        const r = await fetch(`${base}/actuate/apply_stage`, { method: "POST", headers, body: JSON.stringify(body) });
+        const r = await fetch(`${base}/actuate/apply_stage`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(body),
+        });
+        if (!r.ok) throw new Error(`/actuate/apply_stage ${r.status}`);
         const j: ApplyResp = await r.json();
 
         if (j.after) {
@@ -544,34 +607,61 @@ export default function PlantAgentDashboard() {
           <div className="flex flex-col md:flex-row gap-3 md:items-end">
             <div className="flex-1">
               <label className="text-xs text-slate-500">API Base URL</label>
-              <input value={base} onChange={(e) => setBase(e.target.value)} placeholder="https://<cloud-run-url>" className="w-full mt-1 px-3 py-2 border rounded-xl" />
+              <input
+                value={baseRaw}
+                onChange={(e) => setBaseRaw(e.target.value)}
+                placeholder="https://<cloud-run-url>"
+                className="w-full mt-1 px-3 py-2 border rounded-xl"
+              />
+              <div className="mt-1 text-[11px] text-slate-500">
+                Using: <span className="font-mono">{base || "—"}</span>
+              </div>
             </div>
             <div className="flex-1">
               <label className="text-xs text-slate-500">ID Token (optional for private)</label>
-              <input value={token} onChange={(e) => setToken(e.target.value)} placeholder="paste gcloud-issued ID token" className="w-full mt-1 px-3 py-2 border rounded-xl" />
+              <input
+                value={token}
+                onChange={(e) => setToken(e.target.value)}
+                placeholder="paste gcloud-issued ID token"
+                className="w-full mt-1 px-3 py-2 border rounded-xl"
+              />
             </div>
-            <button onClick={fetchHealth} className="btn-secondary" disabled={disabled}>Check</button>
+            <button onClick={fetchHealth} className="btn-secondary" disabled={disabled}>
+              Check
+            </button>
           </div>
           <div className="mt-3 flex items-center gap-3 text-sm">
-            <label className="inline-flex items-center gap-2"><input type="checkbox" checked={autoPoll === "1"} onChange={(e) => setAutoPoll(e.target.checked ? "1" : "0")} /> Auto-refresh snapshot</label>
-            <button onClick={() => { fetchSnapshot(); getMetrics(); fetchTrends(); }} className="btn-outline">Refresh now</button>
+            <label className="inline-flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={autoPoll === "1"}
+                onChange={(e) => setAutoPoll(e.target.checked ? "1" : "0")}
+              />{" "}
+              Auto-refresh snapshot
+            </label>
+            <button
+              onClick={() => {
+                fetchSnapshot();
+                getMetrics();
+                fetchTrends();
+              }}
+              className="btn-outline"
+            >
+              Refresh now
+            </button>
             {errorMsg ? <span className="text-rose-600">• {errorMsg}</span> : null}
           </div>
         </section>
 
         {/* KPI Tiles */}
         <section className="grid md:grid-cols-5 gap-4">
-          {[{
-            label: "Production (tph)", val: kpi?.production_tph
-          }, {
-            label: "O₂ (%)", val: kpi?.o2_percent
-          }, {
-            label: "Specific Power (kWh/t)", val: kpi?.specific_power_kwh_per_ton
-          }, {
-            label: "Kiln Feed (tph)", val: kpi?.kiln_feed_tph
-          }, {
-            label: "Separator ΔP (Pa)", val: kpi?.separator_dp_pa
-          }].map((t, idx) => (
+          {[
+            { label: "Production (tph)", val: kpi?.production_tph },
+            { label: "O₂ (%)", val: kpi?.o2_percent },
+            { label: "Specific Power (kWh/t)", val: kpi?.specific_power_kwh_per_ton },
+            { label: "Kiln Feed (tph)", val: kpi?.kiln_feed_tph },
+            { label: "Separator ΔP (Pa)", val: kpi?.separator_dp_pa },
+          ].map((t, idx) => (
             <div key={idx} className="bg-white rounded-2xl shadow-sm border border-slate-200 p-4">
               <div className="text-xs text-slate-500">{t.label}</div>
               <div className="text-2xl font-semibold mt-1">{fmt(t.val, 3)}</div>
@@ -585,22 +675,34 @@ export default function PlantAgentDashboard() {
             <div className="font-semibold">Suggestions</div>
             <div className="text-xs text-slate-500">
               latest routine run: {routineOut?.created_at ? new Date(routineOut.created_at).toLocaleString() : "-"}
-              {routineOut?.suggestion_id ? <span className="ml-2">• id: <span className="font-mono">{routineOut.suggestion_id}</span></span> : null}
+              {routineOut?.suggestion_id ? (
+                <span className="ml-2">
+                  • id: <span className="font-mono">{routineOut.suggestion_id}</span>
+                </span>
+              ) : null}
             </div>
           </div>
           {(() => {
-            const lines = deriveSuggestionLines(snap, routineOut?.proposed_setpoints, { o2_percent: { min: Number(o2Min), max: Number(o2Max) } });
+            const lines = deriveSuggestionLines(snap, routineOut?.proposed_setpoints, {
+              o2_percent: { min: Number(o2Min), max: Number(o2Max) },
+            });
             return lines.length ? (
               <ul className="mt-3 list-disc pl-6 text-sm space-y-1">
-                {lines.map((s, i) => (<li key={i}>{s}</li>))}
+                {lines.map((s, i) => (
+                  <li key={i}>{s}</li>
+                ))}
               </ul>
             ) : (
               <div className="mt-3 text-sm text-slate-500">Run a routine optimization to populate suggestions.</div>
             );
           })()}
           <div className="mt-3 flex gap-2">
-            <button onClick={applyRoutineProposal} disabled={!routineOut?.proposed_setpoints} className="btn-primary">Accept & Apply</button>
-            <button onClick={rejectRoutine} className="btn-danger">Reject</button>
+            <button onClick={applyRoutineProposal} disabled={!routineOut?.proposed_setpoints} className="btn-primary">
+              Accept & Apply
+            </button>
+            <button onClick={rejectRoutine} className="btn-danger">
+              Reject
+            </button>
           </div>
         </section>
 
@@ -608,7 +710,9 @@ export default function PlantAgentDashboard() {
         <section className="grid md:grid-cols-2 gap-4">
           <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-4">
             <div className="font-semibold mb-1">Important Trends (last hour)</div>
-            <div className="text-xs text-slate-500 mb-2">{chartData.length ? `Loaded ${chartData.length} points` : "Waiting for data…"}</div>
+            <div className="text-xs text-slate-500 mb-2">
+              {chartData.length ? `Loaded ${chartData.length} points` : "Waiting for data…"}
+            </div>
 
             {/* Measured box fixes invisible chart */}
             <div ref={chartBox.ref} className="h-56 w-full">
