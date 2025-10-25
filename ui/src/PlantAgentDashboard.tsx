@@ -79,6 +79,7 @@ const LS_KEYS = {
   BASE: "plant_ui.base_url",
   TOKEN: "plant_ui.id_token",
   AUTOPOLL: "plant_ui.autopoll",
+  AUTOPULL_SUGG: "plant_ui.autopull_suggestions",
 };
 
 function useLocalStorage(key: string, initial: string) {
@@ -106,9 +107,7 @@ function safeNum(n: any): number | undefined {
 function normalizeBase(u: string) {
   if (!u) return "";
   let s = u.trim();
-  // drop trailing slashes
   s = s.replace(/\/+$/, "");
-  // if someone pasted ".../snapshot" remove it; our code appends paths
   s = s.replace(/\/snapshot$/i, "");
   return s;
 }
@@ -195,7 +194,6 @@ async function tryFetchJSON(base: string, headers: Record<string, string>, paths
     try {
       const r = await fetch(`${base}${p}`, { headers });
       if (r.ok) return { response: r, json: await r.json() };
-      // Accept any non-404 as a terminal error so we surface the status
       if (r.status !== 404) throw new Error(`${p} ${r.status}`);
       lastErr = new Error(`${p} 404`);
     } catch (e) {
@@ -210,6 +208,7 @@ export default function PlantAgentDashboard() {
   const base = useMemo(() => normalizeBase(baseRaw), [baseRaw]);
   const [token, setToken] = useLocalStorage(LS_KEYS.TOKEN, "");
   const [autoPoll, setAutoPoll] = useLocalStorage(LS_KEYS.AUTOPOLL, "1");
+  const [autoPullSugg, setAutoPullSugg] = useLocalStorage(LS_KEYS.AUTOPULL_SUGG, "1");
 
   const headers = useMemo(() => {
     const h: Record<string, string> = { "Content-Type": "application/json" };
@@ -224,7 +223,6 @@ export default function PlantAgentDashboard() {
   const fetchHealth = useCallback(async () => {
     setErrorMsg("");
     try {
-      // Try common health endpoints (root + snapshot + healthz)
       const healthCandidates = [`/health`, `/snapshot/health`, `/healthz`];
       let healthResp: Response | null = null;
       for (const p of healthCandidates) {
@@ -238,8 +236,6 @@ export default function PlantAgentDashboard() {
       }
       if (!healthResp) throw new Error("No response");
       setHealth(`${healthResp.status}`);
-
-      // Version: try root first, then /snapshot/version
       const { json: verJson } = await tryFetchJSON(base, headers, [`/version`, `/snapshot/version`]);
       setVer(verJson.version ?? "");
     } catch (e: any) {
@@ -320,7 +316,6 @@ export default function PlantAgentDashboard() {
 
   useEffect(() => {
     if (!base) return;
-    // hint if user pasted .../snapshot as base
     if (/\/snapshot\/?$/i.test(baseRaw)) {
       setErrorMsg((m) => m || "Tip: remove '/snapshot' from the API Base URL; the app adds paths itself.");
     }
@@ -377,7 +372,6 @@ export default function PlantAgentDashboard() {
         apply_top: applyTop,
         log_suggestions: logSugg,
       };
-      // capture BEFORE
       const s0 = (await fetchSnapshotFast()) ?? snap;
       if (s0) setRoutineBefore({ ...s0 });
 
@@ -390,7 +384,6 @@ export default function PlantAgentDashboard() {
       const j: RoutineResp = await r.json();
       setRoutineOut(j);
 
-      // if backend auto-applied (apply_top), prefer its actuation.after
       if (j.actuation?.after) {
         const after = j.actuation.after as Snapshot;
         setSnap(after);
@@ -453,7 +446,6 @@ export default function PlantAgentDashboard() {
   const [val, setVal] = useState<string>("8");
   const [loadOut, setLoadOut] = useState<LoadResp | null>(null);
 
-  // Load-up before/after
   const [loadBefore, setLoadBefore] = useState<Snapshot | null>(null);
   const [loadAfter, setLoadAfter] = useState<Snapshot | null>(null);
 
@@ -539,6 +531,30 @@ export default function PlantAgentDashboard() {
     setLoadBefore(null);
     setLoadAfter(null);
   }, []);
+
+  // ---- NEW: pull the latest scheduler suggestion from the backend ----
+  const fetchLatestRoutine = useCallback(async () => {
+    if (!base) return;
+    try {
+      const r = await fetch(`${base}/routine/latest`, { headers });
+      if (!r.ok) return; // quietly ignore when none yet
+      const j: RoutineResp = await r.json();
+      setRoutineOut(j);
+    } catch {
+      /* ignore */
+    }
+  }, [base, headers]);
+
+  useEffect(() => {
+    if (!base) return;
+    if (autoPullSugg !== "1") return;
+    const id = window.setInterval(() => {
+      fetchLatestRoutine().catch(() => {});
+    }, 15000);
+    // immediate first pull
+    fetchLatestRoutine().catch(() => {});
+    return () => window.clearInterval(id);
+  }, [base, autoPullSugg, fetchLatestRoutine]);
 
   const disabled = !base;
   const kpi = snap;
@@ -630,7 +646,7 @@ export default function PlantAgentDashboard() {
               Check
             </button>
           </div>
-          <div className="mt-3 flex items-center gap-3 text-sm">
+          <div className="mt-3 flex flex-wrap items-center gap-3 text-sm">
             <label className="inline-flex items-center gap-2">
               <input
                 type="checkbox"
@@ -639,11 +655,20 @@ export default function PlantAgentDashboard() {
               />{" "}
               Auto-refresh snapshot
             </label>
+            <label className="inline-flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={autoPullSugg === "1"}
+                onChange={(e) => setAutoPullSugg(e.target.checked ? "1" : "0")}
+              />{" "}
+              Auto-load scheduler suggestions
+            </label>
             <button
               onClick={() => {
                 fetchSnapshot();
                 getMetrics();
                 fetchTrends();
+                fetchLatestRoutine();
               }}
               className="btn-outline"
             >
@@ -713,14 +738,11 @@ export default function PlantAgentDashboard() {
             <div className="text-xs text-slate-500 mb-2">
               {chartData.length ? `Loaded ${chartData.length} points` : "Waiting for data…"}
             </div>
-
-            {/* Measured box fixes invisible chart */}
             <div ref={chartBox.ref} className="h-56 w-full">
               {chartData.length > 0 && chartBox.w > 0 && chartBox.h > 0 ? (
                 <LineChart width={chartBox.w} height={chartBox.h} data={chartData} margin={{ top: 8, right: 32, left: 8, bottom: 8 }}>
                   <CartesianGrid stroke="#e2e8f0" strokeDasharray="3 3" />
                   <XAxis dataKey="t" tick={{ fill: "#334155", fontSize: 12 }} axisLine={{ stroke: "#94a3b8" }} tickLine={{ stroke: "#94a3b8" }} />
-                  {/* Left axis: production (tph) */}
                   <YAxis
                     yAxisId="left"
                     domain={["auto", "auto"]}
@@ -728,7 +750,6 @@ export default function PlantAgentDashboard() {
                     axisLine={{ stroke: "#94a3b8" }}
                     tickLine={{ stroke: "#94a3b8" }}
                   />
-                  {/* Right axis: O2% + Specific Power */}
                   <YAxis
                     yAxisId="right"
                     orientation="right"

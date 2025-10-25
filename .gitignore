@@ -18,3 +18,5 @@ exports/
 
 # Optional: ignore large Excel if you don’t want it in git
 # data/cement_240TPD_KPI_mockup_v2.xlsx
+/KEY.json
+/secrets/*.json

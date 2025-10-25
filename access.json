@@ -1,0 +1,38 @@
+[
+  {
+    "role": "WRITER",
+    "specialGroup": "projectWriters"
+  },
+  {
+    "role": "WRITER",
+    "userByEmail": "1012558892606-compute@developer.gserviceaccount.com"
+  },
+  {
+    "role": "WRITER",
+    "userByEmail": "plant-agent-bq-scheduler@my-plant-agent-123456.iam.gserviceaccount.com"
+  },
+  {
+    "role": "WRITER",
+    "userByEmail": "plant-agent@my-plant-agent-123456.iam.gserviceaccount.com"
+  },
+  {
+    "role": "WRITER",
+    "userByEmail": "service-1012558892606@gcp-sa-bigquerydatatransfer.iam.gserviceaccount.com"
+  },
+  {
+    "role": "OWNER",
+    "specialGroup": "projectOwners"
+  },
+  {
+    "role": "OWNER",
+    "userByEmail": "garvit.haran2801@gmail.com"
+  },
+  {
+    "role": "OWNER",
+    "userByEmail": "rukshit.haran2801@gmail.com"
+  },
+  {
+    "role": "READER",
+    "specialGroup": "projectReaders"
+  }
+]

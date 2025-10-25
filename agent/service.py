@@ -14,7 +14,7 @@ from collections import deque
 import yaml
 import pandas as pd
 import datetime
-from fastapi import FastAPI, HTTPException, Body, Query, Response
+from fastapi import FastAPI, HTTPException, Body, Query, Response, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -129,44 +129,59 @@ BQ_SUGGESTIONS_TABLE_ENV = os.getenv("BQ_SUGGESTIONS_TABLE")
 # -------------------------
 app = FastAPI(title="Plant Agent API", version=SERVICE_VERSION)
 
-UI_ORIGINS = [
+# Allowed UI origins:
+# - Can be overridden via env UI_ORIGINS="https://a.com,https://b.com"
+_default_ui_origins = [
     "http://localhost:5173",
     "http://localhost:3000",
     "https://your-ui.example.com",
     "https://garvit2801.github.io",
     "https://garvit2801.github.io/Plant_Agent",
 ]
+_env_ui = [o.strip() for o in os.getenv("UI_ORIGINS", "").split(",") if o.strip()]
+UI_ORIGINS = _env_ui or _default_ui_origins
+
+# FastAPI CORS middleware will handle most cases, including OPTIONS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=UI_ORIGINS,
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
 )
 
-@app.options("/cron/routine")
-def options_cron_routine():
-    return Response(
-        status_code=204,
-        headers={
-            "Allow": "POST, OPTIONS",
-            "Access-Control-Allow-Methods": "POST, OPTIONS",
+def _origin_allowed(origin: Optional[str]) -> bool:
+    if not origin:
+        return False
+    return origin in UI_ORIGINS
+
+def _cors_hdrs_for(origin: Optional[str]) -> Dict[str, str]:
+    if _origin_allowed(origin):
+        return {
+            "Access-Control-Allow-Origin": origin,
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
             "Access-Control-Allow-Headers": "authorization, content-type",
-            "Access-Control-Allow-Origin": "*",  # tighten to your UI origin in prod
-        },
-    )
+            "Access-Control-Max-Age": "86400",
+            "Vary": "Origin",
+        }
+    return {}
+
+# Catch-all OPTIONS handler to make **every** path preflightable
+@app.options("/{path:path}")
+async def options_any(path: str, request: Request):
+    origin = request.headers.get("origin")
+    return Response(status_code=204, headers=_cors_hdrs_for(origin))
+
+# Keep explicit OPTIONS where you want stricter control
+@app.options("/cron/routine")
+def options_cron_routine(request: Request):
+    origin = request.headers.get("origin")
+    return Response(status_code=204, headers=_cors_hdrs_for(origin) | {"Allow": "POST, OPTIONS"})
 
 @app.options("/optimize/routine")
-def options_optimize_routine():
-    return Response(
-        status_code=204,
-        headers={
-            "Allow": "POST, OPTIONS",
-            "Access-Control-Allow-Methods": "POST, OPTIONS",
-            "Access-Control-Allow-Headers": "authorization, content-type",
-            "Access-Control-Allow-Origin": "*",
-        },
-    )
+def options_optimize_routine(request: Request):
+    origin = request.headers.get("origin")
+    return Response(status_code=204, headers=_cors_hdrs_for(origin) | {"Allow": "POST, OPTIONS"})
 
 # -------------------------
 # Robust plant.yaml resolver
@@ -597,6 +612,19 @@ def _bq_ingest_snapshot(snapshot: Dict[str, Any], source: str = "apply") -> Opti
     return err
 
 # -------------------------
+# NEW: recent routine suggestions memory + helpers
+# -------------------------
+_ROUTINE_RECENT: deque = deque(maxlen=50)
+
+def _maybe_parse_json(v: Any) -> Any:
+    if isinstance(v, (dict, list)) or v is None:
+        return v
+    try:
+        return json.loads(v)
+    except Exception:
+        return v
+
+# -------------------------
 # Internal helpers: apply setpoints (reused by routes)
 # -------------------------
 def _apply_setpoints_internal(setpts: Dict[str, float],
@@ -736,6 +764,7 @@ def root():
             "/actuate/apply_stage", "/actuate/rollback",
             "/ingest", "/metrics",
             "/predict/spower",
+            "/routine/latest",
         ],
         "bq_enabled": _BQ_ENABLED,
     }
@@ -1101,6 +1130,24 @@ def optimize_routine(req: RoutineOptimizeReq):
         payload["actuation"] = actuation
     payload["suggestion_id"] = suggestion_id
     payload["created_at"] = created_at.isoformat()
+
+    # NEW: remember latest suggestion for quick UI retrieval (incl. cron runs)
+    try:
+        _ROUTINE_RECENT.append({
+            "suggestion_id": suggestion_id,
+            "created_at": created_at.isoformat(),
+            "proposed_setpoints": proposal,
+            "applied": bool(applied),
+            "actuation": actuation,
+            "bq_log": payload.get("bq_log"),
+            "suggestions_log": payload.get("suggestions_log"),
+            "current": s,
+            "predicted_after": pred,
+            "mode": "routine",
+        })
+    except Exception:
+        pass
+
     return payload
 
 @app.post("/cron/routine")
@@ -1113,6 +1160,42 @@ def cron_routine(body: dict = Body(default={})):
         log_suggestions=bool(body.get("log_suggestions", True)),
     )
     return optimize_routine(req)
+
+# -------------------------
+# NEW: expose latest routine suggestion for the UI
+# -------------------------
+@app.get("/routine/latest")
+def routine_latest():
+    # 1) Try in-memory first (covers recent cron/optimize hits on this instance)
+    if _ROUTINE_RECENT:
+        return _ROUTINE_RECENT[-1]
+
+    # 2) Fallback to BigQuery history
+    if not _BQ_ENABLED or _bq_client is None:
+        raise HTTPException(status_code=404, detail="No routine suggestions available")
+
+    from google.cloud import bigquery  # type: ignore
+    table = _routine_table()
+    sql = f"""
+      SELECT suggestion_id, created_at, proposed_setpoints, predicted_after, snapshot
+      FROM `{table}`
+      ORDER BY created_at DESC
+      LIMIT 1
+    """
+    rows = list(_bq_client.query(sql, location=BQ_LOCATION).result())
+    if not rows:
+        raise HTTPException(status_code=404, detail="No routine suggestions in BigQuery")
+    r = dict(rows[0])
+
+    return {
+        "suggestion_id": r.get("suggestion_id"),
+        "created_at": r.get("created_at").isoformat() if r.get("created_at") else None,
+        "proposed_setpoints": _maybe_parse_json(r.get("proposed_setpoints")),
+        "predicted_after": _maybe_parse_json(r.get("predicted_after")),
+        "current": _maybe_parse_json(r.get("snapshot")),
+        "applied": False,
+        "mode": "routine",
+    }
 
 # -------------------------
 # Optimize (Load Up/Down) + Plan Logging
@@ -1177,7 +1260,6 @@ def optimize_load(req: LoadOptimizeReq):
 
     stages = build_stage_plan(s, targets, levers, stages_max=req.steps or stages_max)
 
-    # Fallback: if planner produced no movement, build a direct-apply stage
     def _has_moves(stages_list: List[Dict[str, Any]]) -> bool:
         for st in stages_list or []:
             sp = st.get("setpoints") or {}
