@@ -4,6 +4,7 @@ import { LineChart, Line, XAxis, YAxis, Tooltip, Legend, CartesianGrid } from "r
 /**
  * Plant Agent – Operations Dashboard UI (BQ-aware)
  * Align trends/snapshot sources; add dwell; remove “auto” direction; keep last-runs fresh.
+ * (Update: clean trends to avoid 10 tph resets; prefer BQ; use live countdown in header chip)
  */
 
 type Snapshot = {
@@ -190,6 +191,35 @@ async function tryFetchJSON(base: string, headers: Record<string, string>, paths
   throw lastErr ?? new Error("No candidate path succeeded");
 }
 
+/** Clean/denoise trend rows to avoid “snap-to-10” artifacts */
+function cleanTrends(rows: any[]): TrendPoint[] {
+  const sorted = [...rows].sort((a, b) => new Date(a.ts ?? 0).getTime() - new Date(b.ts ?? 0).getTime());
+  const out: TrendPoint[] = [];
+  let lastProd: number | undefined;
+
+  for (const row of sorted) {
+    const prod = Number(row.production_tph);
+    const o2 = Number(row.o2_percent);
+    const sp = Number(row.specific_power_kwh_per_ton);
+
+    const prodGood = Number.isFinite(prod) && prod > 0.5 && prod < 1000;
+    const o2Good = Number.isFinite(o2) && o2 >= 0 && o2 < 30;
+    const spGood = Number.isFinite(sp) && sp > 0 && sp < 200;
+
+    const spike = lastProd && prodGood ? Math.abs(prod - lastProd) / lastProd > 0.30 : false;
+    const keepProd = prodGood && !spike ? prod : NaN;
+    if (Number.isFinite(keepProd)) lastProd = keepProd as number;
+
+    out.push({
+      t: row.ts ? new Date(row.ts).toLocaleTimeString() : "",
+      production_tph: Number.isFinite(keepProd) ? (keepProd as number) : (NaN as any),
+      o2_percent: o2Good ? o2 : (NaN as any),
+      specific_power_kwh_per_ton: spGood ? sp : (NaN as any),
+    });
+  }
+  return out;
+}
+
 export default function PlantAgentDashboard() {
   const [baseRaw, setBaseRaw] = useLocalStorage(LS_KEYS.BASE, "");
   const base = useMemo(() => normalizeBase(baseRaw), [baseRaw]);
@@ -272,26 +302,14 @@ export default function PlantAgentDashboard() {
     if (!base) return;
     setErrorMsg("");
     try {
-      // Prefer AUTO first so it matches /snapshot source; then fall back to BQ explicitly.
+      // Prefer BQ to avoid mixed-source artifacts; fallback to auto only if BQ missing.
       const { json: data } = await tryFetchJSON(base, headers, [
-        `/trends?minutes=120&limit=240&source=auto`,
         `/trends?minutes=120&limit=240&source=bq`,
+        `/trends?minutes=120&limit=240&source=auto`,
       ]);
       if (Array.isArray(data)) {
-        const mapped: TrendPoint[] = data
-          .map((row: any) => ({
-            t: row.ts ? new Date(row.ts).toLocaleTimeString() : "",
-            production_tph: Number(row.production_tph),
-            o2_percent: Number(row.o2_percent),
-            specific_power_kwh_per_ton: Number(row.specific_power_kwh_per_ton),
-          }))
-          .filter(
-            (p) =>
-              Number.isFinite(p.production_tph) &&
-              Number.isFinite(p.o2_percent) &&
-              Number.isFinite(p.specific_power_kwh_per_ton)
-          );
-        setTrends(mapped.slice(-240));
+        const cleaned = cleanTrends(data);
+        setTrends(cleaned.slice(-240));
       }
     } catch (e: any) {
       setErrorMsg((prev) => prev || e?.message || "Failed to fetch trends");
@@ -554,13 +572,13 @@ export default function PlantAgentDashboard() {
 
   const chartBox = useMeasure();
 
+  // Use live, ticking countdown for the header chip
   const nextLabel = useMemo(() => {
-    if (!lastRuns?.seconds_to_next && lastRuns?.seconds_to_next !== 0) return "-";
-    const s = lastRuns.seconds_to_next!;
-    const m = Math.floor(s / 60);
-    const ss = s % 60;
+    if (countdown === null || countdown === undefined) return "-";
+    const m = Math.floor(countdown / 60);
+    const ss = countdown % 60;
     return `${m}:${String(ss).padStart(2, "0")} to next routine`;
-  }, [lastRuns]);
+  }, [countdown]);
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900">
