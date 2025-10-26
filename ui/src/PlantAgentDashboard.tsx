@@ -3,6 +3,7 @@ import { LineChart, Line, XAxis, YAxis, Tooltip, Legend, CartesianGrid } from "r
 
 /**
  * Plant Agent – Operations Dashboard UI (BQ-aware)
+ * (Updated for autosnapshot countdown, tighter state sync, step dwell, trends polish)
  */
 
 type Snapshot = {
@@ -75,11 +76,20 @@ type ApplyResp = {
   applied_at?: string;
 };
 
+type LastRuns = {
+  last_cron_routine: string | null;
+  last_ingest: string | null;
+  sched_period_sec: number;
+  now: string;
+  next_cron_eta: string | null;
+  seconds_to_next: number | null;
+};
+
 const LS_KEYS = {
   BASE: "plant_ui.base_url",
   TOKEN: "plant_ui.id_token",
   AUTOPOLL: "plant_ui.autopoll",
-  AUTOPULL_SUGG: "plant_ui.autopull_suggestions",
+  STEP_DWELL: "plant_ui.step_dwell", // csv seconds per step
 };
 
 function useLocalStorage(key: string, initial: string) {
@@ -159,17 +169,24 @@ function deriveSuggestionLines(
   return out;
 }
 
-function Chip({ children, tone = "slate" }: { children: React.ReactNode; tone?: "slate" | "green" | "rose" | "amber" }) {
+function Chip({
+  children,
+  tone = "slate",
+}: {
+  children: React.ReactNode;
+  tone?: "slate" | "green" | "rose" | "amber" | "indigo";
+}) {
   const map: Record<string, string> = {
     slate: "bg-slate-100 text-slate-700",
     green: "bg-green-100 text-green-700",
     rose: "bg-rose-100 text-rose-700",
     amber: "bg-amber-100 text-amber-800",
+    indigo: "bg-indigo-100 text-indigo-700",
   };
   return <span className={cls("px-2 py-1 rounded-full border text-xs", map[tone])}>{children}</span>;
 }
 
-/** Measure a container (fixes ResponsiveContainer zero-size issues) */
+/** Measure box */
 function useMeasure() {
   const ref = useRef<HTMLDivElement | null>(null);
   const [size, setSize] = useState({ w: 0, h: 0 });
@@ -187,7 +204,6 @@ function useMeasure() {
   return { ref, ...size };
 }
 
-/** Try a list of path candidates and return the first successful JSON */
 async function tryFetchJSON(base: string, headers: Record<string, string>, paths: string[]) {
   let lastErr: any;
   for (const p of paths) {
@@ -208,7 +224,7 @@ export default function PlantAgentDashboard() {
   const base = useMemo(() => normalizeBase(baseRaw), [baseRaw]);
   const [token, setToken] = useLocalStorage(LS_KEYS.TOKEN, "");
   const [autoPoll, setAutoPoll] = useLocalStorage(LS_KEYS.AUTOPOLL, "1");
-  const [autoPullSugg, setAutoPullSugg] = useLocalStorage(LS_KEYS.AUTOPULL_SUGG, "1");
+  const [stepDwellCsv, setStepDwellCsv] = useLocalStorage(LS_KEYS.STEP_DWELL, "20"); // seconds
 
   const headers = useMemo(() => {
     const h: Record<string, string> = { "Content-Type": "application/json" };
@@ -220,6 +236,9 @@ export default function PlantAgentDashboard() {
   const [ver, setVer] = useState<string>("");
   const [errorMsg, setErrorMsg] = useState<string>("");
 
+  const [lastRuns, setLastRuns] = useState<LastRuns | null>(null);
+  const [countdown, setCountdown] = useState<number | null>(null);
+
   const fetchHealth = useCallback(async () => {
     setErrorMsg("");
     try {
@@ -230,12 +249,11 @@ export default function PlantAgentDashboard() {
           const rr = await fetch(`${base}${p}`, { headers });
           healthResp = rr;
           if (rr.ok || rr.status !== 404) break;
-        } catch {
-          /* try next */
-        }
+        } catch {}
       }
       if (!healthResp) throw new Error("No response");
       setHealth(`${healthResp.status}`);
+
       const { json: verJson } = await tryFetchJSON(base, headers, [`/version`, `/snapshot/version`]);
       setVer(verJson.version ?? "");
     } catch (e: any) {
@@ -257,10 +275,9 @@ export default function PlantAgentDashboard() {
       o2_percent: s.o2_percent,
       specific_power_kwh_per_ton: s.specific_power_kwh_per_ton,
     };
-    setHistory((prev) => [...prev.slice(-120), point]);
+    setHistory((prev) => [...prev.slice(-240), point]);
   }, []);
 
-  /** Prefer non-BQ snapshot first (avoids view lag); fallback to BQ */
   const fetchSnapshotFast = useCallback(async (): Promise<Snapshot | null> => {
     if (!base) return null;
     const urls = [`${base}/snapshot`, `${base}/snapshot?source=bq`];
@@ -272,9 +289,7 @@ export default function PlantAgentDashboard() {
         setSnap(j);
         pushHistory(j);
         return j;
-      } catch {
-        /* try next */
-      }
+      } catch {}
     }
     return null;
   }, [base, headers, pushHistory]);
@@ -289,9 +304,10 @@ export default function PlantAgentDashboard() {
     if (!base) return;
     setErrorMsg("");
     try {
+      // Prefer BQ if available; fallback automatically
       const { json: data } = await tryFetchJSON(base, headers, [
-        `/trends?minutes=60&limit=120`,
-        `/snapshot/trends?minutes=60&limit=120`,
+        `/trends?minutes=120&limit=240&source=bq`,
+        `/trends?minutes=120&limit=240&source=auto`,
       ]);
       if (Array.isArray(data)) {
         const mapped: TrendPoint[] = data
@@ -307,11 +323,23 @@ export default function PlantAgentDashboard() {
               Number.isFinite(p.o2_percent) &&
               Number.isFinite(p.specific_power_kwh_per_ton)
           );
-        setTrends(mapped.slice(-120));
+        setTrends(mapped.slice(-240));
       }
     } catch (e: any) {
       setErrorMsg((prev) => prev || e?.message || "Failed to fetch trends");
     }
+  }, [base, headers]);
+
+  // NEW: read last_runs and maintain countdown
+  const fetchLastRuns = useCallback(async () => {
+    if (!base) return;
+    try {
+      const r = await fetch(`${base}/debug/last_runs`, { headers });
+      if (!r.ok) return;
+      const j = (await r.json()) as LastRuns;
+      setLastRuns(j);
+      setCountdown(j.seconds_to_next ?? null);
+    } catch {}
   }, [base, headers]);
 
   useEffect(() => {
@@ -322,8 +350,8 @@ export default function PlantAgentDashboard() {
     fetchHealth();
     fetchTrends();
     fetchSnapshot();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [base]);
+    fetchLastRuns();
+  }, [base]); // eslint-disable-line
 
   useEffect(() => {
     const enabled = autoPoll === "1";
@@ -334,14 +362,24 @@ export default function PlantAgentDashboard() {
     }
     pollRef.current = window.setInterval(() => {
       fetchSnapshot().catch(() => {});
+      fetchLastRuns().catch(() => {});
     }, 5000);
     return () => {
       if (pollRef.current) window.clearInterval(pollRef.current);
       pollRef.current = null;
     };
-  }, [autoPoll, base, fetchSnapshot]);
+  }, [autoPoll, base, fetchSnapshot, fetchLastRuns]);
 
-  // Metrics
+  // live countdown tick
+  useEffect(() => {
+    if (countdown === null) return;
+    const id = window.setInterval(() => {
+      setCountdown((c) => (c === null ? c : Math.max(0, c - 1)));
+    }, 1000);
+    return () => window.clearInterval(id);
+  }, [countdown]);
+
+  // Metrics (still available via button)
   const [metrics, setMetrics] = useState<any>(null);
   const getMetrics = useCallback(async () => {
     setErrorMsg("");
@@ -360,7 +398,6 @@ export default function PlantAgentDashboard() {
   const [logSugg, setLogSugg] = useState<boolean>(true);
   const [routineOut, setRoutineOut] = useState<RoutineResp | null>(null);
 
-  // Routine before/after (for accepted suggestions)
   const [routineBefore, setRoutineBefore] = useState<Snapshot | null>(null);
   const [routineAfter, setRoutineAfter] = useState<Snapshot | null>(null);
 
@@ -372,7 +409,9 @@ export default function PlantAgentDashboard() {
         apply_top: applyTop,
         log_suggestions: logSugg,
       };
-      const s0 = (await fetchSnapshotFast()) ?? snap;
+
+      // Use current in-memory snapshot as "before" (avoid extra tick drift)
+      const s0 = snap ?? (await fetchSnapshotFast());
       if (s0) setRoutineBefore({ ...s0 });
 
       const r = await fetch(`${base}/optimize/routine`, {
@@ -384,16 +423,19 @@ export default function PlantAgentDashboard() {
       const j: RoutineResp = await r.json();
       setRoutineOut(j);
 
-      if (j.actuation?.after) {
+      // Only update snapshot if the backend actually applied (i.e., apply_top checked)
+      if (j.applied && j.actuation?.after) {
         const after = j.actuation.after as Snapshot;
         setSnap(after);
         pushHistory(after);
         setRoutineAfter({ ...after });
+        // keep both modules in sync
+        await fetchTrends();
       }
     } catch (e: any) {
       setErrorMsg(e?.message || "Run routine failed");
     }
-  }, [base, headers, o2Min, o2Max, applyTop, logSugg, fetchSnapshotFast, snap, pushHistory]);
+  }, [base, headers, o2Min, o2Max, applyTop, logSugg, snap, fetchSnapshotFast, pushHistory, fetchTrends]);
 
   const applyRoutineProposal = useCallback(async () => {
     if (!routineOut?.proposed_setpoints) return;
@@ -408,22 +450,23 @@ export default function PlantAgentDashboard() {
       if (!r.ok) throw new Error(`/actuate/apply_stage ${r.status}`);
       const j: ApplyResp = await r.json();
 
+      let after: Snapshot | null = null;
       if (j.after) {
-        const after = j.after as Snapshot;
+        after = j.after as Snapshot;
+      } else {
+        after = await fetchSnapshotFast();
+      }
+      if (after) {
         setSnap(after);
         pushHistory(after);
         setRoutineAfter({ ...after });
-      } else {
-        const s1 = await fetchSnapshotFast();
-        if (s1) {
-          setSnap(s1);
-          setRoutineAfter({ ...s1 });
-        }
+        // refresh trends & clear any stale load/routine "before" sticks
+        await fetchTrends();
       }
     } catch (e: any) {
       setErrorMsg(e?.message || "Apply failed");
     }
-  }, [base, headers, routineOut, fetchSnapshotFast, pushHistory]);
+  }, [base, headers, routineOut, fetchSnapshotFast, pushHistory, fetchTrends]);
 
   const rejectRoutine = useCallback(() => {
     setRoutineOut((x) => (x ? { ...x, applied: false } : x));
@@ -442,7 +485,7 @@ export default function PlantAgentDashboard() {
   // Load planning
   const [loadMode, setLoadMode] = useState<"pct" | "abs" | "target">("pct");
   const [steps, setSteps] = useState<string>("3");
-  const [direction, setDirection] = useState<"auto" | "up" | "down">("auto");
+  const [direction, setDirection] = useState<"up" | "down">("up"); // removed "auto"
   const [val, setVal] = useState<string>("8");
   const [loadOut, setLoadOut] = useState<LoadResp | null>(null);
 
@@ -452,8 +495,7 @@ export default function PlantAgentDashboard() {
   const runLoad = useCallback(async () => {
     setErrorMsg("");
     try {
-      const body: LoadReq = { steps: Number(steps) || 3 } as any;
-      if (direction !== "auto") body.direction = direction;
+      const body: LoadReq = { steps: Number(steps) || 3, direction } as any;
       if (loadMode === "pct") body.delta_pct = Number(val);
       if (loadMode === "abs") body.delta_abs = Number(val);
       if (loadMode === "target") body.target_tph = Number(val);
@@ -467,13 +509,28 @@ export default function PlantAgentDashboard() {
       const j: LoadResp = await r.json();
       setLoadOut(j);
 
-      const s0 = (await fetchSnapshotFast()) ?? snap;
+      const s0 = snap ?? (await fetchSnapshotFast());
       if (s0) setLoadBefore({ ...s0 });
       setLoadAfter(null);
     } catch (e: any) {
       setErrorMsg(e?.message || "Create plan failed");
     }
   }, [base, headers, steps, direction, val, loadMode, fetchSnapshotFast, snap]);
+
+  // Helper to parse per-step dwell seconds (comma separated)
+  const parseStepDwells = useCallback(
+    (nStages: number): number[] => {
+      const parts = stepDwellCsv
+        .split(",")
+        .map((s) => Number(s.trim()))
+        .filter((x) => Number.isFinite(x) && x >= 0);
+      if (parts.length === 0) return Array(nStages).fill(20);
+      const out: number[] = [];
+      for (let i = 0; i < nStages; i++) out.push(parts[i] ?? parts[0]);
+      return out;
+    },
+    [stepDwellCsv]
+  );
 
   const applyStage = useCallback(
     async (i: number) => {
@@ -489,37 +546,44 @@ export default function PlantAgentDashboard() {
         if (!r.ok) throw new Error(`/actuate/apply_stage ${r.status}`);
         const j: ApplyResp = await r.json();
 
-        if (j.after) {
-          const after = j.after as Snapshot;
+        let after: Snapshot | null = null;
+        if (j.after) after = j.after as Snapshot;
+        else after = await fetchSnapshotFast();
+
+        if (after) {
           setSnap(after);
           pushHistory(after);
           if (i === loadOut.stages.length - 1) setLoadAfter({ ...after });
-        } else if (i === loadOut.stages.length - 1) {
-          const s1 = await fetchSnapshotFast();
-          if (s1) setLoadAfter({ ...s1 });
+          // keep Routine card "current" in sync too
+          setRoutineBefore(null);
+          setRoutineAfter(null);
+          await fetchTrends();
         }
       } catch (e: any) {
         setErrorMsg(e?.message || `Apply stage ${i + 1} failed`);
       }
     },
-    [base, headers, loadOut, fetchSnapshotFast, pushHistory]
+    [base, headers, loadOut, fetchSnapshotFast, pushHistory, fetchTrends]
   );
+
+  const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
 
   const applyAllStages = useCallback(async () => {
     if (!loadOut) return;
     if (!loadBefore) {
-      const s0 = (await fetchSnapshotFast()) ?? snap;
+      const s0 = snap ?? (await fetchSnapshotFast());
       if (s0) setLoadBefore({ ...s0 });
     }
+    const dwells = parseStepDwells(loadOut.stages.length);
     for (let i = 0; i < loadOut.stages.length; i++) {
       await applyStage(i);
-      await new Promise((res) => setTimeout(res, 400));
+      await sleep(Math.max(0, (dwells[i] ?? 0) * 1000));
     }
     if (!loadAfter) {
       const s1 = await fetchSnapshotFast();
       if (s1) setLoadAfter({ ...s1 });
     }
-  }, [loadOut, applyStage, loadBefore, fetchSnapshotFast, snap, loadAfter]);
+  }, [loadOut, applyStage, loadBefore, fetchSnapshotFast, snap, loadAfter, parseStepDwells]);
 
   const acceptPlan = useCallback(async () => {
     if (!loadOut) return;
@@ -531,30 +595,6 @@ export default function PlantAgentDashboard() {
     setLoadBefore(null);
     setLoadAfter(null);
   }, []);
-
-  // ---- NEW: pull the latest scheduler suggestion from the backend ----
-  const fetchLatestRoutine = useCallback(async () => {
-    if (!base) return;
-    try {
-      const r = await fetch(`${base}/routine/latest`, { headers });
-      if (!r.ok) return; // quietly ignore when none yet
-      const j: RoutineResp = await r.json();
-      setRoutineOut(j);
-    } catch {
-      /* ignore */
-    }
-  }, [base, headers]);
-
-  useEffect(() => {
-    if (!base) return;
-    if (autoPullSugg !== "1") return;
-    const id = window.setInterval(() => {
-      fetchLatestRoutine().catch(() => {});
-    }, 15000);
-    // immediate first pull
-    fetchLatestRoutine().catch(() => {});
-    return () => window.clearInterval(id);
-  }, [base, autoPullSugg, fetchLatestRoutine]);
 
   const disabled = !base;
   const kpi = snap;
@@ -602,8 +642,16 @@ export default function PlantAgentDashboard() {
     });
   }, [routineBefore, routineAfter]);
 
-  // measured chart box
   const chartBox = useMeasure();
+
+  // helper for countdown label
+  const nextLabel = useMemo(() => {
+    if (!lastRuns?.seconds_to_next && lastRuns?.seconds_to_next !== 0) return "-";
+    const s = lastRuns.seconds_to_next!;
+    const m = Math.floor(s / 60);
+    const ss = s % 60;
+    return `${m}:${String(ss).padStart(2, "0")} to next routine`;
+  }, [lastRuns]);
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900">
@@ -613,6 +661,12 @@ export default function PlantAgentDashboard() {
           <div className="ml-auto flex items-center gap-2 text-sm">
             <Chip tone="slate">ver {ver || "-"}</Chip>
             <Chip tone={health === "200" ? "green" : "rose"}>health {health || "-"}</Chip>
+            <Chip tone="indigo">
+              {lastRuns?.last_cron_routine
+                ? `last routine: ${new Date(lastRuns.last_cron_routine).toLocaleString()}`
+                : "last routine: -"}
+            </Chip>
+            <Chip tone="amber">{nextLabel}</Chip>
           </div>
         </div>
       </header>
@@ -642,11 +696,11 @@ export default function PlantAgentDashboard() {
                 className="w-full mt-1 px-3 py-2 border rounded-xl"
               />
             </div>
-            <button onClick={fetchHealth} className="btn-secondary" disabled={disabled}>
+            <button onClick={fetchHealth} className="btn-outline" disabled={disabled}>
               Check
             </button>
           </div>
-          <div className="mt-3 flex flex-wrap items-center gap-3 text-sm">
+          <div className="mt-3 flex items-center gap-3 text-sm">
             <label className="inline-flex items-center gap-2">
               <input
                 type="checkbox"
@@ -655,20 +709,12 @@ export default function PlantAgentDashboard() {
               />{" "}
               Auto-refresh snapshot
             </label>
-            <label className="inline-flex items-center gap-2">
-              <input
-                type="checkbox"
-                checked={autoPullSugg === "1"}
-                onChange={(e) => setAutoPullSugg(e.target.checked ? "1" : "0")}
-              />{" "}
-              Auto-load scheduler suggestions
-            </label>
             <button
               onClick={() => {
                 fetchSnapshot();
                 getMetrics();
                 fetchTrends();
-                fetchLatestRoutine();
+                fetchLastRuns();
               }}
               className="btn-outline"
             >
@@ -694,7 +740,7 @@ export default function PlantAgentDashboard() {
           ))}
         </section>
 
-        {/* Suggestions */}
+        {/* Suggestions (Routine) */}
         <section className="bg-white rounded-2xl shadow-sm border border-slate-200 p-4">
           <div className="flex items-center justify-between">
             <div className="font-semibold">Suggestions</div>
@@ -734,7 +780,7 @@ export default function PlantAgentDashboard() {
         {/* Trends + Snapshot table */}
         <section className="grid md:grid-cols-2 gap-4">
           <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-4">
-            <div className="font-semibold mb-1">Important Trends (last hour)</div>
+            <div className="font-semibold mb-1">Important Trends (last 2 hours)</div>
             <div className="text-xs text-slate-500 mb-2">
               {chartData.length ? `Loaded ${chartData.length} points` : "Waiting for data…"}
             </div>
@@ -793,7 +839,7 @@ export default function PlantAgentDashboard() {
             <div className="font-semibold">Routine Optimization</div>
             <div className="text-xs text-slate-500">Logs to routine_suggestions_v2 (+ suggestions_v1)</div>
           </div>
-          <div className="mt-3 grid md:grid-cols-5 gap-3 items-end">
+          <div className="mt-3 grid md:grid-cols-6 gap-3 items-end">
             <div>
               <label className="text-xs text-slate-500">O₂ min</label>
               <input value={o2Min} onChange={(e) => setO2Min(e.target.value)} className="w-full mt-1 px-3 py-2 border rounded-xl" />
@@ -809,6 +855,9 @@ export default function PlantAgentDashboard() {
               <input type="checkbox" checked={logSugg} onChange={(e) => setLogSugg(e.target.checked)} /> Log suggestions
             </label>
             <button onClick={runRoutine} className="btn-secondary" disabled={disabled}>Run routine</button>
+            <div className="text-xs text-slate-500">
+              Next: {lastRuns?.next_cron_eta ? new Date(lastRuns.next_cron_eta).toLocaleTimeString() : "-"}
+            </div>
           </div>
         </section>
 
@@ -820,7 +869,7 @@ export default function PlantAgentDashboard() {
               latest plan: {loadOut?.created_at ? new Date(loadOut.created_at).toLocaleString() : "-"} • id: {loadOut?.plan_id || "-"}
             </div>
           </div>
-          <div className="mt-3 grid md:grid-cols-6 gap-3 items-end">
+          <div className="mt-3 grid md:grid-cols-7 gap-3 items-end">
             <div>
               <label className="text-xs text-slate-500">Approach</label>
               <select value={loadMode} onChange={(e) => setLoadMode(e.target.value as any)} className="w-full mt-1 px-3 py-2 border rounded-xl">
@@ -840,18 +889,15 @@ export default function PlantAgentDashboard() {
             <div>
               <label className="text-xs text-slate-500">Direction</label>
               <select value={direction} onChange={(e) => setDirection(e.target.value as any)} className="w-full mt-1 px-3 py-2 border rounded-xl">
-                <option value="auto">auto</option>
                 <option value="up">up</option>
                 <option value="down">down</option>
               </select>
             </div>
+            <div className="col-span-2">
+              <label className="text-xs text-slate-500">Step dwell seconds (CSV; per-stage)</label>
+              <input value={stepDwellCsv} onChange={(e) => setStepDwellCsv(e.target.value)} className="w-full mt-1 px-3 py-2 border rounded-xl font-mono" />
+            </div>
             <button onClick={runLoad} className="btn-indigo" disabled={disabled}>Create plan</button>
-            {loadOut && (
-              <div className="flex gap-2">
-                <button onClick={acceptPlan} className="btn-primary">Accept & Apply All</button>
-                <button onClick={rejectPlan} className="btn-danger">Reject</button>
-              </div>
-            )}
           </div>
 
           {loadOut && (
@@ -871,7 +917,8 @@ export default function PlantAgentDashboard() {
                       </div>
                     ))}
                   </div>
-                  <button onClick={applyAllStages} className="mt-3 btn-outline">Apply all</button>
+                  {/* Removed the redundant black "Apply all" button; keep only the primary */}
+                  <button onClick={acceptPlan} className="mt-3 btn-primary">Accept & Apply All</button>
                 </div>
                 <div>
                   <div className="text-sm font-medium mb-1">BigQuery log</div>

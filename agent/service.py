@@ -102,8 +102,10 @@ PORT = int(os.getenv("PORT", "8080"))
 USE_MOCK = int(os.getenv("USE_MOCK", "1"))
 MOCK_TICK_SEC = float(os.getenv("MOCK_TICK_SEC", "5"))
 APPLY_ENABLED = int(os.getenv("APPLY_ENABLED", "1"))
-# NEW: auto-write the "after" snapshot to BQ snapshots base table so UI updates
+# Auto-write the "after" snapshot to BQ snapshots base table so UI updates
 AUTO_INGEST_ON_APPLY = int(os.getenv("AUTO_INGEST_ON_APPLY", "1"))
+# Scheduler cadence hint for UI countdowns
+SCHED_PERIOD_SEC = int(os.getenv("SCHED_PERIOD_SEC", "300"))  # default 5 min
 
 # Project (prefer explicit env)
 PROJECT_ID = (
@@ -129,8 +131,6 @@ BQ_SUGGESTIONS_TABLE_ENV = os.getenv("BQ_SUGGESTIONS_TABLE")
 # -------------------------
 app = FastAPI(title="Plant Agent API", version=SERVICE_VERSION)
 
-# Allowed UI origins:
-# - Can be overridden via env UI_ORIGINS="https://a.com,https://b.com"
 _default_ui_origins = [
     "http://localhost:5173",
     "http://localhost:3000",
@@ -141,7 +141,6 @@ _default_ui_origins = [
 _env_ui = [o.strip() for o in os.getenv("UI_ORIGINS", "").split(",") if o.strip()]
 UI_ORIGINS = _env_ui or _default_ui_origins
 
-# FastAPI CORS middleware will handle most cases, including OPTIONS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=UI_ORIGINS,
@@ -151,9 +150,7 @@ app.add_middleware(
 )
 
 def _origin_allowed(origin: Optional[str]) -> bool:
-    if not origin:
-        return False
-    return origin in UI_ORIGINS
+    return bool(origin and origin in UI_ORIGINS)
 
 def _cors_hdrs_for(origin: Optional[str]) -> Dict[str, str]:
     if _origin_allowed(origin):
@@ -166,13 +163,11 @@ def _cors_hdrs_for(origin: Optional[str]) -> Dict[str, str]:
         }
     return {}
 
-# Catch-all OPTIONS handler to make **every** path preflightable
 @app.options("/{path:path}")
 async def options_any(path: str, request: Request):
     origin = request.headers.get("origin")
     return Response(status_code=204, headers=_cors_hdrs_for(origin))
 
-# Keep explicit OPTIONS where you want stricter control
 @app.options("/cron/routine")
 def options_cron_routine(request: Request):
     origin = request.headers.get("origin")
@@ -612,19 +607,6 @@ def _bq_ingest_snapshot(snapshot: Dict[str, Any], source: str = "apply") -> Opti
     return err
 
 # -------------------------
-# NEW: recent routine suggestions memory + helpers
-# -------------------------
-_ROUTINE_RECENT: deque = deque(maxlen=50)
-
-def _maybe_parse_json(v: Any) -> Any:
-    if isinstance(v, (dict, list)) or v is None:
-        return v
-    try:
-        return json.loads(v)
-    except Exception:
-        return v
-
-# -------------------------
 # Internal helpers: apply setpoints (reused by routes)
 # -------------------------
 def _apply_setpoints_internal(setpts: Dict[str, float],
@@ -638,24 +620,20 @@ def _apply_setpoints_internal(setpts: Dict[str, float],
     if not isinstance(setpts, dict) or not setpts:
         raise HTTPException(status_code=422, detail="No setpoints provided")
 
-    # knobs to make changes visible
     nudge = float(os.getenv("MOCK_APPLY_NUDGE", "1.0"))
     settle_ticks = int(os.getenv("MOCK_APPLY_SETTLE_TICKS", "5"))
 
-    # capture before snapshot
     if USE_MOCK:
         with _state_lock:
             before = {k: v for k, v in _STATE.items() if k != "sp"}
     else:
         before = {}
 
-    # apply to mock
     if USE_MOCK:
         cfg = get_config()
         levers: Dict[str, Any] = cfg.get("levers", {})
         with _state_lock:
             sp = _STATE.setdefault("sp", {})
-            # write SPs (clamped)
             for k, v in setpts.items():
                 if k not in ("kiln_feed_tph","separator_dp_pa","id_fan_flow_Nm3_h","cooler_airflow_Nm3_h","kiln_speed_rpm"):
                     continue
@@ -663,14 +641,12 @@ def _apply_setpoints_internal(setpts: Dict[str, float],
                 hi = levers.get(k, {}).get("max", 1e12)
                 sp[k] = clamp(float(v), lo, hi)
 
-            # immediate PV nudge toward SPs
             for k in ("kiln_feed_tph","separator_dp_pa","id_fan_flow_Nm3_h","cooler_airflow_Nm3_h","kiln_speed_rpm"):
                 if k in sp:
                     cur = float(_STATE[k])
                     tgt = float(sp[k])
                     _STATE[k] = cur + nudge * (tgt - cur)
 
-            # settle a few ticks so derived KPIs respond
             for _ in range(max(0, settle_ticks)):
                 _physics_tick(_STATE, dt_sec=MOCK_TICK_SEC)
 
@@ -681,14 +657,12 @@ def _apply_setpoints_internal(setpts: Dict[str, float],
 
     applied_at = _now_ts()
 
-    # Auto-ingest the "after" snapshot so the UI latest-view/trends reflect it
     if AUTO_INGEST_ON_APPLY and after:
         try:
             _bq_ingest_snapshot(after, source=f"apply:{mode or 'manual'}")
         except Exception as e:
             logging.warning("Auto-ingest after apply failed: %s", e)
 
-    # log to BQ: actuations_v2
     tbl = _acts_table()
     err = None
     if _BQ_ENABLED and tbl:
@@ -723,7 +697,6 @@ def _apply_setpoints_internal(setpts: Dict[str, float],
     else:
         logging.info("Skipping actuation log: BQ_ENABLED=%s, table=%s", _BQ_ENABLED, tbl)
 
-    # round for UI readability
     def _round_map(m: Dict[str, Any]) -> Dict[str, Any]:
         out: Dict[str, Any] = {}
         for k, v in m.items():
@@ -742,6 +715,25 @@ def _apply_setpoints_internal(setpts: Dict[str, float],
     }
 
 # -------------------------
+# Last-run memory for scheduler & ingest (for countdowns)
+# -------------------------
+_LAST_CRON_RUN: Optional[datetime.datetime] = None
+_LAST_INGEST_RUN: Optional[datetime.datetime] = None
+
+# -------------------------
+# NEW: recent routine suggestions memory + helpers
+# -------------------------
+_ROUTINE_RECENT: deque = deque(maxlen=50)
+
+def _maybe_parse_json(v: Any) -> Any:
+    if isinstance(v, (dict, list)) or v is None:
+        return v
+    try:
+        return json.loads(v)
+    except Exception:
+        return v
+
+# -------------------------
 # Routes
 # -------------------------
 @app.get("/")
@@ -757,21 +749,22 @@ def root():
         "health": "/healthz",
         "endpoints": [
             "/healthz", "/health", "/_ah/health", "/version", "/config",
-            "/debug/config", "/debug/tables", "/debug/bq_recent",
+            "/debug/config", "/debug/tables", "/debug/bq_recent", "/debug/last_runs",
             "/snapshot", "/snapshot/set",
             "/trends",
             "/optimize/routine", "/optimize/load", "/cron/routine",
+            "/routine/latest",
             "/actuate/apply_stage", "/actuate/rollback",
             "/ingest", "/metrics",
             "/predict/spower",
-            "/routine/latest",
         ],
         "bq_enabled": _BQ_ENABLED,
+        "sched_period_sec": SCHED_PERIOD_SEC,
     }
 
 @app.get("/version")
 def version():
-    return {"version": SERVICE_VERSION}
+    return {"version": SERVICE_VERSION, "sched_period_sec": SCHED_PERIOD_SEC}
 
 @app.get("/healthz")
 def healthz():
@@ -824,6 +817,7 @@ def debug_config():
         "bq_table_effective": effective_table,
         "project_id_env": os.getenv("PROJECT_ID"),
         "project_id_effective": proj_eff,
+        "sched_period_sec": SCHED_PERIOD_SEC,
     }
 
 @app.get("/debug/tables")
@@ -867,6 +861,24 @@ def debug_bq_recent():
         "bq_error": _BQ_ERR,
     }
 
+# NEW: expose last autosnapshot / cron run times + countdown
+@app.get("/debug/last_runs")
+def debug_last_runs():
+    now = _now_ts()
+    next_run = None
+    sec_to_next = None
+    if _LAST_CRON_RUN:
+        next_run = _LAST_CRON_RUN + datetime.timedelta(seconds=SCHED_PERIOD_SEC)
+        sec_to_next = max(0, int((next_run - now).total_seconds()))
+    return {
+        "last_cron_routine": _LAST_CRON_RUN.isoformat() if _LAST_CRON_RUN else None,
+        "last_ingest": _LAST_INGEST_RUN.isoformat() if _LAST_INGEST_RUN else None,
+        "sched_period_sec": SCHED_PERIOD_SEC,
+        "now": now.isoformat(),
+        "next_cron_eta": next_run.isoformat() if next_run else None,
+        "seconds_to_next": sec_to_next,
+    }
+
 @app.get("/snapshot")
 def snapshot(source: Optional[str] = Query(default="auto", description="'auto'|'mock'|'bq'")):
     if source == "bq":
@@ -903,7 +915,7 @@ def snapshot_set(req: SnapshotSetReq):
 @app.get("/trends")
 def trends(
     minutes: int = Query(default=60, ge=1, le=24*60),
-    limit: int = Query(default=120, ge=1, le=5000),
+    limit: int = Query(default=180, ge=1, le=5000),  # slightly higher default density
     source: str = Query(default="auto", description="'auto'|'mock'|'bq'")
 ):
     # Mock path
@@ -1046,7 +1058,6 @@ def optimize_routine(req: RoutineOptimizeReq):
     proposal_list = propose_actions(s, recipe, levers)
     proposal = proposal_list[0] if proposal_list else {}
 
-    # Fallback: if no proposal generated, synthesize a small, bounded suggestion
     if not proposal:
         fallback = {}
         if "id_fan_flow_Nm3_h" in s and "id_fan_flow_Nm3_h" in levers:
@@ -1131,7 +1142,7 @@ def optimize_routine(req: RoutineOptimizeReq):
     payload["suggestion_id"] = suggestion_id
     payload["created_at"] = created_at.isoformat()
 
-    # NEW: remember latest suggestion for quick UI retrieval (incl. cron runs)
+    # --- NEW: remember latest suggestion for quick UI retrieval (incl. cron runs)
     try:
         _ROUTINE_RECENT.append({
             "suggestion_id": suggestion_id,
@@ -1152,6 +1163,8 @@ def optimize_routine(req: RoutineOptimizeReq):
 
 @app.post("/cron/routine")
 def cron_routine(body: dict = Body(default={})):
+    global _LAST_CRON_RUN
+    _LAST_CRON_RUN = _now_ts()  # record for UI countdowns
     req = RoutineOptimizeReq(
         snapshot=body.get("snapshot"),
         targets=body.get("targets"),
@@ -1310,7 +1323,6 @@ def optimize_load(req: LoadOptimizeReq):
         "steps_cfg": levers,
     }
 
-    # Log the plan
     tbl = _plans_table()
     err = None
     if _BQ_ENABLED and tbl:
@@ -1374,6 +1386,8 @@ def actuate_rollback():
 # -------------------------
 @app.post("/ingest")
 def ingest(doc: dict = Body(default={})):
+    global _LAST_INGEST_RUN
+    _LAST_INGEST_RUN = _now_ts()
     if not _BQ_ENABLED or _bq_client is None:
         raise HTTPException(status_code=500, detail=_BQ_ERR or "BigQuery unavailable")
 
@@ -1557,4 +1571,6 @@ def metrics():
         "history_points": history_len,
         "snapshot": s,
         "levers": list(cfg.get("levers", {}).keys()),
+        "bq_enabled": _BQ_ENABLED,
+        "sched_period_sec": SCHED_PERIOD_SEC,
     }
