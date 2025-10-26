@@ -657,9 +657,13 @@ def _apply_setpoints_internal(setpts: Dict[str, float],
 
     applied_at = _now_ts()
 
+    # Record ingest time if we auto-ingest after apply
     if AUTO_INGEST_ON_APPLY and after:
         try:
             _bq_ingest_snapshot(after, source=f"apply:{mode or 'manual'}")
+            # reflect on /debug/last_runs
+            global _LAST_INGEST_RUN
+            _LAST_INGEST_RUN = applied_at
         except Exception as e:
             logging.warning("Auto-ingest after apply failed: %s", e)
 
@@ -915,11 +919,11 @@ def snapshot_set(req: SnapshotSetReq):
 @app.get("/trends")
 def trends(
     minutes: int = Query(default=60, ge=1, le=24*60),
-    limit: int = Query(default=180, ge=1, le=5000),  # slightly higher default density
+    limit: int = Query(default=180, ge=1, le=5000),
     source: str = Query(default="auto", description="'auto'|'mock'|'bq'")
 ):
-    # Mock path
-    if source == "mock" or (source == "auto" and USE_MOCK and (not _BQ_ENABLED)):
+    # Prefer the in-memory ring buffer whenever we're in mock mode.
+    if source == "mock" or (source == "auto" and USE_MOCK):
         cutoff = _now_ts() - datetime.timedelta(minutes=minutes)
         pts = [p for p in list(_HIST) if datetime.datetime.fromisoformat(p["ts"].replace("Z","")).astimezone(datetime.timezone.utc) >= cutoff]
         pts = pts[-limit:]
@@ -1026,6 +1030,10 @@ def _insert_suggestions_rows(suggestion_id: str,
 
 @app.post("/optimize/routine")
 def optimize_routine(req: RoutineOptimizeReq):
+    # Treat manual routine runs as a "cron run" for dashboard freshness
+    global _LAST_CRON_RUN
+    _LAST_CRON_RUN = _now_ts()
+
     # snapshot
     if req.snapshot and isinstance(req.snapshot, dict):
         s = dict(req.snapshot)
@@ -1142,7 +1150,7 @@ def optimize_routine(req: RoutineOptimizeReq):
     payload["suggestion_id"] = suggestion_id
     payload["created_at"] = created_at.isoformat()
 
-    # --- NEW: remember latest suggestion for quick UI retrieval (incl. cron runs)
+    # --- remember latest suggestion for quick UI retrieval
     try:
         _ROUTINE_RECENT.append({
             "suggestion_id": suggestion_id,
