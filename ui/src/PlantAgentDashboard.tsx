@@ -7,6 +7,55 @@ import { LineChart, Line, XAxis, YAxis, Tooltip, Legend, CartesianGrid } from "r
  * (Update: clean trends to avoid 10 tph resets; prefer BQ; use live countdown in header chip)
  */
 
+// ---- DEBUG helpers ----
+const DEBUG_KEY = "plant_ui.debug";
+const getDebug = () => (localStorage.getItem(DEBUG_KEY) ?? "0") === "1";
+const setDebug = (b: boolean) => localStorage.setItem(DEBUG_KEY, b ? "1" : "0");
+const [debugUI, setDebugUI] = useState(getDebug());
+
+function warn(msg: string, extra?: any) {
+  console.warn(`[PlantUI] ${msg}`, extra ?? "");
+}
+
+function info(msg: string, extra?: any) {
+  if (getDebug()) console.log(`[PlantUI] ${msg}`, extra ?? "");
+}
+
+type TrendDiag = {
+  n: number;
+  firstTs?: string;
+  lastTs?: string;
+  nonMonotonic: number;
+  prodMin?: number;
+  prodMax?: number;
+  prodEq10: number;
+  prodNaN: number;
+  o2NaN: number;
+  spNaN: number;
+};
+function diagnoseTrends(arr: any[]): TrendDiag {
+  const diag: TrendDiag = { n: arr.length, nonMonotonic: 0, prodEq10: 0, prodNaN: 0, o2NaN: 0, spNaN: 0 };
+  let prev = -Infinity;
+  let min = +Infinity, max = -Infinity;
+  for (const r of arr) {
+    const ts = typeof r.ts === "string" || typeof r.ts === "number" ? Number(new Date(r.ts)) : NaN;
+    if (Number.isFinite(ts)) {
+      if (!diag.firstTs) diag.firstTs = new Date(ts).toISOString();
+      diag.lastTs = new Date(ts).toISOString();
+      if (ts < prev) diag.nonMonotonic++;
+      prev = ts;
+    }
+    const p = Number(r.production_tph);
+    const o = Number(r.o2_percent);
+    const s = Number(r.specific_power_kwh_per_ton);
+    if (!Number.isFinite(p)) diag.prodNaN++; else { min = Math.min(min, p); max = Math.max(max, p); if (p === 10) diag.prodEq10++; }
+    if (!Number.isFinite(o)) diag.o2NaN++;
+    if (!Number.isFinite(s)) diag.spNaN++;
+  }
+  if (diag.n) { diag.prodMin = Number.isFinite(min) ? min : undefined; diag.prodMax = Number.isFinite(max) ? max : undefined; }
+  return diag;
+}
+
 type Snapshot = {
   production_tph: number;
   kiln_feed_tph: number;
@@ -302,42 +351,77 @@ export default function PlantAgentDashboard() {
     if (!base) return;
     setErrorMsg("");
     try {
-      // Prefer BQ to avoid mixed-source artifacts; fallback to auto only if BQ missing.
-      const { json: data } = await tryFetchJSON(base, headers, [
-        `/trends?minutes=120&limit=240&source=bq`,
+      // try both sources; we want to *see* which one responds first
+      const { json: data, response } = await tryFetchJSON(base, headers, [
         `/trends?minutes=120&limit=240&source=auto`,
+        `/trends?minutes=120&limit=240&source=bq`,
       ]);
-      if (Array.isArray(data)) {
-        const cleaned = cleanTrends(data);
-        setTrends(cleaned.slice(-240));
+      if (!Array.isArray(data)) return;
+  
+      const diag = diagnoseTrends(data);
+      info(`Fetched trends from ${response.url}`, diag);
+  
+      if (diag.nonMonotonic > 0) {
+        warn(`Trends have ${diag.nonMonotonic} non-monotonic timestamps (ordering issue in API).`, diag);
       }
+      if (diag.prodEq10 > 0 && diag.prodEq10 >= Math.ceil(diag.n * 0.3)) {
+        warn(`~${Math.round((diag.prodEq10 / diag.n) * 100)}% of points have production=10 (plateau).`, diag);
+      }
+      if ((diag.prodNaN || diag.o2NaN || diag.spNaN) && getDebug()) {
+        console.table({ prodNaN: diag.prodNaN, o2NaN: diag.o2NaN, spNaN: diag.spNaN });
+      }
+  
+      const mapped: TrendPoint[] = data
+        .map((row: any) => ({
+          t: row.ts ? new Date(row.ts).toLocaleTimeString() : "",
+          production_tph: Number(row.production_tph),
+          o2_percent: Number(row.o2_percent),
+          specific_power_kwh_per_ton: Number(row.specific_power_kwh_per_ton),
+        }))
+        .filter(
+          (p) =>
+            Number.isFinite(p.production_tph) &&
+            Number.isFinite(p.o2_percent) &&
+            Number.isFinite(p.specific_power_kwh_per_ton)
+        );
+      setTrends(mapped.slice(-240));
     } catch (e: any) {
       setErrorMsg((prev) => prev || e?.message || "Failed to fetch trends");
+      warn("fetchTrends failed", e);
     }
-  }, [base, headers]);
+  }, [base, headers]);  
 
   // NEW: read last_runs and maintain countdown
   const fetchLastRuns = useCallback(async () => {
     if (!base) return;
     try {
       const r = await fetch(`${base}/debug/last_runs`, { headers });
-      if (!r.ok) return;
+      if (!r.ok) { warn(`/debug/last_runs ${r.status}`); return; }
       const j = (await r.json()) as LastRuns;
+      info("last_runs", j);
       setLastRuns(j);
       setCountdown(j.seconds_to_next ?? null);
-    } catch {}
-  }, [base, headers]);
-
-  useEffect(() => {
-    if (!base) return;
-    if (/\/snapshot\/?$/i.test(baseRaw)) {
-      setErrorMsg((m) => m || "Tip: remove '/snapshot' from the API Base URL; the app adds paths itself.");
+    } catch (e) {
+      warn("fetchLastRuns error", e);
     }
-    fetchHealth();
-    fetchTrends();
-    fetchSnapshot();
-    fetchLastRuns();
-  }, [base]); // eslint-disable-line
+  }, [base, headers]);
+  
+  useEffect(() => {
+    if (countdown === null) return;
+    info("countdown start", { countdown });
+    const id = window.setInterval(() => {
+      setCountdown((c) => {
+        if (c === null) return c;
+        const next = Math.max(0, c - 1);
+        if (next % 10 === 0) info("countdown tick", { next }); // log every 10s
+        return next;
+      });
+    }, 1000);
+    return () => {
+      info("countdown stop", { id });
+      window.clearInterval(id);
+    };
+  }, [countdown]);  
 
   useEffect(() => {
     const enabled = autoPoll === "1";
@@ -592,6 +676,18 @@ export default function PlantAgentDashboard() {
               {lastRuns?.last_cron_routine ? `last routine: ${new Date(lastRuns.last_cron_routine).toLocaleString()}` : "last routine: -"}
             </Chip>
             <Chip tone="amber">{nextLabel}</Chip>
+            <label className="ml-2 inline-flex items-center gap-1 text-xs cursor-pointer">
+            <input
+              type="checkbox"
+              checked={debugUI}
+              onChange={(e) => {
+                setDebug(e.target.checked);   // persist in localStorage
+                setDebugUI(e.target.checked); // trigger re-render
+                info("Debug toggled", e.target.checked);
+              }}
+            />
+            Debug
+          </label>
           </div>
         </div>
       </header>
@@ -867,6 +963,33 @@ export default function PlantAgentDashboard() {
           <pre className="text-xs bg-slate-50 border rounded-xl p-3 overflow-auto mt-2">{JSON.stringify(metrics, null, 2)}</pre>
         </section>
       </main>
+
+        {/* Debug panel */}
+      {getDebug() && (
+        <section className="bg-slate-900 text-slate-100 rounded-2xl border border-slate-700 p-4">
+          <div className="font-semibold mb-2">Debug</div>
+          <div className="grid md:grid-cols-3 gap-4 text-xs">
+            <div>
+              <div className="opacity-80 mb-1">last_runs (raw)</div>
+              <pre className="bg-black/50 p-2 rounded-lg overflow-auto max-h-40">{JSON.stringify(lastRuns, null, 2)}</pre>
+            </div>
+            <div>
+              <div className="opacity-80 mb-1">countdown</div>
+              <div className="font-mono text-lg">{countdown ?? "-"}</div>
+            </div>
+            <div>
+              <div className="opacity-80 mb-1">latest trend points</div>
+              <pre className="bg-black/50 p-2 rounded-lg overflow-auto max-h-40">
+      {JSON.stringify((trends.length ? trends : history).slice(-5), null, 2)}
+              </pre>
+            </div>
+          </div>
+          <div className="mt-3 flex gap-2">
+            <button className="btn-outline" onClick={() => fetchTrends()}>Re-fetch trends</button>
+            <button className="btn-outline" onClick={() => fetchLastRuns()}>Re-fetch last_runs</button>
+          </div>
+        </section>
+      )}
     </div>
   );
 }
