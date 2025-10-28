@@ -8,6 +8,7 @@ import glob
 import threading
 import time
 import uuid
+import math
 from typing import Any, Dict, List, Optional, Tuple
 from collections import deque
 
@@ -865,8 +866,11 @@ def debug_bq_recent():
         "bq_error": _BQ_ERR,
     }
 
-# NEW: expose last autosnapshot / cron run times + countdown
+# ---------- Countdown (GET aliases added to avoid 405s) ----------
 @app.get("/debug/last_runs")
+@app.get("/last_runs")
+@app.get("/snapshot/last_runs")
+@app.get("/debug/schedule")
 def debug_last_runs():
     now = _now_ts()
     next_run = None
@@ -874,7 +878,7 @@ def debug_last_runs():
     if _LAST_CRON_RUN:
         next_run = _LAST_CRON_RUN + datetime.timedelta(seconds=SCHED_PERIOD_SEC)
         sec_to_next = max(0, int((next_run - now).total_seconds()))
-    return {
+    out = {
         "last_cron_routine": _LAST_CRON_RUN.isoformat() if _LAST_CRON_RUN else None,
         "last_ingest": _LAST_INGEST_RUN.isoformat() if _LAST_INGEST_RUN else None,
         "sched_period_sec": SCHED_PERIOD_SEC,
@@ -882,6 +886,8 @@ def debug_last_runs():
         "next_cron_eta": next_run.isoformat() if next_run else None,
         "seconds_to_next": sec_to_next,
     }
+    logging.info("last_runs seconds_to_next=%s next=%s", out["seconds_to_next"], out["next_cron_eta"])
+    return out
 
 @app.get("/snapshot")
 def snapshot(source: Optional[str] = Query(default="auto", description="'auto'|'mock'|'bq'")):
@@ -914,20 +920,87 @@ def snapshot_set(req: SnapshotSetReq):
     return {"ok": True, "state": snap}
 
 # -------------------------
-# /trends → BQ (or mock) time-series
+# /trends → BQ (or mock) time-series  (+ sanitization & logs)
 # -------------------------
+def _sanitize_trend_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Keep timestamps ascending, coerce to floats, clamp ranges,
+    and drop obvious spikes (e.g., >30% jump for production).
+    """
+    def _f(v):
+        try:
+            if isinstance(v, str):
+                # handle formatted strings like "12,000.000"
+                v = v.replace(",", "")
+            return float(v)
+        except Exception:
+            return None
+
+    rows_sorted = sorted(rows, key=lambda r: r.get("ts") or "")
+    out: List[Dict[str, Any]] = []
+    last_p = None
+    last_sp = None
+
+    for r in rows_sorted:
+        p = _f(r.get("production_tph"))
+        o2 = _f(r.get("o2_percent"))
+        sp = _f(r.get("specific_power_kwh_per_ton"))
+
+        # clamp reasonable operating bounds
+        ok_p = p is not None and 0.5 <= p <= 1000
+        ok_o2 = o2 is not None and 0.0 <= o2 <= 30.0
+        ok_sp = sp is not None and 0.1 <= sp <= 300.0
+
+        # anti-spike (relative) for prod & sp
+        if ok_p and last_p is not None:
+            if abs(p - last_p) / max(1e-6, last_p) > 0.30:  # >30% jump = likely spike
+                p = None
+                ok_p = False
+        if ok_sp and last_sp is not None:
+            if abs(sp - last_sp) / max(1e-6, last_sp) > 0.30:
+                sp = None
+                ok_sp = False
+
+        if ok_p:
+            last_p = p
+        if ok_sp:
+            last_sp = sp
+
+        out.append({
+            "ts": r.get("ts"),
+            "production_tph": p if ok_p else None,
+            "o2_percent": o2 if ok_o2 else None,
+            "specific_power_kwh_per_ton": sp if ok_sp else None,
+        })
+    return out
+
 @app.get("/trends")
 def trends(
     minutes: int = Query(default=60, ge=1, le=24*60),
     limit: int = Query(default=180, ge=1, le=5000),
-    source: str = Query(default="auto", description="'auto'|'mock'|'bq'")
+    source: str = Query(default="auto", description="'auto'|'mock'|'bq'"),
+    clean: int = Query(default=1, ge=0, le=1),  # enable sanitizer by default
 ):
     # Prefer the in-memory ring buffer whenever we're in mock mode.
     if source == "mock" or (source == "auto" and USE_MOCK):
         cutoff = _now_ts() - datetime.timedelta(minutes=minutes)
         pts = [p for p in list(_HIST) if datetime.datetime.fromisoformat(p["ts"].replace("Z","")).astimezone(datetime.timezone.utc) >= cutoff]
         pts = pts[-limit:]
-        return pts
+        out = _sanitize_trend_rows(pts) if clean else pts
+        # brief diff vs current snapshot for diagnostics
+        try:
+            with _state_lock:
+                snap = {k: v for k, v in _STATE.items() if k != "sp"}
+            last = out[-1] if out else {}
+            logging.info(
+                "trends(mock) count=%d first=%s last=%s snap_prod=%.3f last_prod=%s",
+                len(out), out[0]["ts"] if out else None, last.get("ts"),
+                float(snap.get("production_tph", 0.0)),
+                last.get("production_tph"),
+            )
+        except Exception:
+            pass
+        return out
 
     # BQ path
     if not _BQ_ENABLED or _bq_client is None:
@@ -956,15 +1029,23 @@ def trends(
             ]
         ),
     )
-    rows = list(job.result())
-    out = []
-    for r in rows:
-        out.append({
-            "ts": r.get("ts").isoformat() if r.get("ts") else None,
-            "production_tph": r.get("production_tph"),
-            "o2_percent": r.get("o2_percent"),
-            "specific_power_kwh_per_ton": r.get("specific_power_kwh_per_ton"),
-        })
+    rows = [{"ts": r.get("ts").isoformat() if r.get("ts") else None,
+             "production_tph": r.get("production_tph"),
+             "o2_percent": r.get("o2_percent"),
+             "specific_power_kwh_per_ton": r.get("specific_power_kwh_per_ton")} for r in job.result()]
+    out = _sanitize_trend_rows(rows) if clean else rows
+
+    try:
+        snap = _latest_snapshot_from_bq()
+        last = out[-1] if out else {}
+        logging.info(
+            "trends(bq) count=%d first=%s last=%s snap_prod=%s last_prod=%s",
+            len(out), out[0]["ts"] if out else None, last.get("ts"),
+            snap.get("production_tph"), last.get("production_tph"),
+        )
+    except Exception:
+        pass
+
     return out
 
 # -------------------------

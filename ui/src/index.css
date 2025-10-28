@@ -15,10 +15,7 @@
 }
 
 /* Layout baseline */
-html, body, #root {
-  height: 100%;
-}
-
+html, body, #root { height: 100%; }
 body {
   background: var(--page-bg);
   color: var(--text);
@@ -27,29 +24,22 @@ body {
   text-rendering: optimizeLegibility;
 }
 
-/* Accessible focus ring for anything keyboard-focused */
+/* Accessible focus ring */
 :focus-visible {
   outline: 2px solid var(--focus);
   outline-offset: 2px;
 }
 
-/* Links (your JSX mostly styles buttons, but this helps any plain <a>) */
-a {
-  text-underline-offset: 2px;
-}
-a:hover {
-  text-decoration: underline;
-}
+/* Links */
+a { text-underline-offset: 2px; }
+a:hover { text-decoration: underline; }
 
-/* Inputs — mild normalization so they look decent even without Tailwind classes */
-input, select, button, textarea {
-  font: inherit;
-  color: inherit;
-}
+/* Inputs normalization */
+input, select, button, textarea { font: inherit; color: inherit; }
 input, select, textarea {
   background: white;
   border: 1px solid var(--card-border);
-  border-radius: 0.75rem;  /* ~ rounded-xl */
+  border-radius: 0.75rem;
 }
 input:focus, select:focus, textarea:focus {
   outline: none;
@@ -57,7 +47,7 @@ input:focus, select:focus, textarea:focus {
   border-color: color-mix(in oklab, var(--focus) 40%, var(--card-border));
 }
 
-/* Buttons — base + variants to keep them clearly visible */
+/* Buttons */
 button {
   cursor: pointer;
   border: none;
@@ -67,33 +57,28 @@ button:active { transform: translateY(0.5px); }
 button:disabled { cursor: not-allowed; opacity: 0.6; }
 
 /* Shared button look */
-.btn,
-.btn-primary,
-.btn-secondary,
-.btn-indigo,
-.btn-danger,
-.btn-outline {
+.btn, .btn-primary, .btn-secondary, .btn-indigo, .btn-danger, .btn-outline {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  padding: .5rem 1rem;       /* px-4 py-2 */
-  border-radius: .75rem;     /* rounded-xl */
+  padding: .5rem 1rem;
+  border-radius: .75rem;
   font-weight: 600;
   border: 1px solid transparent;
   box-shadow: 0 1px 2px rgb(0 0 0 / 0.06);
 }
 
 /* Variants */
-.btn-primary { background:#16a34a; color:white; }             /* emerald-600 */
+.btn-primary { background:#16a34a; color:white; }
 .btn-primary:hover { filter: brightness(1.05); }
 
-.btn-indigo { background:#4f46e5; color:white; }              /* indigo-600 */
+.btn-indigo { background:#4f46e5; color:white; }
 .btn-indigo:hover { filter: brightness(1.06); }
 
-.btn-secondary { background:#0f172a; color:white; }           /* slate-900 */
+.btn-secondary { background:#0f172a; color:white; }
 .btn-secondary:hover { filter: brightness(1.06); }
 
-.btn-danger { background:#dc2626; color:white; }              /* red-600 */
+.btn-danger { background:#dc2626; color:white; }
 .btn-danger:hover { filter: brightness(1.06); }
 
 .btn-outline {
@@ -101,50 +86,53 @@ button:disabled { cursor: not-allowed; opacity: 0.6; }
   color:#0f172a;
   border-color: var(--card-border);
 }
-.btn-outline:hover {
-  background:#f8fafc;
-}
+.btn-outline:hover { background:#f8fafc; }
 
 /* Code / pre blocks */
 pre, code, kbd, samp {
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
 }
 pre {
-  background: #f8fafc; /* slate-50 */
+  background: #f8fafc;
   border: 1px solid var(--card-border);
   border-radius: 0.75rem;
 }
 
 /* Recharts: ensure it always fills the card area */
-.recharts-wrapper {
-  width: 100% !important;
+.recharts-wrapper { width: 100% !important; }
+
+/* Small helpers */
+.text-muted { color: var(--muted); }
+.scroll-smooth { scroll-behavior: smooth; }
+
+/* Data health banners */
+.banner-warn {
+  background: #fff7ed;            /* amber-50 */
+  border: 1px solid #fbbf24;      /* amber-400 */
+  color: #92400e;                 /* amber-800 */
+  border-radius: 0.75rem;
+  padding: 0.5rem 0.75rem;
+}
+.banner-info {
+  background: #eff6ff;            /* blue-50 */
+  border: 1px solid #93c5fd;      /* blue-300 */
+  color: #1e3a8a;                 /* blue-900 */
+  border-radius: 0.75rem;
+  padding: 0.5rem 0.75rem;
 }
 
-/* Small helpers used around the app */
-.text-muted {
-  color: var(--muted);
-}
-
-/* Hide scrollbars on small code blocks without stealing scroll */
-.scroll-smooth {
-  scroll-behavior: smooth;
-}
-
-/* Optional dark mode polish (uses system setting) */
+/* Optional dark mode polish */
 @media (prefers-color-scheme: dark) {
   :root {
-    --page-bg: #0b1220;     /* near slate-950 */
-    --text: #e5e7eb;        /* slate-200 */
-    --muted: #94a3b8;       /* slate-400 */
-    --card-border: #1f2937; /* slate-800 */
-    --focus: #818cf8;       /* indigo-400 */
+    --page-bg: #0b1220;
+    --text: #e5e7eb;
+    --muted: #94a3b8;
+    --card-border: #1f2937;
+    --focus: #818cf8;
   }
-  body {
-    background: var(--page-bg);
-    color: var(--text);
-  }
+  body { background: var(--page-bg); color: var(--text); }
   input, select, textarea, pre {
-    background: #0f172a; /* slate-900 */
+    background: #0f172a;
     color: var(--text);
     border-color: var(--card-border);
   }
@@ -152,5 +140,11 @@ pre {
     background:#0f172a;
     color:#e5e7eb;
     border-color: var(--card-border);
+  }
+  .banner-warn {
+    background: #3b2f1a; border-color: #fbbf24; color: #fde68a;
+  }
+  .banner-info {
+    background: #0b2546; border-color: #60a5fa; color: #bfdbfe;
   }
 }
