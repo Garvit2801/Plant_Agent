@@ -872,18 +872,71 @@ def debug_bq_recent():
 @app.get("/snapshot/last_runs")
 @app.get("/debug/schedule")
 def debug_last_runs():
+    """
+    Return last run info for the UI countdown. Uses in-memory timestamps first
+    and falls back to BigQuery when this instance hasn't seen a run yet.
+    """
     now = _now_ts()
-    next_run = None
+
+    # 1) Start with in-memory values
+    last_cron = _LAST_CRON_RUN
+    last_ing  = _LAST_INGEST_RUN
+
+    # 2) Fallback to BigQuery if needed (multi-instance / cold start friendly)
+    #    We only query BQ if we don't have a value already.
+    if (last_cron is None or last_ing is None) and _BQ_ENABLED and (_bq_client is not None):
+        try:
+            from google.cloud import bigquery  # type: ignore
+
+            # last routine suggestion time (acts as "cron last run")
+            if last_cron is None:
+                try:
+                    sql_cron = f"""
+                        SELECT MAX(created_at) AS ts
+                        FROM `{_routine_table()}`
+                    """
+                    rows_cron = list(_bq_client.query(sql_cron, location=BQ_LOCATION).result())
+                    ts = rows_cron[0].ts if rows_cron and getattr(rows_cron[0], "ts", None) else None
+                    if ts:
+                        # normalize to aware UTC datetime
+                        last_cron = ts if isinstance(ts, datetime.datetime) else datetime.datetime.fromisoformat(str(ts))
+                        if last_cron.tzinfo is None:
+                            last_cron = last_cron.replace(tzinfo=datetime.timezone.utc)
+                except Exception as e:
+                    logging.info("BQ fallback (cron) failed: %s", e)
+
+            # last ingest time from base snapshots table
+            if last_ing is None:
+                try:
+                    sql_ing = f"""
+                        SELECT MAX(ts) AS ts
+                        FROM `{_snapshots_table()}`
+                    """
+                    rows_ing = list(_bq_client.query(sql_ing, location=BQ_LOCATION).result())
+                    ts = rows_ing[0].ts if rows_ing and getattr(rows_ing[0], "ts", None) else None
+                    if ts:
+                        last_ing = ts if isinstance(ts, datetime.datetime) else datetime.datetime.fromisoformat(str(ts))
+                        if last_ing.tzinfo is None:
+                            last_ing = last_ing.replace(tzinfo=datetime.timezone.utc)
+                except Exception as e:
+                    logging.info("BQ fallback (ingest) failed: %s", e)
+
+        except Exception as e:
+            logging.info("BQ fallback disabled/unavailable: %s", e)
+
+    # 3) Compute next ETA from last_cron + SCHED_PERIOD_SEC (if we have last_cron)
+    next_eta = None
     sec_to_next = None
-    if _LAST_CRON_RUN:
-        next_run = _LAST_CRON_RUN + datetime.timedelta(seconds=SCHED_PERIOD_SEC)
-        sec_to_next = max(0, int((next_run - now).total_seconds()))
+    if last_cron is not None:
+        next_eta = last_cron + datetime.timedelta(seconds=SCHED_PERIOD_SEC)
+        sec_to_next = max(0, int((next_eta - now).total_seconds()))
+
     out = {
-        "last_cron_routine": _LAST_CRON_RUN.isoformat() if _LAST_CRON_RUN else None,
-        "last_ingest": _LAST_INGEST_RUN.isoformat() if _LAST_INGEST_RUN else None,
+        "last_cron_routine": last_cron.isoformat() if last_cron else None,
+        "last_ingest": last_ing.isoformat() if last_ing else None,
         "sched_period_sec": SCHED_PERIOD_SEC,
         "now": now.isoformat(),
-        "next_cron_eta": next_run.isoformat() if next_run else None,
+        "next_cron_eta": next_eta.isoformat() if next_eta else None,
         "seconds_to_next": sec_to_next,
     }
     logging.info("last_runs seconds_to_next=%s next=%s", out["seconds_to_next"], out["next_cron_eta"])
