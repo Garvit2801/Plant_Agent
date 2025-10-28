@@ -295,7 +295,14 @@ export default function PlantAgentDashboard() {
   const [stepDwellCsv, setStepDwellCsv] = useLocalStorage(LS_KEYS.STEP_DWELL, "20");
   const [trendSource, setTrendSource] = useLocalStorage(LS_KEYS.TREND_SOURCE, "auto"); // "auto" | "bq"
 
-  const headers = useMemo(() => {
+  // NEW: separate headers for GET and POST
+  const getHeaders = useMemo(() => {
+    const h: Record<string, string> = {};
+    if (token.trim()) h["Authorization"] = `Bearer ${token.trim()}`;
+    return h;
+  }, [token]);
+
+  const postHeaders = useMemo(() => {
     const h: Record<string, string> = { "Content-Type": "application/json" };
     if (token.trim()) h["Authorization"] = `Bearer ${token.trim()}`;
     return h;
@@ -316,7 +323,7 @@ export default function PlantAgentDashboard() {
       let healthResp: Response | null = null;
       for (const p of healthCandidates) {
         try {
-          const rr = await fetch(`${base}${p}`, { headers });
+          const rr = await fetch(`${base}${p}`, { headers: getHeaders });
           healthResp = rr;
           if (rr.ok || rr.status !== 404) break;
         } catch {}
@@ -324,13 +331,13 @@ export default function PlantAgentDashboard() {
       if (!healthResp) throw new Error("No response");
       setHealth(`${healthResp.status}`);
 
-      const { json: verJson } = await tryFetchJSON(base, headers, [`/version`, `/snapshot/version`]);
+      const { json: verJson } = await tryFetchJSON(base, getHeaders, [`/version`, `/snapshot/version`]);
       setVer(verJson.version ?? "");
     } catch (e: any) {
       setHealth("error");
       setErrorMsg(e?.message || "Failed to reach /health");
     }
-  }, [base, headers]);
+  }, [base, getHeaders]);
 
   // Snapshot + trends
   const [snap, setSnap] = useState<Snapshot | null>(null);
@@ -352,7 +359,7 @@ export default function PlantAgentDashboard() {
     const urls = [`${base}/snapshot`, `${base}/snapshot?source=bq`];
     for (const u of urls) {
       try {
-        const r = await fetch(u, { headers });
+        const r = await fetch(u, { headers: getHeaders });
         if (!r.ok) continue;
         const j = (await r.json()) as Snapshot;
         setSnap(j);
@@ -361,7 +368,7 @@ export default function PlantAgentDashboard() {
       } catch {}
     }
     return null;
-  }, [base, headers, pushHistory]);
+  }, [base, getHeaders, pushHistory]);
 
   const fetchSnapshot = useCallback(async () => {
     if (!base) return;
@@ -377,7 +384,7 @@ export default function PlantAgentDashboard() {
       const pathAuto = `/trends?minutes=120&limit=240&source=auto`;
       const pathBQ = `/trends?minutes=120&limit=240&source=bq`;
       const paths = trendSource === "bq" ? [pathBQ, pathAuto] : [pathAuto, pathBQ];
-      const { json: data, url } = await tryFetchJSON(base, headers, paths);
+      const { json: data, url } = await tryFetchJSON(base, getHeaders, paths);
       if (!Array.isArray(data)) return;
 
       setTrendEndpoint(url.replace(base, ""));
@@ -404,7 +411,7 @@ export default function PlantAgentDashboard() {
       setErrorMsg((prev) => prev || e?.message || "Failed to fetch trends");
       warn("fetchTrends failed", e);
     }
-  }, [base, headers, trendSource, snap]);
+  }, [base, getHeaders, trendSource, snap]);
 
   // last_runs -> countdown
   const fetchLastRuns = useCallback(async () => {
@@ -412,7 +419,7 @@ export default function PlantAgentDashboard() {
     try {
       // try multiple GET paths; some backends expose only /snapshot/last_runs
       const candidates = [`/debug/last_runs`, `/snapshot/last_runs`, `/last_runs`, `/debug/schedule`];
-      const { json, url } = await tryFetchJSON(base, headers, candidates);
+      const { json, url } = await tryFetchJSON(base, getHeaders, candidates);
       const j = json as LastRuns;
       info(`last_runs from ${url}`, j);
 
@@ -427,7 +434,7 @@ export default function PlantAgentDashboard() {
       setCountdownCause(msg);
       warn("fetchLastRuns error", msg);
     }
-  }, [base, headers]);
+  }, [base, getHeaders]);
 
   // polling (snapshot + last_runs)
   useEffect(() => {
@@ -474,10 +481,10 @@ export default function PlantAgentDashboard() {
   const getMetrics = useCallback(async () => {
     setErrorMsg("");
     try {
-      const { json } = await tryFetchJSON(base, headers, [`/metrics`, `/snapshot/metrics`]);
+      const { json } = await tryFetchJSON(base, getHeaders, [`/metrics`, `/snapshot/metrics`]);
       setMetrics(json);
     } catch (e: any) { setErrorMsg(e?.message || "Failed to fetch metrics"); }
-  }, [base, headers]);
+  }, [base, getHeaders]);
 
   // Routine
   const [o2Min, setO2Min] = useState<string>("2.3");
@@ -502,7 +509,7 @@ export default function PlantAgentDashboard() {
       const s0 = snap ?? (await fetchSnapshotFast());
       if (s0) setRoutineBefore({ ...s0 });
 
-      const r = await fetch(`${base}/optimize/routine`, { method: "POST", headers, body: JSON.stringify(body) });
+      const r = await fetch(`${base}/optimize/routine`, { method: "POST", headers: postHeaders, body: JSON.stringify(body) });
       if (!r.ok) throw new Error(`/optimize/routine ${r.status}`);
       const j: RoutineResp = await r.json();
       setRoutineOut(j);
@@ -521,14 +528,14 @@ export default function PlantAgentDashboard() {
     } catch (e: any) {
       setErrorMsg(e?.message || "Run routine failed");
     }
-  }, [base, headers, o2Min, o2Max, applyTop, logSugg, snap, fetchSnapshotFast, pushHistory, fetchTrends, fetchLastRuns]);
+  }, [base, postHeaders, o2Min, o2Max, applyTop, logSugg, snap, fetchSnapshotFast, pushHistory, fetchTrends, fetchLastRuns]);
 
   const applyRoutineProposal = useCallback(async () => {
     if (!routineOut?.proposed_setpoints) return;
     setErrorMsg("");
     try {
       const body = { proposal: routineOut.proposed_setpoints, mode: "routine" };
-      const r = await fetch(`${base}/actuate/apply_stage`, { method: "POST", headers, body: JSON.stringify(body) });
+      const r = await fetch(`${base}/actuate/apply_stage`, { method: "POST", headers: postHeaders, body: JSON.stringify(body) });
       if (!r.ok) throw new Error(`/actuate/apply_stage ${r.status}`);
       const j: ApplyResp = await r.json();
 
@@ -544,7 +551,7 @@ export default function PlantAgentDashboard() {
     } catch (e: any) {
       setErrorMsg(e?.message || "Apply failed");
     }
-  }, [base, headers, routineOut, fetchSnapshotFast, pushHistory, fetchTrends, fetchLastRuns]);
+  }, [base, postHeaders, routineOut, fetchSnapshotFast, pushHistory, fetchTrends, fetchLastRuns]);
 
   const rejectRoutine = useCallback(() => {
     setRoutineOut((x) => (x ? { ...x, applied: false } : x));
@@ -575,7 +582,7 @@ export default function PlantAgentDashboard() {
       if (loadMode === "abs") body.delta_abs = Number(val);
       if (loadMode === "target") body.target_tph = Number(val);
 
-      const r = await fetch(`${base}/optimize/load`, { method: "POST", headers, body: JSON.stringify(body) });
+      const r = await fetch(`${base}/optimize/load`, { method: "POST", headers: postHeaders, body: JSON.stringify(body) });
       if (!r.ok) throw new Error(`/optimize/load ${r.status}`);
       const j: LoadResp = await r.json();
       setLoadOut(j);
@@ -586,7 +593,7 @@ export default function PlantAgentDashboard() {
     } catch (e: any) {
       setErrorMsg(e?.message || "Create plan failed");
     }
-  }, [base, headers, steps, direction, val, loadMode, fetchSnapshotFast, snap]);
+  }, [base, postHeaders, steps, direction, val, loadMode, fetchSnapshotFast, snap]);
 
   // Helper to parse per-step dwell seconds (comma separated)
   const parseStepDwells = useCallback((nStages: number): number[] => {
@@ -602,7 +609,7 @@ export default function PlantAgentDashboard() {
     setErrorMsg("");
     try {
       const body = { stage: loadOut.stages[i], mode: loadOut.mode, plan_id: loadOut.plan_id, stage_index: i };
-      const r = await fetch(`${base}/actuate/apply_stage`, { method: "POST", headers, body: JSON.stringify(body) });
+      const r = await fetch(`${base}/actuate/apply_stage`, { method: "POST", headers: postHeaders, body: JSON.stringify(body) });
       if (!r.ok) throw new Error(`/actuate/apply_stage ${r.status}`);
       const j: ApplyResp = await r.json();
 
@@ -619,7 +626,7 @@ export default function PlantAgentDashboard() {
     } catch (e: any) {
       setErrorMsg(e?.message || `Apply stage ${i + 1} failed`);
     }
-  }, [base, headers, loadOut, fetchSnapshotFast, pushHistory, fetchTrends, fetchLastRuns]);
+  }, [base, postHeaders, loadOut, fetchSnapshotFast, pushHistory, fetchTrends, fetchLastRuns]);
 
   const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
 
@@ -878,10 +885,10 @@ export default function PlantAgentDashboard() {
               <label className="text-xs text-slate-500">O₂ max</label>
               <input value={o2Max} onChange={(e) => setO2Max(e.target.value)} className="w-full mt-1 px-3 py-2 border rounded-xl" />
             </div>
-            <label className="inline-flex items-center gap-2 text-sm">
+            <label className="inline-flex items-center gap-2 text_sm">
               <input type="checkbox" checked={applyTop} onChange={(e) => setApplyTop(e.target.checked)} /> Apply top
             </label>
-            <label className="inline-flex items-center gap-2 text-sm">
+            <label className="inline-flex items-center gap-2 text_sm">
               <input type="checkbox" checked={logSugg} onChange={(e) => setLogSugg(e.target.checked)} /> Log suggestions
             </label>
             <button onClick={runRoutine} className="btn-secondary" disabled={!base}>Run routine</button>
@@ -897,7 +904,7 @@ export default function PlantAgentDashboard() {
             <div className="font-semibold">Load Planning</div>
             <div className="text-xs text-slate-500">latest plan: {loadOut?.created_at ? new Date(loadOut.created_at).toLocaleString() : "-"} • id: {loadOut?.plan_id || "-"}</div>
           </div>
-          <div className="mt-3 grid md:grid-cols-7 gap-3 items-end">
+          <div className="mt-3 grid md:grid-cols-7 gap-3 items_end">
             <div>
               <label className="text-xs text-slate-500">Approach</label>
               <select value={loadMode} onChange={(e) => setLoadMode(e.target.value as any)} className="w-full mt-1 px-3 py-2 border rounded-xl">
