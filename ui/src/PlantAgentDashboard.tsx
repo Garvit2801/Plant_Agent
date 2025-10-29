@@ -3,7 +3,11 @@ import { LineChart, Line, XAxis, YAxis, Tooltip, Legend, CartesianGrid } from "r
 
 /**
  * Plant Agent – Operations Dashboard UI (BQ-aware)
- * Adds: 405 fallback for last_runs (POST if GET not allowed), and disables noisy polling if backend lacks a supported method.
+ * Adds:
+ * - Default API base to the ...-el Cloud Run URL
+ * - 405 fallback for last_runs (GET→POST) with trailing-slash aliases
+ * - Capture X-Service-Version header from any request
+ * - Warn if user points to the ...-em URL by mistake
  */
 
 const DEBUG_KEY = "plant_ui.debug";
@@ -93,6 +97,9 @@ const LS_KEYS = {
   TREND_SOURCE: "plant_ui.trend_source"
 };
 
+// ---- Defaults: point to the ...-el URL
+const DEFAULT_BASE = "https://plant-agent-i32khy5nrq-el.a.run.app";
+
 function useLocalStorage(key: string, initial: string) {
   const [v, setV] = useState<string>(() => localStorage.getItem(key) ?? initial);
   useEffect(() => { localStorage.setItem(key, v); }, [key, v]);
@@ -136,14 +143,17 @@ function Chip({ children, tone="slate" }: { children: React.ReactNode; tone?: "s
   return <span className={cls("px-2 py-1 rounded-full border text-xs", map[tone])}>{children}</span>;
 }
 
-/** GET helper that tries multiple paths */
+/** GET helper that tries multiple paths; captures X-Service-Version if present */
 async function tryFetchJSON(base: string, headers: Record<string, string>, paths: string[]) {
   let lastErr: any;
   for (const p of paths) {
     try {
       const url = `${base}${p}`;
       const r = await fetch(url, { headers });
-      if (r.ok) return { response: r, json: await r.json(), url };
+      if (r.ok) {
+        const verHdr = r.headers.get("x-service-version");
+        return { response: r, json: await r.json(), url, verHdr };
+      }
       if (r.status !== 404) {
         const text = await r.text().catch(() => "");
         lastErr = new Error(`GET ${p} ${r.status} ${text ? `– ${text.slice(0, 140)}` : ""}`);
@@ -157,7 +167,7 @@ async function tryFetchJSON(base: string, headers: Record<string, string>, paths
   throw lastErr ?? new Error("No candidate path succeeded");
 }
 
-/** GET→POST fallback for backends that disallow GET (405) */
+/** GET→POST fallback for backends that disallow GET (405); captures X-Service-Version */
 async function fetchJSONWithMethodFallback(
   base: string,
   getHeaders: Record<string, string>,
@@ -170,12 +180,12 @@ async function fetchJSONWithMethodFallback(
     // 1) Try GET first
     try {
       const rg = await fetch(url, { headers: getHeaders });
-      if (rg.ok) return { response: rg, json: await rg.json(), url, method: "GET" };
+      if (rg.ok) return { response: rg, json: await rg.json(), url, method: "GET", verHdr: rg.headers.get("x-service-version") };
       if (rg.status === 405) {
         // 2) Fallback to POST
         try {
           const rp = await fetch(url, { method: "POST", headers: postHeaders, body: "{}" });
-          if (rp.ok) return { response: rp, json: await rp.json(), url, method: "POST" };
+          if (rp.ok) return { response: rp, json: await rp.json(), url, method: "POST", verHdr: rp.headers.get("x-service-version") };
           const txt = await rp.text().catch(() => "");
           lastErr = new Error(`POST ${p} ${rp.status} ${txt ? `– ${txt.slice(0, 140)}` : ""}`);
         } catch (ep) {
@@ -217,8 +227,10 @@ function cleanTrends(rows: any[]): TrendPoint[] {
 export default function PlantAgentDashboard() {
   const [debugUI, setDebugUI] = useState(getDebug());
 
-  const [baseRaw, setBaseRaw] = useLocalStorage(LS_KEYS.BASE, "");
+  const [baseRaw, setBaseRaw] = useLocalStorage(LS_KEYS.BASE, DEFAULT_BASE);
   const base = useMemo(() => normalizeBase(baseRaw), [baseRaw]);
+  const wrongRegion = useMemo(() => /-em\.a\.run\.app$/i.test(base), [base]);
+
   const [token, setToken] = useLocalStorage(LS_KEYS.TOKEN, "");
   const [autoPoll, setAutoPoll] = useLocalStorage(LS_KEYS.AUTOPOLL, "1");
   const [stepDwellCsv, setStepDwellCsv] = useLocalStorage(LS_KEYS.STEP_DWELL, "20");
@@ -247,28 +259,38 @@ export default function PlantAgentDashboard() {
   // If backend doesn’t support GET/POST for last_runs, stop polling to avoid console noise
   const disableLastRunsRef = useRef<boolean>(false);
 
+  const maybeTakeVersionHeader = useCallback((hdr?: string | null) => {
+    if (hdr && !ver) setVer(hdr);
+  }, [ver]);
+
   const fetchHealth = useCallback(async () => {
     setErrorMsg("");
     try {
-      const healthCandidates = [`/health`, `/snapshot/health`, `/healthz`];
+      const healthCandidates = [`/health`, `/snapshot/health`, `/healthz`, `/`];
       let healthResp: Response | null = null;
       for (const p of healthCandidates) {
         try {
           const rr = await fetch(`${base}${p}`, { headers: getHeaders });
           healthResp = rr;
+          const hdr = rr.headers.get("x-service-version");
+          maybeTakeVersionHeader(hdr);
           if (rr.ok || rr.status !== 404) break;
         } catch {}
       }
       if (!healthResp) throw new Error("No response");
       setHealth(`${healthResp.status}`);
 
-      const { json: verJson } = await tryFetchJSON(base, getHeaders, [`/version`, `/snapshot/version`]);
-      setVer(verJson.version ?? "");
+      // Prefer header; else call /version JSON
+      if (!ver) {
+        const { json: verJson, verHdr } = await tryFetchJSON(base, getHeaders, [`/version`, `/snapshot/version`]);
+        maybeTakeVersionHeader(verHdr);
+        if (verJson?.version) setVer(verJson.version);
+      }
     } catch (e: any) {
       setHealth("error");
       setErrorMsg(e?.message || "Failed to reach /health");
     }
-  }, [base, getHeaders]);
+  }, [base, getHeaders, maybeTakeVersionHeader, ver]);
 
   // Snapshot + trends
   const [snap, setSnap] = useState<Snapshot | null>(null);
@@ -291,6 +313,8 @@ export default function PlantAgentDashboard() {
     for (const u of urls) {
       try {
         const r = await fetch(u, { headers: getHeaders });
+        const hdr = r.headers.get("x-service-version");
+        maybeTakeVersionHeader(hdr);
         if (!r.ok) continue;
         const j = (await r.json()) as Snapshot;
         setSnap(j);
@@ -299,7 +323,7 @@ export default function PlantAgentDashboard() {
       } catch {}
     }
     return null;
-  }, [base, getHeaders, pushHistory]);
+  }, [base, getHeaders, pushHistory, maybeTakeVersionHeader]);
 
   const fetchSnapshot = useCallback(async () => {
     if (!base) return;
@@ -314,7 +338,8 @@ export default function PlantAgentDashboard() {
       const pathAuto = `/trends?minutes=120&limit=240&source=auto`;
       const pathBQ = `/trends?minutes=120&limit=240&source=bq`;
       const paths = trendSource === "bq" ? [pathBQ, pathAuto] : [pathAuto, pathBQ];
-      const { json: data, url } = await tryFetchJSON(base, getHeaders, paths);
+      const { json: data, url, verHdr } = await tryFetchJSON(base, getHeaders, paths);
+      maybeTakeVersionHeader(verHdr);
       if (!Array.isArray(data)) return;
 
       setTrendEndpoint(url.replace(base, ""));
@@ -337,14 +362,20 @@ export default function PlantAgentDashboard() {
       setErrorMsg((prev) => prev || e?.message || "Failed to fetch trends");
       warn("fetchTrends failed", e);
     }
-  }, [base, getHeaders, trendSource, snap]);
+  }, [base, getHeaders, trendSource, snap, maybeTakeVersionHeader]);
 
-  // last_runs with GET→POST fallback
+  // last_runs with GET→POST fallback + trailing slash aliases
   const fetchLastRuns = useCallback(async () => {
     if (!base || disableLastRunsRef.current) return;
     try {
-      const candidates = [`/debug/last_runs`, `/snapshot/last_runs`, `/last_runs`, `/debug/schedule`];
-      const { json, url, method } = await fetchJSONWithMethodFallback(base, getHeaders, postHeaders, candidates);
+      const candidates = [
+        `/debug/last_runs`, `/debug/last_runs/`,
+        `/snapshot/last_runs`, `/snapshot/last_runs/`,
+        `/last_runs`, `/last_runs/`,
+        `/debug/schedule`, `/debug/schedule/`,
+      ];
+      const { json, url, method, verHdr } = await fetchJSONWithMethodFallback(base, getHeaders, postHeaders, candidates);
+      maybeTakeVersionHeader(verHdr);
       const j = json as LastRuns;
       info(`last_runs via ${method} from ${url}`, j);
       setLastRuns(j);
@@ -362,7 +393,7 @@ export default function PlantAgentDashboard() {
       setCountdownCause(`Countdown unavailable: ${msg}. Tried GET then POST.`);
       warn("fetchLastRuns error", msg);
     }
-  }, [base, getHeaders, postHeaders]);
+  }, [base, getHeaders, postHeaders, maybeTakeVersionHeader]);
 
   // polling (snapshot + last_runs)
   useEffect(() => {
@@ -408,10 +439,11 @@ export default function PlantAgentDashboard() {
   const getMetrics = useCallback(async () => {
     setErrorMsg("");
     try {
-      const { json } = await tryFetchJSON(base, getHeaders, [`/metrics`, `/snapshot/metrics`]);
+      const { json, verHdr } = await tryFetchJSON(base, getHeaders, [`/metrics`, `/snapshot/metrics`]);
+      maybeTakeVersionHeader(verHdr);
       setMetrics(json);
     } catch (e: any) { setErrorMsg(e?.message || "Failed to fetch metrics"); }
-  }, [base, getHeaders]);
+  }, [base, getHeaders, maybeTakeVersionHeader]);
 
   // Routine
   const [o2Min, setO2Min] = useState<string>("2.3");
@@ -433,6 +465,8 @@ export default function PlantAgentDashboard() {
       if (s0) setRoutineBefore({ ...s0 });
 
       const r = await fetch(`${base}/optimize/routine`, { method: "POST", headers: postHeaders, body: JSON.stringify(body) });
+      const hdr = r.headers.get("x-service-version");
+      maybeTakeVersionHeader(hdr);
       if (!r.ok) throw new Error(`/optimize/routine ${r.status}`);
       const j: RoutineResp = await r.json();
       setRoutineOut(j);
@@ -443,7 +477,7 @@ export default function PlantAgentDashboard() {
         setSnap(after); pushHistory(after); setRoutineAfter({ ...after }); await fetchTrends();
       }
     } catch (e: any) { setErrorMsg(e?.message || "Run routine failed"); }
-  }, [base, postHeaders, o2Min, o2Max, applyTop, logSugg, snap, fetchSnapshotFast, pushHistory, fetchTrends, fetchLastRuns]);
+  }, [base, postHeaders, o2Min, o2Max, applyTop, logSugg, snap, fetchSnapshotFast, pushHistory, fetchTrends, fetchLastRuns, maybeTakeVersionHeader]);
 
   const applyRoutineProposal = useCallback(async () => {
     if (!routineOut?.proposed_setpoints) return;
@@ -451,13 +485,15 @@ export default function PlantAgentDashboard() {
     try {
       const body = { proposal: routineOut.proposed_setpoints, mode: "routine" };
       const r = await fetch(`${base}/actuate/apply_stage`, { method: "POST", headers: postHeaders, body: JSON.stringify(body) });
+      const hdr = r.headers.get("x-service-version");
+      maybeTakeVersionHeader(hdr);
       if (!r.ok) throw new Error(`/actuate/apply_stage ${r.status}`);
       const j: ApplyResp = await r.json();
       let after: Snapshot | null = j.after ? (j.after as Snapshot) : await fetchSnapshotFast();
       if (after) { setSnap(after); pushHistory(after); setRoutineAfter({ ...after }); await fetchTrends(); }
       fetchLastRuns().catch(() => {});
     } catch (e: any) { setErrorMsg(e?.message || "Apply failed"); }
-  }, [base, postHeaders, routineOut, fetchSnapshotFast, pushHistory, fetchTrends, fetchLastRuns]);
+  }, [base, postHeaders, routineOut, fetchSnapshotFast, pushHistory, fetchTrends, fetchLastRuns, maybeTakeVersionHeader]);
 
   const rejectRoutine = useCallback(() => {
     setRoutineOut((x) => (x ? { ...x, applied: false } : x));
@@ -487,6 +523,8 @@ export default function PlantAgentDashboard() {
       if (loadMode === "target") body.target_tph = Number(val);
 
       const r = await fetch(`${base}/optimize/load`, { method: "POST", headers: postHeaders, body: JSON.stringify(body) });
+      const hdr = r.headers.get("x-service-version");
+      maybeTakeVersionHeader(hdr);
       if (!r.ok) throw new Error(`/optimize/load ${r.status}`);
       const j: LoadResp = await r.json();
       setLoadOut(j);
@@ -495,7 +533,7 @@ export default function PlantAgentDashboard() {
       if (s0) setLoadBefore({ ...s0 });
       setLoadAfter(null);
     } catch (e: any) { setErrorMsg(e?.message || "Create plan failed"); }
-  }, [base, postHeaders, steps, direction, val, loadMode, fetchSnapshotFast, snap]);
+  }, [base, postHeaders, steps, direction, val, loadMode, fetchSnapshotFast, snap, maybeTakeVersionHeader]);
 
   const parseStepDwells = useCallback((nStages: number): number[] => {
     const parts = stepDwellCsv.split(",").map((s) => Number(s.trim())).filter((x) => Number.isFinite(x) && x >= 0);
@@ -511,6 +549,8 @@ export default function PlantAgentDashboard() {
     try {
       const body = { stage: loadOut.stages[i], mode: loadOut.mode, plan_id: loadOut.plan_id, stage_index: i };
       const r = await fetch(`${base}/actuate/apply_stage`, { method: "POST", headers: postHeaders, body: JSON.stringify(body) });
+      const hdr = r.headers.get("x-service-version");
+      maybeTakeVersionHeader(hdr);
       if (!r.ok) throw new Error(`/actuate/apply_stage ${r.status}`);
       const j: ApplyResp = await r.json();
 
@@ -523,7 +563,7 @@ export default function PlantAgentDashboard() {
       }
       fetchLastRuns().catch(() => {});
     } catch (e: any) { setErrorMsg(e?.message || `Apply stage ${i + 1} failed`); }
-  }, [base, postHeaders, loadOut, fetchSnapshotFast, pushHistory, fetchTrends, fetchLastRuns]);
+  }, [base, postHeaders, loadOut, fetchSnapshotFast, pushHistory, fetchTrends, fetchLastRuns, maybeTakeVersionHeader]);
 
   const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
   const applyAllStages = useCallback(async () => {
@@ -641,6 +681,11 @@ export default function PlantAgentDashboard() {
               <label className="text-xs text-slate-500">API Base URL</label>
               <input value={baseRaw} onChange={(e) => setBaseRaw(e.target.value)} placeholder="https://<cloud-run-url>" className="w-full mt-1 px-3 py-2 border rounded-xl" />
               <div className="mt-1 text-[11px] text-slate-500">Using: <span className="font-mono">{base || "—"}</span></div>
+              {wrongRegion && (
+                <div className="mt-1 text-[11px] text-amber-700">
+                  Heads up: you’re pointing to the <span className="font-mono">…-em</span> host. Switch to the <span className="font-mono">…-el</span> URL to hit the latest revision.
+                </div>
+              )}
             </div>
             <div className="flex-1">
               <label className="text-xs text-slate-500">ID Token (optional for private)</label>

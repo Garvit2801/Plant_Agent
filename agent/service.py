@@ -132,12 +132,26 @@ BQ_SUGGESTIONS_TABLE_ENV = os.getenv("BQ_SUGGESTIONS_TABLE")
 # -------------------------
 app = FastAPI(title="Plant Agent API", version=SERVICE_VERSION)
 
+@app.middleware("http")
+async def stamp_and_log(request: Request, call_next):
+    logging.info(
+        "REQ method=%s path=%s origin=%s",
+        request.method, request.url.path, request.headers.get("origin"),
+    )
+    resp = await call_next(request)
+    resp.headers["X-Service-Version"] = SERVICE_VERSION
+    resp.headers["X-Sched-Period-Sec"] = str(SCHED_PERIOD_SEC)
+    resp.headers["Vary"] = "Origin"
+    return resp
+
+
 _default_ui_origins = [
     "http://localhost:5173",
     "http://localhost:3000",
     "https://your-ui.example.com",
     "https://garvit2801.github.io",
-    "https://garvit2801.github.io/Plant_Agent",
+    # Note: origins never include a path; this next entry is redundant but harmless:
+    # "https://garvit2801.github.io/Plant_Agent",
 ]
 _env_ui = [o.strip() for o in os.getenv("UI_ORIGINS", "").split(",") if o.strip()]
 UI_ORIGINS = _env_ui or _default_ui_origins
@@ -866,65 +880,46 @@ def debug_bq_recent():
         "bq_error": _BQ_ERR,
     }
 
-# ---------- Countdown (GET aliases added to avoid 405s) ----------
-@app.get("/debug/last_runs")
-@app.get("/last_runs")
-@app.get("/snapshot/last_runs")
-@app.get("/debug/schedule")
-def debug_last_runs():
+# ---------- Countdown (GET/POST/OPTIONS on all aliases) ----------
+@app.api_route("/debug/last_runs", methods=["GET","POST","OPTIONS"])
+@app.api_route("/last_runs", methods=["GET","POST","OPTIONS"])
+@app.api_route("/snapshot/last_runs", methods=["GET","POST","OPTIONS"])
+@app.api_route("/debug/schedule", methods=["GET","POST","OPTIONS"])
+def debug_last_runs(request: Request):
     """
     Return last run info for the UI countdown. Uses in-memory timestamps first
     and falls back to BigQuery when this instance hasn't seen a run yet.
     """
     now = _now_ts()
 
-    # 1) Start with in-memory values
+    # In-memory times set by /optimize/routine, /cron/routine, and /ingest
     last_cron = _LAST_CRON_RUN
     last_ing  = _LAST_INGEST_RUN
 
-    # 2) Fallback to BigQuery if needed (multi-instance / cold start friendly)
-    #    We only query BQ if we don't have a value already.
+    # Fallback to BQ once per request if needed
     if (last_cron is None or last_ing is None) and _BQ_ENABLED and (_bq_client is not None):
         try:
-            from google.cloud import bigquery  # type: ignore
-
-            # last routine suggestion time (acts as "cron last run")
+            # last routine suggestion time ~ "cron last run"
             if last_cron is None:
-                try:
-                    sql_cron = f"""
-                        SELECT MAX(created_at) AS ts
-                        FROM `{_routine_table()}`
-                    """
-                    rows_cron = list(_bq_client.query(sql_cron, location=BQ_LOCATION).result())
-                    ts = rows_cron[0].ts if rows_cron and getattr(rows_cron[0], "ts", None) else None
-                    if ts:
-                        # normalize to aware UTC datetime
-                        last_cron = ts if isinstance(ts, datetime.datetime) else datetime.datetime.fromisoformat(str(ts))
-                        if last_cron.tzinfo is None:
-                            last_cron = last_cron.replace(tzinfo=datetime.timezone.utc)
-                except Exception as e:
-                    logging.info("BQ fallback (cron) failed: %s", e)
-
+                sql_cron = f"SELECT MAX(created_at) AS ts FROM `{_routine_table()}`"
+                rows_cron = list(_bq_client.query(sql_cron, location=BQ_LOCATION).result())
+                ts = rows_cron[0].ts if rows_cron and getattr(rows_cron[0], "ts", None) else None
+                if ts:
+                    last_cron = ts if isinstance(ts, datetime.datetime) else datetime.datetime.fromisoformat(str(ts))
+                    if last_cron.tzinfo is None:
+                        last_cron = last_cron.replace(tzinfo=datetime.timezone.utc)
             # last ingest time from base snapshots table
             if last_ing is None:
-                try:
-                    sql_ing = f"""
-                        SELECT MAX(ts) AS ts
-                        FROM `{_snapshots_table()}`
-                    """
-                    rows_ing = list(_bq_client.query(sql_ing, location=BQ_LOCATION).result())
-                    ts = rows_ing[0].ts if rows_ing and getattr(rows_ing[0], "ts", None) else None
-                    if ts:
-                        last_ing = ts if isinstance(ts, datetime.datetime) else datetime.datetime.fromisoformat(str(ts))
-                        if last_ing.tzinfo is None:
-                            last_ing = last_ing.replace(tzinfo=datetime.timezone.utc)
-                except Exception as e:
-                    logging.info("BQ fallback (ingest) failed: %s", e)
-
+                sql_ing = f"SELECT MAX(ts) AS ts FROM `{_snapshots_table()}`"
+                rows_ing = list(_bq_client.query(sql_ing, location=BQ_LOCATION).result())
+                ts = rows_ing[0].ts if rows_ing and getattr(rows_ing[0], "ts", None) else None
+                if ts:
+                    last_ing = ts if isinstance(ts, datetime.datetime) else datetime.datetime.fromisoformat(str(ts))
+                    if last_ing.tzinfo is None:
+                        last_ing = last_ing.replace(tzinfo=datetime.timezone.utc)
         except Exception as e:
             logging.info("BQ fallback disabled/unavailable: %s", e)
 
-    # 3) Compute next ETA from last_cron + SCHED_PERIOD_SEC (if we have last_cron)
     next_eta = None
     sec_to_next = None
     if last_cron is not None:
@@ -941,6 +936,14 @@ def debug_last_runs():
     }
     logging.info("last_runs seconds_to_next=%s next=%s", out["seconds_to_next"], out["next_cron_eta"])
     return out
+
+# ---- Trailing-slash aliases to avoid 405s on /path/ ----
+@app.api_route("/debug/last_runs/", methods=["GET","POST","OPTIONS"])
+@app.api_route("/last_runs/", methods=["GET","POST","OPTIONS"])
+@app.api_route("/snapshot/last_runs/", methods=["GET","POST","OPTIONS"])
+@app.api_route("/debug/schedule/", methods=["GET","POST","OPTIONS"])
+def debug_last_runs_slash(request: Request):
+    return debug_last_runs(request)
 
 @app.get("/snapshot")
 def snapshot(source: Optional[str] = Query(default="auto", description="'auto'|'mock'|'bq'")):
@@ -1716,3 +1719,15 @@ def metrics():
         "bq_enabled": _BQ_ENABLED,
         "sched_period_sec": SCHED_PERIOD_SEC,
     }
+
+# -------------------------
+# Startup diagnostics: print route table (one-time)
+# -------------------------
+@app.on_event("startup")
+def _log_routes_on_startup():
+    try:
+        for r in app.routes:
+            methods = getattr(r, "methods", None)
+            logging.info("ROUTE path=%s methods=%s name=%s", r.path, methods, r.name)
+    except Exception as e:
+        logging.info("Route logging failed: %s", e)
