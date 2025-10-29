@@ -3,12 +3,14 @@ import { LineChart, Line, XAxis, YAxis, Tooltip, Legend, CartesianGrid } from "r
 
 /**
  * Plant Agent – Operations Dashboard UI (BQ-aware)
- * - Points default API base at the ...-el host (the one exposing /debug/last_runs)
- * - Keeps GET→POST fallback for last_runs
- * - Warns if the user targets the ...-em host (which lacks last_runs routes)
+ * - Default & auto-correct API base to the ...-el host (exposes /debug/last_runs)
+ * - If user pastes ...-em, we transparently swap to ...-el and persist
+ * - Keeps GET→POST fallback for last_runs and silences polling when not supported
  */
 
 const DEFAULT_API_BASE = "https://plant-agent-i32khy5nrq-el.a.run.app";
+const RECOMMENDED_HOST = "plant-agent-i32khy5nrq-el.a.run.app";
+const LEGACY_HOST = "plant-agent-i32khy5nrq-em.a.run.app";
 
 const DEBUG_KEY = "plant_ui.debug";
 const getDebug = () => (localStorage.getItem(DEBUG_KEY) ?? "0") === "1";
@@ -171,27 +173,21 @@ async function fetchJSONWithMethodFallback(
   let lastErr: any;
   for (const p of paths) {
     const url = `${base}${p}`;
-    // 1) Try GET first
     try {
       const rg = await fetch(url, { headers: getHeaders });
       if (rg.ok) return { response: rg, json: await rg.json(), url, method: "GET" };
       if (rg.status === 405) {
-        // 2) Fallback to POST
         try {
           const rp = await fetch(url, { method: "POST", headers: postHeaders, body: "{}" });
           if (rp.ok) return { response: rp, json: await rp.json(), url, method: "POST" };
           const txt = await rp.text().catch(() => "");
           lastErr = new Error(`POST ${p} ${rp.status} ${txt ? `– ${txt.slice(0, 140)}` : ""}`);
-        } catch (ep) {
-          lastErr = ep;
-        }
+        } catch (ep) { lastErr = ep; }
       } else {
         const txt = await rg.text().catch(() => "");
         lastErr = new Error(`GET ${p} ${rg.status} ${txt ? `– ${txt.slice(0, 140)}` : ""}`);
       }
-    } catch (eg) {
-      lastErr = eg;
-    }
+    } catch (eg) { lastErr = eg; }
   }
   throw lastErr ?? new Error("No candidate path succeeded via GET/POST");
 }
@@ -218,19 +214,38 @@ function cleanTrends(rows: any[]): TrendPoint[] {
   return out;
 }
 
+/** Coerce any ...-em URL to the recommended ...-el URL */
+function coerceRecommendedBase(u: string): string {
+  if (!u) return u;
+  try {
+    const url = new URL(u);
+    if (url.host === LEGACY_HOST) {
+      url.host = RECOMMENDED_HOST;
+      return url.toString().replace(/\/+$/, "");
+    }
+    return u;
+  } catch {
+    // If it's a bare host or invalid, do a simple text replace as a fallback
+    return u.replace(LEGACY_HOST, RECOMMENDED_HOST).replace(/\/+$/, "");
+  }
+}
+
 export default function PlantAgentDashboard() {
   const [debugUI, setDebugUI] = useState(getDebug());
 
-  // Default to the ...-el host so /debug/last_runs is available out of the box
-  const [baseRaw, setBaseRaw] = useLocalStorage(LS_KEYS.BASE, DEFAULT_API_BASE);
-  const base = useMemo(() => normalizeBase(baseRaw), [baseRaw]);
+  // 1) Seed default ...-el
+  const [baseRaw, _setBaseRaw] = useLocalStorage(LS_KEYS.BASE, DEFAULT_API_BASE);
+  const setBaseRaw = (v: string) => _setBaseRaw(coerceRecommendedBase(v));
+  // 2) Auto-correct cached/pasted ...-em → ...-el on mount and whenever user edits
+  useEffect(() => { const coerced = coerceRecommendedBase(baseRaw); if (coerced !== baseRaw) _setBaseRaw(coerced); /* persist */ }, []); // run once
+
+  const base = useMemo(() => normalizeBase(coerceRecommendedBase(baseRaw)), [baseRaw]);
   const [token, setToken] = useLocalStorage(LS_KEYS.TOKEN, "");
   const [autoPoll, setAutoPoll] = useLocalStorage(LS_KEYS.AUTOPOLL, "1");
   const [stepDwellCsv, setStepDwellCsv] = useLocalStorage(LS_KEYS.STEP_DWELL, "20");
   const [trendSource, setTrendSource] = useLocalStorage(LS_KEYS.TREND_SOURCE, "auto");
 
-  // UI banner if someone points to the ...-em host (which lacks /debug/last_runs)
-  const isEmHost = /\bplant-agent-i32khy5nrq-em\.a\.run\.app\b/i.test(base || "");
+  const isEmHost = /\bplant-agent-i32khy5nrq-em\.a\.run\.app\b/i.test(baseRaw || "");
 
   // Separate headers
   const getHeaders = useMemo(() => {
@@ -252,7 +267,6 @@ export default function PlantAgentDashboard() {
   const [lastRuns, setLastRuns] = useState<LastRuns | null>(null);
   const [countdown, setCountdown] = useState<number | null>(null);
   const [countdownCause, setCountdownCause] = useState<string>("");
-  // If backend doesn’t support GET/POST for last_runs, stop polling to avoid console noise
   const disableLastRunsRef = useRef<boolean>(false);
 
   const fetchHealth = useCallback(async () => {
@@ -350,8 +364,17 @@ export default function PlantAgentDashboard() {
   // last_runs with GET→POST fallback
   const fetchLastRuns = useCallback(async () => {
     if (!base || disableLastRunsRef.current) return;
+
+    // HARD STOP: never query ...-em for last_runs
+    if (isEmHost) {
+      disableLastRunsRef.current = true;
+      setCountdown(null);
+      setLastRuns(null);
+      setCountdownCause(`Countdown disabled: base is ${LEGACY_HOST}. Switched to ${RECOMMENDED_HOST} automatically.`);
+      return;
+    }
+
     try {
-      // Prioritize only the routes the ...-el service actually exposes.
       const candidates = [`/debug/last_runs`, `/debug/schedule`];
       const { json, url, method } = await fetchJSONWithMethodFallback(base, getHeaders, postHeaders, candidates);
       const j = json as LastRuns;
@@ -360,7 +383,6 @@ export default function PlantAgentDashboard() {
       setCountdown(j.seconds_to_next ?? null);
       setCountdownCause("");
     } catch (e: any) {
-      // If we constantly get 405/Method Not Allowed for every candidate, stop polling to reduce noise.
       const msg = String(e?.message || e);
       const looksLikeNoMethod = /405/.test(msg) || /Method Not Allowed/i.test(msg);
       if (looksLikeNoMethod) {
@@ -371,7 +393,7 @@ export default function PlantAgentDashboard() {
       setCountdownCause(`Countdown unavailable: ${msg}. Tried GET then POST.`);
       warn("fetchLastRuns error", msg);
     }
-  }, [base, getHeaders, postHeaders]);
+  }, [base, getHeaders, postHeaders, isEmHost]);
 
   // polling (snapshot + last_runs)
   useEffect(() => {
@@ -381,7 +403,6 @@ export default function PlantAgentDashboard() {
       pollRef.current = null;
       return;
     }
-    // reset disabling if base changes or toggled
     disableLastRunsRef.current = false;
 
     fetchSnapshot().catch(() => {});
@@ -648,21 +669,27 @@ export default function PlantAgentDashboard() {
           <div className="flex flex-col md:flex-row gap-3 md:items-end">
             <div className="flex-1">
               <label className="text-xs text-slate-500">API Base URL</label>
-              <input value={baseRaw} onChange={(e) => setBaseRaw(e.target.value)} placeholder="https://<cloud-run-url>" className="w-full mt-1 px-3 py-2 border rounded-xl" />
+              <input
+                value={baseRaw}
+                onChange={(e) => setBaseRaw(e.target.value)}
+                placeholder="https://<cloud-run-url>"
+                className="w-full mt-1 px-3 py-2 border rounded-xl"
+              />
               <div className="mt-1 text-[11px] text-slate-500">Using: <span className="font-mono">{base || "—"}</span></div>
             </div>
             <div className="flex-1">
               <label className="text-xs text-slate-500">ID Token (optional for private)</label>
               <input value={token} onChange={(e) => setToken(e.target.value)} placeholder="paste gcloud-issued ID token" className="w-full mt-1 px-3 py-2 border rounded-xl" />
             </div>
+            <button onClick={() => { setBaseRaw(DEFAULT_API_BASE); }} className="btn-outline">Use recommended host</button>
             <button onClick={fetchHealth} className="btn-outline" disabled={!base}>Check</button>
           </div>
 
           {/* Host sanity banner */}
           {isEmHost && (
             <div className="banner-warn mt-3">
-              You’re pointing at the <span className="font-mono">…-em</span> host which does not expose <span className="font-mono">/debug/last_runs</span>.
-              Switch to the default <span className="font-mono">…-el</span> host (already prefilled above) for countdowns to work.
+              You pasted the <span className="font-mono">…-em</span> host which lacks <span className="font-mono">/debug/last_runs</span>.
+              We’ve switched you to <span className="font-mono">…-el</span> automatically and saved it.
             </div>
           )}
 
