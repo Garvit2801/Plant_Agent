@@ -3,14 +3,11 @@ import { LineChart, Line, XAxis, YAxis, Tooltip, Legend, CartesianGrid } from "r
 
 /**
  * Plant Agent – Operations Dashboard UI (BQ-aware)
- * - Default & auto-correct API base to the ...-el host (exposes /debug/last_runs)
- * - If user pastes ...-em, we transparently swap to ...-el and persist
- * - Keeps GET→POST fallback for last_runs and silences polling when not supported
+ * Adds:
+ *  - GET→POST fallback for last_runs (405 handling)
+ *  - Cron countdown
+ *  - Probing /routine/latest when countdown hits zero or when last_cron_routine advances
  */
-
-const DEFAULT_API_BASE = "https://plant-agent-i32khy5nrq-el.a.run.app";
-const RECOMMENDED_HOST = "plant-agent-i32khy5nrq-el.a.run.app";
-const LEGACY_HOST = "plant-agent-i32khy5nrq-em.a.run.app";
 
 const DEBUG_KEY = "plant_ui.debug";
 const getDebug = () => (localStorage.getItem(DEBUG_KEY) ?? "0") === "1";
@@ -173,21 +170,27 @@ async function fetchJSONWithMethodFallback(
   let lastErr: any;
   for (const p of paths) {
     const url = `${base}${p}`;
+    // 1) Try GET first
     try {
       const rg = await fetch(url, { headers: getHeaders });
       if (rg.ok) return { response: rg, json: await rg.json(), url, method: "GET" };
       if (rg.status === 405) {
+        // 2) Fallback to POST
         try {
           const rp = await fetch(url, { method: "POST", headers: postHeaders, body: "{}" });
           if (rp.ok) return { response: rp, json: await rp.json(), url, method: "POST" };
           const txt = await rp.text().catch(() => "");
           lastErr = new Error(`POST ${p} ${rp.status} ${txt ? `– ${txt.slice(0, 140)}` : ""}`);
-        } catch (ep) { lastErr = ep; }
+        } catch (ep) {
+          lastErr = ep;
+        }
       } else {
         const txt = await rg.text().catch(() => "");
         lastErr = new Error(`GET ${p} ${rg.status} ${txt ? `– ${txt.slice(0, 140)}` : ""}`);
       }
-    } catch (eg) { lastErr = eg; }
+    } catch (eg) {
+      lastErr = eg;
+    }
   }
   throw lastErr ?? new Error("No candidate path succeeded via GET/POST");
 }
@@ -214,38 +217,15 @@ function cleanTrends(rows: any[]): TrendPoint[] {
   return out;
 }
 
-/** Coerce any ...-em URL to the recommended ...-el URL */
-function coerceRecommendedBase(u: string): string {
-  if (!u) return u;
-  try {
-    const url = new URL(u);
-    if (url.host === LEGACY_HOST) {
-      url.host = RECOMMENDED_HOST;
-      return url.toString().replace(/\/+$/, "");
-    }
-    return u;
-  } catch {
-    // If it's a bare host or invalid, do a simple text replace as a fallback
-    return u.replace(LEGACY_HOST, RECOMMENDED_HOST).replace(/\/+$/, "");
-  }
-}
-
 export default function PlantAgentDashboard() {
   const [debugUI, setDebugUI] = useState(getDebug());
 
-  // 1) Seed default ...-el
-  const [baseRaw, _setBaseRaw] = useLocalStorage(LS_KEYS.BASE, DEFAULT_API_BASE);
-  const setBaseRaw = (v: string) => _setBaseRaw(coerceRecommendedBase(v));
-  // 2) Auto-correct cached/pasted ...-em → ...-el on mount and whenever user edits
-  useEffect(() => { const coerced = coerceRecommendedBase(baseRaw); if (coerced !== baseRaw) _setBaseRaw(coerced); /* persist */ }, []); // run once
-
-  const base = useMemo(() => normalizeBase(coerceRecommendedBase(baseRaw)), [baseRaw]);
+  const [baseRaw, setBaseRaw] = useLocalStorage(LS_KEYS.BASE, "");
+  const base = useMemo(() => normalizeBase(baseRaw), [baseRaw]);
   const [token, setToken] = useLocalStorage(LS_KEYS.TOKEN, "");
   const [autoPoll, setAutoPoll] = useLocalStorage(LS_KEYS.AUTOPOLL, "1");
   const [stepDwellCsv, setStepDwellCsv] = useLocalStorage(LS_KEYS.STEP_DWELL, "20");
   const [trendSource, setTrendSource] = useLocalStorage(LS_KEYS.TREND_SOURCE, "auto");
-
-  const isEmHost = /\bplant-agent-i32khy5nrq-em\.a\.run\.app\b/i.test(baseRaw || "");
 
   // Separate headers
   const getHeaders = useMemo(() => {
@@ -267,6 +247,7 @@ export default function PlantAgentDashboard() {
   const [lastRuns, setLastRuns] = useState<LastRuns | null>(null);
   const [countdown, setCountdown] = useState<number | null>(null);
   const [countdownCause, setCountdownCause] = useState<string>("");
+  // If backend doesn’t support GET/POST for last_runs, stop polling to avoid console noise
   const disableLastRunsRef = useRef<boolean>(false);
 
   const fetchHealth = useCallback(async () => {
@@ -364,18 +345,8 @@ export default function PlantAgentDashboard() {
   // last_runs with GET→POST fallback
   const fetchLastRuns = useCallback(async () => {
     if (!base || disableLastRunsRef.current) return;
-
-    // HARD STOP: never query ...-em for last_runs
-    if (isEmHost) {
-      disableLastRunsRef.current = true;
-      setCountdown(null);
-      setLastRuns(null);
-      setCountdownCause(`Countdown disabled: base is ${LEGACY_HOST}. Switched to ${RECOMMENDED_HOST} automatically.`);
-      return;
-    }
-
     try {
-      const candidates = [`/debug/last_runs`, `/debug/schedule`];
+      const candidates = [`/debug/last_runs`, `/snapshot/last_runs`, `/last_runs`, `/debug/schedule`];
       const { json, url, method } = await fetchJSONWithMethodFallback(base, getHeaders, postHeaders, candidates);
       const j = json as LastRuns;
       info(`last_runs via ${method} from ${url}`, j);
@@ -383,6 +354,7 @@ export default function PlantAgentDashboard() {
       setCountdown(j.seconds_to_next ?? null);
       setCountdownCause("");
     } catch (e: any) {
+      // If we constantly get 405/Method Not Allowed for every candidate, stop polling to reduce noise.
       const msg = String(e?.message || e);
       const looksLikeNoMethod = /405/.test(msg) || /Method Not Allowed/i.test(msg);
       if (looksLikeNoMethod) {
@@ -393,7 +365,71 @@ export default function PlantAgentDashboard() {
       setCountdownCause(`Countdown unavailable: ${msg}. Tried GET then POST.`);
       warn("fetchLastRuns error", msg);
     }
-  }, [base, getHeaders, postHeaders, isEmHost]);
+  }, [base, getHeaders, postHeaders]);
+
+  // --------- New: Routine latest probing ----------
+  const [routineOut, setRoutineOut] = useState<RoutineResp | null>(null);
+  const [lastSuggestionAt, setLastSuggestionAt] = useState<string | null>(null);
+  const cronProbeRef = useRef<number | null>(null);
+
+  const fetchRoutineLatest = useCallback(async () => {
+    if (!base) return false;
+    try {
+      const r = await fetch(`${base}/routine/latest`, { headers: getHeaders });
+      if (!r.ok) return false;
+      const j: RoutineResp = await r.json();
+      const created = j?.created_at || null;
+      const isNewer =
+        created && (!lastSuggestionAt || new Date(created).getTime() > new Date(lastSuggestionAt).getTime());
+      const hasProposal = !!j?.proposed_setpoints && Object.keys(j.proposed_setpoints).length > 0;
+
+      if (isNewer || hasProposal) {
+        setRoutineOut(j);
+        setLastSuggestionAt(created);
+        info("Fetched /routine/latest", j);
+        return true;
+      }
+      return false;
+    } catch {
+      return false;
+    }
+  }, [base, getHeaders, lastSuggestionAt]);
+
+  // Kick a fetch once at mount / base change
+  useEffect(() => {
+    fetchRoutineLatest();
+  }, [fetchRoutineLatest]);
+
+  // When countdown reaches 0, probe /routine/latest for ~20s (every 2s)
+  useEffect(() => {
+    if (countdown !== 0) return;
+    let tries = 0;
+    if (cronProbeRef.current) window.clearInterval(cronProbeRef.current);
+    cronProbeRef.current = window.setInterval(async () => {
+      tries += 1;
+      const ok = await fetchRoutineLatest();
+      if (ok || tries >= 10) {
+        if (cronProbeRef.current) window.clearInterval(cronProbeRef.current);
+        cronProbeRef.current = null;
+      }
+    }, 2000);
+    return () => {
+      if (cronProbeRef.current) window.clearInterval(cronProbeRef.current);
+      cronProbeRef.current = null;
+    };
+  }, [countdown, fetchRoutineLatest]);
+
+  // Also refresh when backend's last_cron_routine advances
+  useEffect(() => {
+    if (!lastRuns?.last_cron_routine) return;
+    const isNewer =
+      !lastSuggestionAt ||
+      new Date(lastRuns.last_cron_routine).getTime() > new Date(lastSuggestionAt).getTime();
+    if (isNewer) {
+      fetchRoutineLatest();
+    }
+  }, [lastRuns?.last_cron_routine, lastSuggestionAt, fetchRoutineLatest]);
+  // ------------------------------------------------
 
   // polling (snapshot + last_runs)
   useEffect(() => {
@@ -403,6 +439,7 @@ export default function PlantAgentDashboard() {
       pollRef.current = null;
       return;
     }
+    // reset disabling if base changes or toggled
     disableLastRunsRef.current = false;
 
     fetchSnapshot().catch(() => {});
@@ -443,12 +480,11 @@ export default function PlantAgentDashboard() {
     } catch (e: any) { setErrorMsg(e?.message || "Failed to fetch metrics"); }
   }, [base, getHeaders]);
 
-  // Routine
+  // Routine controls
   const [o2Min, setO2Min] = useState<string>("2.3");
   const [o2Max, setO2Max] = useState<string>("4.5");
   const [applyTop, setApplyTop] = useState<boolean>(false);
   const [logSugg, setLogSugg] = useState<boolean>(true);
-  const [routineOut, setRoutineOut] = useState<RoutineResp | null>(null);
   const [routineBefore, setRoutineBefore] = useState<Snapshot | null>(null);
   const [routineAfter, setRoutineAfter] = useState<Snapshot | null>(null);
 
@@ -466,6 +502,7 @@ export default function PlantAgentDashboard() {
       if (!r.ok) throw new Error(`/optimize/routine ${r.status}`);
       const j: RoutineResp = await r.json();
       setRoutineOut(j);
+      setLastSuggestionAt(j?.created_at ?? null);
 
       fetchLastRuns().catch(() => {});
       if (j.applied && j.actuation?.after) {
@@ -669,30 +706,15 @@ export default function PlantAgentDashboard() {
           <div className="flex flex-col md:flex-row gap-3 md:items-end">
             <div className="flex-1">
               <label className="text-xs text-slate-500">API Base URL</label>
-              <input
-                value={baseRaw}
-                onChange={(e) => setBaseRaw(e.target.value)}
-                placeholder="https://<cloud-run-url>"
-                className="w-full mt-1 px-3 py-2 border rounded-xl"
-              />
+              <input value={baseRaw} onChange={(e) => setBaseRaw(e.target.value)} placeholder="https://<cloud-run-url>" className="w-full mt-1 px-3 py-2 border rounded-xl" />
               <div className="mt-1 text-[11px] text-slate-500">Using: <span className="font-mono">{base || "—"}</span></div>
             </div>
             <div className="flex-1">
               <label className="text-xs text-slate-500">ID Token (optional for private)</label>
               <input value={token} onChange={(e) => setToken(e.target.value)} placeholder="paste gcloud-issued ID token" className="w-full mt-1 px-3 py-2 border rounded-xl" />
             </div>
-            <button onClick={() => { setBaseRaw(DEFAULT_API_BASE); }} className="btn-outline">Use recommended host</button>
             <button onClick={fetchHealth} className="btn-outline" disabled={!base}>Check</button>
           </div>
-
-          {/* Host sanity banner */}
-          {isEmHost && (
-            <div className="banner-warn mt-3">
-              You pasted the <span className="font-mono">…-em</span> host which lacks <span className="font-mono">/debug/last_runs</span>.
-              We’ve switched you to <span className="font-mono">…-el</span> automatically and saved it.
-            </div>
-          )}
-
           <div className="mt-3 flex items-center gap-3 text-sm flex-wrap">
             <label className="inline-flex items-center gap-2">
               <input type="checkbox" checked={autoPoll === "1"} onChange={(e) => setAutoPoll(e.target.checked ? "1" : "0")} /> Auto-refresh snapshot
@@ -705,7 +727,7 @@ export default function PlantAgentDashboard() {
               </select>
               <span className="text-xs text-slate-500">from <span className="font-mono">{trendEndpoint}</span></span>
             </div>
-            <button onClick={() => { fetchSnapshot(); getMetrics(); fetchTrends(); fetchLastRuns(); }} className="btn-outline">Refresh now</button>
+            <button onClick={() => { fetchSnapshot(); getMetrics(); fetchTrends(); fetchLastRuns(); fetchRoutineLatest(); }} className="btn-outline">Refresh now</button>
             {errorMsg ? <span className="text-rose-600">• {errorMsg}</span> : null}
           </div>
 
@@ -754,7 +776,11 @@ export default function PlantAgentDashboard() {
             return lines.length ? (
               <ul className="mt-3 list-disc pl-6 text-sm space-y-1">{lines.map((s, i) => (<li key={i}>{s}</li>))}</ul>
             ) : (
-              <div className="mt-3 text-sm text-slate-500">Run a routine optimization to populate suggestions.</div>
+              <div className="mt-3 text-sm text-slate-500">
+                {countdown === 0
+                  ? "Waiting for cron suggestion… probing /routine/latest."
+                  : "Run a routine optimization to populate suggestions."}
+              </div>
             );
           })()}
           <div className="mt-3 flex gap-2">
@@ -1000,6 +1026,7 @@ export default function PlantAgentDashboard() {
           <div className="mt-3 flex gap-2">
             <button className="btn-outline" onClick={() => fetchTrends()}>Re-fetch trends</button>
             <button className="btn-outline" onClick={() => { disableLastRunsRef.current = false; fetchLastRuns(); }}>Re-fetch last_runs</button>
+            <button className="btn-outline" onClick={() => fetchRoutineLatest()}>Re-fetch /routine/latest</button>
           </div>
         </section>
       )}
