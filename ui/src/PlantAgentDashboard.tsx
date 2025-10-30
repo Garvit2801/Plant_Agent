@@ -2,12 +2,11 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { LineChart, Line, XAxis, YAxis, Tooltip, Legend, CartesianGrid } from "recharts";
 
 /**
- * Plant Agent – Operations Dashboard UI (complete)
- * - Robust cron pickup: polls /routine/latest before/after ETA and on last_cron_routine change
- * - GET→POST fallback and /path vs /path/ tolerance for last_runs + routine/latest
- * - Responsive chart via ResizeObserver
- * - “Use recommended host” + “Check” buttons
- * - Minimal CSS classes supported via Tailwind OR the CSS snippet below
+ * Plant Agent – Operations Dashboard UI (FINAL)
+ * - /routine/latest: prefer GET without trailing slash; never bail on 405; try both variants, GET only
+ * - last_runs: GET→POST fallback; tolerate /debug/last_runs, /snapshot/last_runs, /last_runs, /debug/schedule
+ * - Countdown + cron probing (before/after ETA & when last_cron_routine advances)
+ * - Responsive tiles, cards, debug panel; small trend cleaning; snapshot/trends/metrics
  */
 
 const RECOMMENDED_HOST = "https://plant-agent-i32khy5nrq-el.a.run.app";
@@ -30,11 +29,11 @@ function useLocalStorage(key: string, initial: string) {
   return [v, setV] as const;
 }
 
-function warn(msg: string, extra?: any) { console.warn(`[PlantUI] ${msg}`, extra ?? ""); }
-function info(msg: string, extra?: any) { if (getDebug()) console.log(`[PlantUI] ${msg}`, extra ?? ""); }
 function cls(...xs: (string | false | undefined | null)[]) { return xs.filter(Boolean).join(" "); }
 function fmt(n: number | undefined | null, d = 3) { if (n == null || Number.isNaN(n)) return "-"; return Number(n).toFixed(d); }
 function normalizeBase(u: string) { if (!u) return ""; let s = u.trim(); s = s.replace(/\/+$/, ""); s = s.replace(/\/snapshot$/i, ""); return s; }
+function info(msg: string, extra?: any) { if (getDebug()) console.log(`[PlantUI] ${msg}`, extra ?? ""); }
+function warn(msg: string, extra?: any) { console.warn(`[PlantUI] ${msg}`, extra ?? ""); }
 
 type Snapshot = {
   production_tph: number; kiln_feed_tph: number; separator_dp_pa: number;
@@ -47,12 +46,13 @@ type LastRuns = { last_cron_routine: string | null; last_ingest: string | null; 
 type RoutineResp = {
   mode?: string; current?: Snapshot;
   proposed_setpoints?: Record<string, number>;
-  proposal?: { setpoints?: Record<string, number> };
-  top?: { proposed_setpoints?: Record<string, number> };
   suggestion_id?: string;
   created_at?: string; createdAt?: string; ts?: string; timestamp?: string;
+  applied?: boolean;
   actuation?: { after?: Snapshot } | null;
   bq_log?: { table?: string; insert_error?: string | null };
+  suggestions_log?: any;
+  predicted_after?: any;
 };
 
 type LoadResp = {
@@ -61,13 +61,14 @@ type LoadResp = {
   target?: any;
   bq_log?: { table?: string; insert_error?: string | null };
 };
+
 type ApplyResp = { ok: boolean; before?: Partial<Snapshot> | null; after?: Partial<Snapshot> | null; applied_at?: string; };
 
 function Chip({ children, tone="slate" }: { children: React.ReactNode; tone?: "slate" | "green" | "rose" | "amber" | "indigo" }) {
   const map: Record<string, string> = {
-    slate: "chip-slate", green: "chip-green", rose: "chip-rose", amber: "chip-amber", indigo: "chip-indigo",
+    slate: "chip chip-slate", green: "chip chip-green", rose: "chip chip-rose", amber: "chip chip-amber", indigo: "chip chip-indigo",
   };
-  return <span className={cls("chip", map[tone])}>{children}</span>;
+  return <span className={map[tone]}>{children}</span>;
 }
 
 /* tolerant pickers */
@@ -78,31 +79,37 @@ function pickProposal(j: any): Record<string, number> | undefined {
   return j?.proposed_setpoints || j?.proposal?.setpoints || j?.top?.proposed_setpoints;
 }
 
-/* fetch helpers */
-async function tryFetchJSON(base: string, headers: Record<string,string>, paths: string[]) {
+/* GET-only helper that tries multiple paths (used for /routine/latest) */
+async function getJsonCandidates(base: string, headers: Record<string, string>, paths: string[]) {
   let last: any;
   for (const p of paths) {
+    const url = `${base}${p}`;
     try {
-      const r = await fetch(`${base}${p}`, { headers });
-      if (r.ok) return { json: await r.json(), path: p, status: r.status };
-      const txt = await r.text().catch(() => "");
-      last = new Error(`${p} ${r.status}${txt ? ` – ${txt.slice(0,140)}` : ""}`);
+      const r = await fetch(url, { headers });
+      if (r.ok) return { json: await r.json(), path: p, status: r.status, method: "GET" as const };
+      // continue on 405/404 etc., do not bail
+      const txt = await r.text().catch(()=> "");
+      last = new Error(`GET ${p} ${r.status}${txt ? ` – ${txt.slice(0,140)}` : ""}`);
     } catch (e) { last = e; }
   }
   throw last ?? new Error("No candidate path succeeded");
 }
+
+/* GET→POST fallback (used for schedule/last_runs style endpoints) */
 async function methodFallback(base: string, getHeaders: Record<string,string>, postHeaders: Record<string,string>, paths: string[]) {
   let last: any;
   for (const p of paths) {
     const url = `${base}${p}`;
     try {
       const g = await fetch(url, { headers: getHeaders });
-      if (g.ok) return { json: await g.json(), path: p, method: "GET", status: g.status };
+      if (g.ok) return { json: await g.json(), path: p, method: "GET" as const, status: g.status };
       if (g.status === 405) {
-        const pr = await fetch(url, { method: "POST", headers: postHeaders, body: "{}" });
-        if (pr.ok) return { json: await pr.json(), path: p, method: "POST", status: pr.status };
-        const txt = await pr.text().catch(()=> "");
-        last = new Error(`POST ${p} ${pr.status}${txt ? ` – ${txt.slice(0,140)}` : ""}`);
+        try {
+          const pr = await fetch(url, { method: "POST", headers: postHeaders, body: "{}" });
+          if (pr.ok) return { json: await pr.json(), path: p, method: "POST" as const, status: pr.status };
+          const txt = await pr.text().catch(()=> "");
+          last = new Error(`POST ${p} ${pr.status}${txt ? ` – ${txt.slice(0,140)}` : ""}`);
+        } catch (e) { last = e; }
       } else {
         const txt = await g.text().catch(()=> "");
         last = new Error(`GET ${p} ${g.status}${txt ? ` – ${txt.slice(0,140)}` : ""}`);
@@ -112,7 +119,25 @@ async function methodFallback(base: string, getHeaders: Record<string,string>, p
   throw last ?? new Error("No candidate path via GET/POST");
 }
 
-/* component */
+/* trend cleaning */
+function cleanTrends(rows: any[]): TrendPoint[] {
+  const sorted = rows.slice().sort((a,b)=>new Date(a.ts??0).getTime()-new Date(b.ts??0).getTime());
+  const out: TrendPoint[] = [];
+  let lastProd: number | undefined;
+  for (const row of sorted) {
+    const parse = (v:any) => { if (v==null) return NaN; const s = typeof v === "string" ? v.replace(/,/g,"") : String(v); const n = Number(s); return Number.isFinite(n)?n:NaN; };
+    const prod = parse(row.production_tph), o2 = parse(row.o2_percent), sp = parse(row.specific_power_kwh_per_ton);
+    const prodGood = Number.isFinite(prod) && prod >= 0.5 && prod < 1000;
+    const o2Good = Number.isFinite(o2) && o2 >= 0 && o2 < 30;
+    const spGood = Number.isFinite(sp) && sp > 0 && sp < 200;
+    const spike = lastProd && prodGood ? Math.abs(prod-lastProd)/Math.max(1e-9,lastProd) > 0.30 : false;
+    const keepProd = prodGood && !spike ? prod : null;
+    if (keepProd !== null) lastProd = keepProd;
+    out.push({ t: row.ts ? new Date(row.ts).toLocaleTimeString() : "", production_tph: keepProd, o2_percent: o2Good?o2:null, specific_power_kwh_per_ton: spGood?sp:null });
+  }
+  return out;
+}
+
 export default function PlantAgentDashboard() {
   const [baseRaw, setBaseRaw] = useLocalStorage(LS_KEYS.BASE, RECOMMENDED_HOST);
   const base = useMemo(() => normalizeBase(baseRaw), [baseRaw]);
@@ -177,7 +202,7 @@ export default function PlantAgentDashboard() {
       }
       if (!r) throw new Error("health unreachable");
       setHealth(String(r.status));
-      const { json: vj } = await tryFetchJSON(base, getHeaders, ["/version","/snapshot/version"]);
+      const { json: vj } = await getJsonCandidates(base, getHeaders, ["/version","/snapshot/version"]);
       setVer(vj?.version ?? "-");
     } catch (e:any) {
       setHealth("error"); setVer("-"); setErrorMsg(e?.message || "health failed");
@@ -213,31 +238,15 @@ export default function PlantAgentDashboard() {
     try {
       const pathAuto = "/trends?minutes=120&limit=240&source=auto";
       const pathBQ   = "/trends?minutes=120&limit=240&source=bq";
-      const { json, path } = await tryFetchJSON(base, getHeaders, trendSource === "bq" ? [pathBQ,pathAuto] : [pathAuto,pathBQ]);
+      const { json, path } = await getJsonCandidates(base, getHeaders, trendSource === "bq" ? [pathBQ,pathAuto] : [pathAuto,pathBQ]);
       setTrendEndpoint(path);
-      if (Array.isArray(json)) {
-        const sorted = json.slice().sort((a,b)=>new Date(a.ts??0).getTime()-new Date(b.ts??0).getTime());
-        const out: TrendPoint[] = [];
-        let lastProd: number | undefined;
-        for (const row of sorted) {
-          const parse = (v:any) => { if (v==null) return NaN; const s = typeof v === "string" ? v.replace(/,/g,"") : String(v); const n = Number(s); return Number.isFinite(n)?n:NaN; };
-          const prod = parse(row.production_tph), o2 = parse(row.o2_percent), sp = parse(row.specific_power_kwh_per_ton);
-          const prodGood = Number.isFinite(prod) && prod >= 0.5 && prod < 1000;
-          const o2Good = Number.isFinite(o2) && o2 >= 0 && o2 < 30;
-          const spGood = Number.isFinite(sp) && sp > 0 && sp < 200;
-          const spike = lastProd && prodGood ? Math.abs(prod-lastProd)/Math.max(1e-9,lastProd) > 0.30 : false;
-          const keepProd = prodGood && !spike ? prod : null;
-          if (keepProd !== null) lastProd = keepProd;
-          out.push({ t: row.ts ? new Date(row.ts).toLocaleTimeString() : "", production_tph: keepProd, o2_percent: o2Good?o2:null, specific_power_kwh_per_ton: spGood?sp:null });
-        }
-        setTrends(out.slice(-240));
-      }
+      if (Array.isArray(json)) setTrends(cleanTrends(json).slice(-240));
     } catch (e:any) {
       setErrorMsg(prev => prev || e?.message || "Failed to fetch trends");
     }
   }, [base, getHeaders, trendSource]);
 
-  /* last_runs */
+  /* last_runs (GET→POST fallback) */
   const fetchLastRuns = useCallback(async () => {
     if (!base || disableLastRunsRef.current) return;
     try {
@@ -255,11 +264,11 @@ export default function PlantAgentDashboard() {
     }
   }, [base, getHeaders, postHeaders]);
 
-  /* /routine/latest (probe before/after ETA) */
+  /* /routine/latest (GET-only; prefer no trailing slash) */
   const fetchRoutineLatest = useCallback(async () => {
     if (!base) return false;
     try {
-      const { json, method } = await methodFallback(base, getHeaders, postHeaders, ["/routine/latest","/routine/latest/"]);
+      const { json, path } = await getJsonCandidates(base, getHeaders, ["/routine/latest", "/routine/latest/"]);
       setRoutineRaw(json);
       const created = pickLatestTimestamp(json);
       const proposed = pickProposal(json);
@@ -274,18 +283,22 @@ export default function PlantAgentDashboard() {
           proposed_setpoints: proposed,
           mode: json?.mode,
           current: json?.current,
+          applied: json?.applied,
           actuation: json?.actuation,
-          bq_log: json?.bq_log
+          bq_log: json?.bq_log,
+          suggestions_log: json?.suggestions_log,
+          predicted_after: json?.predicted_after
         });
-        info(`Fetched routine latest via ${method}`, json);
+        info(`Fetched routine latest via ${path}`, json);
         return true;
       }
       return false;
     } catch {
       return false;
     }
-  }, [base, getHeaders, postHeaders, latestSeenAt]);
+  }, [base, getHeaders, latestSeenAt]);
 
+  /* probe around countdown reaching 0 */
   const startCronProbe = useCallback(() => {
     if (cronProbeRef.current) window.clearInterval(cronProbeRef.current);
     let elapsed = 0;
@@ -322,21 +335,24 @@ export default function PlantAgentDashboard() {
     fetchSnapshot().catch(()=>{});
     fetchTrends().catch(()=>{});
     fetchLastRuns().catch(()=>{});
+    fetchRoutineLatest().catch(()=>{});
+
     pollRef.current = window.setInterval(() => {
       fetchSnapshot().catch(()=>{});
       fetchLastRuns().catch(()=>{});
     }, 5000);
     return () => { if (pollRef.current) window.clearInterval(pollRef.current); pollRef.current = null; };
-  }, [autoPoll, base, fetchSnapshot, fetchTrends, fetchLastRuns]);
+  }, [autoPoll, base, fetchSnapshot, fetchTrends, fetchLastRuns, fetchRoutineLatest]);
 
   /* countdown tick */
+  const countTimerRef = useRef<number | null>(null);
   useEffect(() => {
-    if (countdown === null) { if (countRef.current) window.clearInterval(countRef.current); countRef.current = null; return; }
-    if (countRef.current) window.clearInterval(countRef.current);
-    countRef.current = window.setInterval(() => {
+    if (countdown === null) { if (countTimerRef.current) window.clearInterval(countTimerRef.current); countTimerRef.current = null; return; }
+    if (countTimerRef.current) window.clearInterval(countTimerRef.current);
+    countTimerRef.current = window.setInterval(() => {
       setCountdown(c => (c==null ? c : Math.max(0, c - 1)));
     }, 1000);
-    return () => { if (countRef.current) window.clearInterval(countRef.current); countRef.current = null; };
+    return () => { if (countTimerRef.current) window.clearInterval(countTimerRef.current); countTimerRef.current = null; };
   }, [countdown]);
 
   /* routine actions */
@@ -349,16 +365,23 @@ export default function PlantAgentDashboard() {
       const r = await fetch(`${base}/optimize/routine`, { method: "POST", headers: postHeaders, body: JSON.stringify(body) });
       if (!r.ok) throw new Error(`/optimize/routine ${r.status}`);
       const j: RoutineResp = await r.json();
+      // immediately show any proposals
       setRoutineRaw(j);
+      const created = pickLatestTimestamp(j);
+      const proposed = pickProposal(j);
       setRoutineOut({
         suggestion_id: j?.suggestion_id,
-        created_at: pickLatestTimestamp(j) ?? undefined,
-        proposed_setpoints: pickProposal(j),
+        created_at: created ?? undefined,
+        proposed_setpoints: proposed,
         mode: j?.mode,
         current: j?.current,
+        applied: j?.applied,
         actuation: j?.actuation,
-        bq_log: j?.bq_log
+        bq_log: j?.bq_log,
+        suggestions_log: j?.suggestions_log,
+        predicted_after: j?.predicted_after
       });
+      if (created) setLatestSeenAt(created);
       fetchLastRuns().catch(()=>{});
       if (j?.actuation?.after) {
         const after = j.actuation.after as Snapshot;
@@ -484,6 +507,7 @@ export default function PlantAgentDashboard() {
     const m = Math.floor(countdown/60); const s = countdown%60;
     return `${m}:${String(s).padStart(2,"0")} to next routine`;
   }, [countdown]);
+
   const suggestionLines = useMemo(() => {
     const proposed = pickProposal(routineOut);
     if (!snap || !proposed) return [];
@@ -521,7 +545,7 @@ export default function PlantAgentDashboard() {
 
       <main className="mx-auto max-w-7xl p-4 space-y-6">
         {/* Connection */}
-        <section className="bg-white rounded-2xl shadow-sm border border-slate-200 p-4">
+        <section className="card">
           <div className="flex flex-col lg:flex-row gap-3 lg:items-end">
             <div className="flex-1">
               <label className="text-xs text-slate-500">API Base URL</label>
@@ -532,7 +556,7 @@ export default function PlantAgentDashboard() {
               <label className="text-xs text-slate-500">ID Token (optional for private)</label>
               <input value={token} onChange={(e)=>setToken(e.target.value)} placeholder="paste gcloud-issued ID token" className="w-full mt-1 px-3 py-2 border rounded-xl" />
             </div>
-            <button onClick={()=>setBaseRaw(RECOMMENDED_HOST)} className="btn-secondary">Use recommended host</button>
+            <button onClick={()=>setBaseRaw(RECOMMENDED_HOST)} className="btn-outline">Use recommended host</button>
             <button onClick={fetchHealth} className="btn-outline" disabled={!base}>Check</button>
           </div>
           <div className="mt-3 flex items-center gap-3 text-sm flex-wrap">
@@ -557,7 +581,7 @@ export default function PlantAgentDashboard() {
           )}
         </section>
 
-        {/* KPI */}
+        {/* KPI Tiles */}
         <section className="grid md:grid-cols-5 gap-4">
           {[
             { label: "Production (tph)", val: kpi?.production_tph },

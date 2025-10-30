@@ -73,7 +73,7 @@ button {
 button:active { transform: translateY(0.5px); }
 button:disabled { cursor: not-allowed; opacity: 0.6; }
 
-/* Shared button look */
+/* Shared button look (single source of truth) */
 .btn,
 .btn-primary,
 .btn-secondary,
@@ -90,13 +90,22 @@ button:disabled { cursor: not-allowed; opacity: 0.6; }
   box-shadow: 0 1px 2px rgb(0 0 0 / 0.06);
 }
 
+/* Add visible keyboard focus for all .btn* */
+.btn:focus-visible,
+.btn-primary:focus-visible,
+.btn-secondary:focus-visible,
+.btn-indigo:focus-visible,
+.btn-danger:focus-visible,
+.btn-outline:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
 /* Button variants */
 .btn-primary {
   background:#10b981;           /* emerald-500 */
   color:#fff;
   border:1px solid #059669;     /* emerald-600 */
-  padding:.5rem .8rem;
-  border-radius:.75rem;
 }
 .btn-primary:hover { filter: brightness(1.05); }
 .btn-primary:disabled { opacity:.6; }
@@ -105,8 +114,6 @@ button:disabled { cursor: not-allowed; opacity: 0.6; }
   background:#0ea5e9;           /* sky-500 */
   color:#fff;
   border:1px solid #0284c7;     /* sky-600 */
-  padding:.5rem .8rem;
-  border-radius:.75rem;
 }
 .btn-secondary:hover { filter: brightness(1.06); }
 
@@ -114,8 +121,6 @@ button:disabled { cursor: not-allowed; opacity: 0.6; }
   background:#6366f1;           /* indigo-500 */
   color:#fff;
   border:1px solid #4f46e5;     /* indigo-600 */
-  padding:.5rem .8rem;
-  border-radius:.75rem;
 }
 .btn-indigo:hover { filter: brightness(1.06); }
 
@@ -123,8 +128,6 @@ button:disabled { cursor: not-allowed; opacity: 0.6; }
   background:#ef4444;           /* red-500 */
   color:#fff;
   border:1px solid #dc2626;     /* red-600 */
-  padding:.5rem .8rem;
-  border-radius:.75rem;
 }
 .btn-danger:hover { filter: brightness(1.06); }
 
@@ -132,8 +135,6 @@ button:disabled { cursor: not-allowed; opacity: 0.6; }
   background:#fff;
   color:#0f172a;
   border:1px solid #cbd5e1;     /* slate-300 */
-  padding:.5rem .8rem;
-  border-radius:.75rem;
 }
 .btn-outline:hover { background:#f8fafc; } /* slate-50 */
 
