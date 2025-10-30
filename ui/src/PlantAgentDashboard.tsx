@@ -2,98 +2,26 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { LineChart, Line, XAxis, YAxis, Tooltip, Legend, CartesianGrid } from "recharts";
 
 /**
- * Plant Agent – Operations Dashboard UI (BQ-aware)
- * Adds:
- *  - GET→POST fallback for last_runs (405 handling)
- *  - Cron countdown
- *  - Probing /routine/latest when countdown hits zero or when last_cron_routine advances
+ * Plant Agent – Operations Dashboard UI (complete)
+ * - Robust cron pickup: polls /routine/latest before/after ETA and on last_cron_routine change
+ * - GET→POST fallback and /path vs /path/ tolerance for last_runs + routine/latest
+ * - Responsive chart via ResizeObserver
+ * - “Use recommended host” + “Check” buttons
+ * - Minimal CSS classes supported via Tailwind OR the CSS snippet below
  */
+
+const RECOMMENDED_HOST = "https://plant-agent-i32khy5nrq-el.a.run.app";
 
 const DEBUG_KEY = "plant_ui.debug";
 const getDebug = () => (localStorage.getItem(DEBUG_KEY) ?? "0") === "1";
 const setDebug = (b: boolean) => localStorage.setItem(DEBUG_KEY, b ? "1" : "0");
-
-function warn(msg: string, extra?: any) { console.warn(`[PlantUI] ${msg}`, extra ?? ""); }
-function info(msg: string, extra?: any) { if (getDebug()) console.log(`[PlantUI] ${msg}`, extra ?? ""); }
-
-type TrendDiag = {
-  n: number; firstTs?: string; lastTs?: string; nonMonotonic: number;
-  prodMin?: number; prodMax?: number; prodEq10: number; prodNaN: number; o2NaN: number; spNaN: number;
-};
-
-function diagnoseTrends(arr: any[]): TrendDiag {
-  const diag: TrendDiag = { n: arr.length, nonMonotonic: 0, prodEq10: 0, prodNaN: 0, o2NaN: 0, spNaN: 0 };
-  let prev = -Infinity, min = +Infinity, max = -Infinity;
-  for (const r of arr) {
-    const ts = typeof r.ts === "string" || typeof r.ts === "number" ? Number(new Date(r.ts)) : NaN;
-    if (Number.isFinite(ts)) {
-      if (!diag.firstTs) diag.firstTs = new Date(ts).toISOString();
-      diag.lastTs = new Date(ts).toISOString();
-      if (ts < prev) diag.nonMonotonic++;
-      prev = ts;
-    }
-    const p = Number(r.production_tph), o = Number(r.o2_percent), s = Number(r.specific_power_kwh_per_ton);
-    if (!Number.isFinite(p)) diag.prodNaN++; else { min = Math.min(min, p); max = Math.max(max, p); if (p === 10) diag.prodEq10++; }
-    if (!Number.isFinite(o)) diag.o2NaN++;
-    if (!Number.isFinite(s)) diag.spNaN++;
-  }
-  if (diag.n) { diag.prodMin = Number.isFinite(min) ? min : undefined; diag.prodMax = Number.isFinite(max) ? max : undefined; }
-  return diag;
-}
-
-type Snapshot = {
-  production_tph: number; kiln_feed_tph: number; separator_dp_pa: number;
-  id_fan_flow_Nm3_h: number; cooler_airflow_Nm3_h: number; kiln_speed_rpm: number;
-  o2_percent: number; specific_power_kwh_per_ton: number;
-};
-
-type TrendPoint = {
-  t: string; production_tph: number | null; o2_percent: number | null; specific_power_kwh_per_ton: number | null;
-};
-
-type RoutineReq = {
-  snapshot?: Snapshot; targets?: Record<string, any>; constraints?: Record<string, any>;
-  apply_top?: boolean; log_suggestions?: boolean;
-};
-
-type RoutineResp = {
-  mode: string; current: Snapshot; predicted_after?: any;
-  proposed_setpoints?: Record<string, number>;
-  bq_log?: { table?: string; insert_error?: string | null };
-  suggestion_id?: string; created_at?: string; applied?: boolean;
-  actuation?: { after?: Snapshot } | null;
-};
-
-type Stage = { name?: string; checks?: string[]; setpoints: Record<string, number> };
-
-type LoadReq = {
-  snapshot?: Snapshot; direction?: "up" | "down";
-  delta_pct?: number | null; delta_abs?: number | null; target_tph?: number | null;
-  steps?: number | null; constraints?: Record<string, any>;
-};
-
-type LoadResp = {
-  plan_id: string; created_at: string; mode: string; current: Snapshot;
-  predicted_after?: any; actions?: any; stages: Stage[]; target: any;
-  bq_log?: { table?: string; insert_error?: string | null };
-};
-
-type ApplyResp = {
-  ok: boolean; bq_log?: { table?: string; insert_error?: string | null };
-  before?: Partial<Snapshot> | null; after?: Partial<Snapshot> | null; applied_at?: string;
-};
-
-type LastRuns = {
-  last_cron_routine: string | null; last_ingest: string | null;
-  sched_period_sec: number; now: string; next_cron_eta: string | null; seconds_to_next: number | null;
-};
 
 const LS_KEYS = {
   BASE: "plant_ui.base_url",
   TOKEN: "plant_ui.id_token",
   AUTOPOLL: "plant_ui.autopoll",
   STEP_DWELL: "plant_ui.step_dwell",
-  TREND_SOURCE: "plant_ui.trend_source"
+  TREND_SOURCE: "plant_ui.trend_source",
 };
 
 function useLocalStorage(key: string, initial: string) {
@@ -102,520 +30,415 @@ function useLocalStorage(key: string, initial: string) {
   return [v, setV] as const;
 }
 
+function warn(msg: string, extra?: any) { console.warn(`[PlantUI] ${msg}`, extra ?? ""); }
+function info(msg: string, extra?: any) { if (getDebug()) console.log(`[PlantUI] ${msg}`, extra ?? ""); }
 function cls(...xs: (string | false | undefined | null)[]) { return xs.filter(Boolean).join(" "); }
 function fmt(n: number | undefined | null, d = 3) { if (n == null || Number.isNaN(n)) return "-"; return Number(n).toFixed(d); }
-function safeNum(n: any): number | undefined { const x = Number(n); return Number.isFinite(x) ? x : undefined; }
 function normalizeBase(u: string) { if (!u) return ""; let s = u.trim(); s = s.replace(/\/+$/, ""); s = s.replace(/\/snapshot$/i, ""); return s; }
 
-function formatSuggestionText(lever: string, current?: number, proposed?: number, deltaPct?: number, cmin?: number, cmax?: number) {
-  let base: string;
-  if (deltaPct === undefined || current === undefined || current === 0 || proposed === undefined) base = `${lever}: set to ${fmt(proposed)}`;
-  else if (deltaPct > 0) base = `Increase ${lever} by ~${Math.abs(Number(deltaPct.toFixed(1)))}% to ${fmt(proposed)}`;
-  else if (deltaPct < 0) base = `Reduce ${lever} by ~${Math.abs(Number(deltaPct.toFixed(1)))}% to ${fmt(proposed)}`;
-  else base = `Hold ${lever} at ${fmt(proposed)}`;
-  const b = (cmin !== undefined || cmax !== undefined)
-    ? ` (bounds ${cmin !== undefined ? fmt(cmin) : "−∞"}…${cmax !== undefined ? fmt(cmax) : "+∞"})` : "";
-  return base + b;
-}
+type Snapshot = {
+  production_tph: number; kiln_feed_tph: number; separator_dp_pa: number;
+  id_fan_flow_Nm3_h: number; cooler_airflow_Nm3_h: number; kiln_speed_rpm: number;
+  o2_percent: number; specific_power_kwh_per_ton: number;
+};
+type TrendPoint = { t: string; production_tph: number | null; o2_percent: number | null; specific_power_kwh_per_ton: number | null; };
+type LastRuns = { last_cron_routine: string | null; last_ingest: string | null; sched_period_sec: number; now: string; next_cron_eta: string | null; seconds_to_next: number | null; };
 
-function deriveSuggestionLines(current: Snapshot | null, proposed?: Record<string, number>, constraints?: Record<string, any>) {
-  if (!current || !proposed) return [] as string[];
-  const out: string[] = [];
-  for (const [lever, p] of Object.entries(proposed)) {
-    const cur = safeNum((current as any)[lever]); const prop = safeNum(p);
-    const deltaAbs = cur !== undefined && prop !== undefined ? prop - cur : undefined;
-    const deltaPct = cur && cur !== 0 && prop !== undefined ? ((prop - cur) / cur) * 100 : undefined;
-    const cMin = constraints?.[lever]?.min; const cMax = constraints?.[lever]?.max;
-    out.push(formatSuggestionText(lever, cur, prop, deltaPct, cMin, cMax) + (deltaAbs !== undefined ? ` (Δabs ${deltaAbs >= 0 ? "+" : ""}${Number(deltaAbs.toFixed(3))})` : ""));
-  }
-  return out;
-}
+type RoutineResp = {
+  mode?: string; current?: Snapshot;
+  proposed_setpoints?: Record<string, number>;
+  proposal?: { setpoints?: Record<string, number> };
+  top?: { proposed_setpoints?: Record<string, number> };
+  suggestion_id?: string;
+  created_at?: string; createdAt?: string; ts?: string; timestamp?: string;
+  actuation?: { after?: Snapshot } | null;
+  bq_log?: { table?: string; insert_error?: string | null };
+};
+
+type LoadResp = {
+  plan_id: string; created_at: string; mode: string; current: Snapshot;
+  stages: { name?: string; checks?: string[]; setpoints: Record<string, number> }[];
+  target?: any;
+  bq_log?: { table?: string; insert_error?: string | null };
+};
+type ApplyResp = { ok: boolean; before?: Partial<Snapshot> | null; after?: Partial<Snapshot> | null; applied_at?: string; };
 
 function Chip({ children, tone="slate" }: { children: React.ReactNode; tone?: "slate" | "green" | "rose" | "amber" | "indigo" }) {
   const map: Record<string, string> = {
-    slate: "bg-slate-100 text-slate-700", green: "bg-green-100 text-green-700",
-    rose: "bg-rose-100 text-rose-700", amber: "bg-amber-100 text-amber-800", indigo: "bg-indigo-100 text-indigo-700",
+    slate: "chip-slate", green: "chip-green", rose: "chip-rose", amber: "chip-amber", indigo: "chip-indigo",
   };
-  return <span className={cls("px-2 py-1 rounded-full border text-xs", map[tone])}>{children}</span>;
+  return <span className={cls("chip", map[tone])}>{children}</span>;
 }
 
-/** GET helper that tries multiple paths */
-async function tryFetchJSON(base: string, headers: Record<string, string>, paths: string[]) {
-  let lastErr: any;
+/* tolerant pickers */
+function pickLatestTimestamp(j: any): string | null {
+  return j?.created_at || j?.createdAt || j?.ts || j?.timestamp || null;
+}
+function pickProposal(j: any): Record<string, number> | undefined {
+  return j?.proposed_setpoints || j?.proposal?.setpoints || j?.top?.proposed_setpoints;
+}
+
+/* fetch helpers */
+async function tryFetchJSON(base: string, headers: Record<string,string>, paths: string[]) {
+  let last: any;
   for (const p of paths) {
     try {
-      const url = `${base}${p}`;
-      const r = await fetch(url, { headers });
-      if (r.ok) return { response: r, json: await r.json(), url };
-      if (r.status !== 404) {
-        const text = await r.text().catch(() => "");
-        lastErr = new Error(`GET ${p} ${r.status} ${text ? `– ${text.slice(0, 140)}` : ""}`);
-      } else {
-        lastErr = new Error(`${p} 404`);
-      }
-    } catch (e) {
-      lastErr = e;
-    }
+      const r = await fetch(`${base}${p}`, { headers });
+      if (r.ok) return { json: await r.json(), path: p, status: r.status };
+      const txt = await r.text().catch(() => "");
+      last = new Error(`${p} ${r.status}${txt ? ` – ${txt.slice(0,140)}` : ""}`);
+    } catch (e) { last = e; }
   }
-  throw lastErr ?? new Error("No candidate path succeeded");
+  throw last ?? new Error("No candidate path succeeded");
 }
-
-/** GET→POST fallback for backends that disallow GET (405) */
-async function fetchJSONWithMethodFallback(
-  base: string,
-  getHeaders: Record<string, string>,
-  postHeaders: Record<string, string>,
-  paths: string[],
-) {
-  let lastErr: any;
+async function methodFallback(base: string, getHeaders: Record<string,string>, postHeaders: Record<string,string>, paths: string[]) {
+  let last: any;
   for (const p of paths) {
     const url = `${base}${p}`;
-    // 1) Try GET first
     try {
-      const rg = await fetch(url, { headers: getHeaders });
-      if (rg.ok) return { response: rg, json: await rg.json(), url, method: "GET" };
-      if (rg.status === 405) {
-        // 2) Fallback to POST
-        try {
-          const rp = await fetch(url, { method: "POST", headers: postHeaders, body: "{}" });
-          if (rp.ok) return { response: rp, json: await rp.json(), url, method: "POST" };
-          const txt = await rp.text().catch(() => "");
-          lastErr = new Error(`POST ${p} ${rp.status} ${txt ? `– ${txt.slice(0, 140)}` : ""}`);
-        } catch (ep) {
-          lastErr = ep;
-        }
+      const g = await fetch(url, { headers: getHeaders });
+      if (g.ok) return { json: await g.json(), path: p, method: "GET", status: g.status };
+      if (g.status === 405) {
+        const pr = await fetch(url, { method: "POST", headers: postHeaders, body: "{}" });
+        if (pr.ok) return { json: await pr.json(), path: p, method: "POST", status: pr.status };
+        const txt = await pr.text().catch(()=> "");
+        last = new Error(`POST ${p} ${pr.status}${txt ? ` – ${txt.slice(0,140)}` : ""}`);
       } else {
-        const txt = await rg.text().catch(() => "");
-        lastErr = new Error(`GET ${p} ${rg.status} ${txt ? `– ${txt.slice(0, 140)}` : ""}`);
+        const txt = await g.text().catch(()=> "");
+        last = new Error(`GET ${p} ${g.status}${txt ? ` – ${txt.slice(0,140)}` : ""}`);
       }
-    } catch (eg) {
-      lastErr = eg;
-    }
+    } catch (e) { last = e; }
   }
-  throw lastErr ?? new Error("No candidate path succeeded via GET/POST");
+  throw last ?? new Error("No candidate path via GET/POST");
 }
 
-/** Trend cleaner */
-function cleanTrends(rows: any[]): TrendPoint[] {
-  const sorted = [...rows].sort((a, b) => new Date(a.ts ?? 0).getTime() - new Date(b.ts ?? 0).getTime());
-  const out: TrendPoint[] = [];
-  let lastProd: number | undefined;
-  for (const row of sorted) {
-    const parse = (v: any) => { if (v == null) return NaN; const s = (typeof v === "string") ? v.replace(/,/g, "") : String(v); const n = Number(s); return Number.isFinite(n) ? n : NaN; };
-    const prod = parse(row.production_tph), o2 = parse(row.o2_percent), sp = parse(row.specific_power_kwh_per_ton);
-    const prodGood = Number.isFinite(prod) && prod >= 0.5 && prod < 1000;
-    const o2Good = Number.isFinite(o2) && o2 >= 0 && o2 < 30;
-    const spGood = Number.isFinite(sp) && sp > 0 && sp < 200;
-    const spike = lastProd && prodGood ? Math.abs(prod - lastProd) / Math.max(1e-9, lastProd) > 0.30 : false;
-    const keepProd = prodGood && !spike ? prod : null;
-    if (keepProd !== null) lastProd = keepProd as number;
-    out.push({
-      t: row.ts ? new Date(row.ts).toLocaleTimeString() : "",
-      production_tph: keepProd, o2_percent: o2Good ? o2 : null, specific_power_kwh_per_ton: spGood ? sp : null,
-    });
-  }
-  return out;
-}
-
+/* component */
 export default function PlantAgentDashboard() {
-  const [debugUI, setDebugUI] = useState(getDebug());
-
-  const [baseRaw, setBaseRaw] = useLocalStorage(LS_KEYS.BASE, "");
+  const [baseRaw, setBaseRaw] = useLocalStorage(LS_KEYS.BASE, RECOMMENDED_HOST);
   const base = useMemo(() => normalizeBase(baseRaw), [baseRaw]);
   const [token, setToken] = useLocalStorage(LS_KEYS.TOKEN, "");
   const [autoPoll, setAutoPoll] = useLocalStorage(LS_KEYS.AUTOPOLL, "1");
-  const [stepDwellCsv, setStepDwellCsv] = useLocalStorage(LS_KEYS.STEP_DWELL, "20");
   const [trendSource, setTrendSource] = useLocalStorage(LS_KEYS.TREND_SOURCE, "auto");
+  const [stepDwellCsv, setStepDwellCsv] = useLocalStorage(LS_KEYS.STEP_DWELL, "20");
 
-  // Separate headers
   const getHeaders = useMemo(() => {
-    const h: Record<string, string> = {};
-    if (token.trim()) h["Authorization"] = `Bearer ${token.trim()}`;
+    const h: Record<string,string> = {};
+    if (token.trim()) h.Authorization = `Bearer ${token.trim()}`;
     return h;
   }, [token]);
-
   const postHeaders = useMemo(() => {
-    const h: Record<string, string> = { "Content-Type": "application/json" };
-    if (token.trim()) h["Authorization"] = `Bearer ${token.trim()}`;
+    const h: Record<string,string> = {"Content-Type":"application/json"};
+    if (token.trim()) h.Authorization = `Bearer ${token.trim()}`;
     return h;
   }, [token]);
 
-  const [health, setHealth] = useState<string>("");
-  const [ver, setVer] = useState<string>("");
+  const [health, setHealth] = useState<string>("-");
+  const [ver, setVer] = useState<string>("-");
   const [errorMsg, setErrorMsg] = useState<string>("");
+
+  const [snap, setSnap] = useState<Snapshot | null>(null);
+  const [history, setHistory] = useState<TrendPoint[]>([]);
+  const [trends, setTrends] = useState<TrendPoint[]>([]);
+  const [trendEndpoint, setTrendEndpoint] = useState("(none)");
 
   const [lastRuns, setLastRuns] = useState<LastRuns | null>(null);
   const [countdown, setCountdown] = useState<number | null>(null);
   const [countdownCause, setCountdownCause] = useState<string>("");
-  // If backend doesn’t support GET/POST for last_runs, stop polling to avoid console noise
-  const disableLastRunsRef = useRef<boolean>(false);
 
+  const [routineOut, setRoutineOut] = useState<RoutineResp | null>(null);
+  const [routineRaw, setRoutineRaw] = useState<any>(null);
+  const [latestSeenAt, setLatestSeenAt] = useState<string | null>(null);
+
+  const [loadOut, setLoadOut] = useState<LoadResp | null>(null);
+  const [loadBefore, setLoadBefore] = useState<Snapshot | null>(null);
+  const [loadAfter, setLoadAfter] = useState<Snapshot | null>(null);
+
+  const [o2Min, setO2Min] = useState("2.3");
+  const [o2Max, setO2Max] = useState("4.5");
+  const [applyTop, setApplyTop] = useState(false);
+  const [logSugg, setLogSugg] = useState(true);
+  const [routineBefore, setRoutineBefore] = useState<Snapshot | null>(null);
+  const [routineAfter, setRoutineAfter] = useState<Snapshot | null>(null);
+
+  const pollRef = useRef<number | null>(null);
+  const countRef = useRef<number | null>(null);
+  const disableLastRunsRef = useRef(false);
+  const cronProbeRef = useRef<number | null>(null);
+  const lastCronRef = useRef<string | null>(null);
+
+  /* health/version */
   const fetchHealth = useCallback(async () => {
-    setErrorMsg("");
+    if (!base) return;
     try {
-      const healthCandidates = [`/health`, `/snapshot/health`, `/healthz`];
-      let healthResp: Response | null = null;
-      for (const p of healthCandidates) {
-        try {
-          const rr = await fetch(`${base}${p}`, { headers: getHeaders });
-          healthResp = rr;
-          if (rr.ok || rr.status !== 404) break;
-        } catch {}
+      const candidates = ["/health", "/snapshot/health", "/healthz"];
+      let r: Response | null = null;
+      for (const p of candidates) {
+        try { const t = await fetch(`${base}${p}`, { headers: getHeaders }); r = t; if (t.ok || t.status !== 404) break; } catch {}
       }
-      if (!healthResp) throw new Error("No response");
-      setHealth(`${healthResp.status}`);
-
-      const { json: verJson } = await tryFetchJSON(base, getHeaders, [`/version`, `/snapshot/version`]);
-      setVer(verJson.version ?? "");
-    } catch (e: any) {
-      setHealth("error");
-      setErrorMsg(e?.message || "Failed to reach /health");
+      if (!r) throw new Error("health unreachable");
+      setHealth(String(r.status));
+      const { json: vj } = await tryFetchJSON(base, getHeaders, ["/version","/snapshot/version"]);
+      setVer(vj?.version ?? "-");
+    } catch (e:any) {
+      setHealth("error"); setVer("-"); setErrorMsg(e?.message || "health failed");
     }
   }, [base, getHeaders]);
 
-  // Snapshot + trends
-  const [snap, setSnap] = useState<Snapshot | null>(null);
-  const [history, setHistory] = useState<TrendPoint[]>([]);
-  const [trends, setTrends] = useState<TrendPoint[]>([]);
-  const [trendEndpoint, setTrendEndpoint] = useState<string>("(none)");
-  const pollRef = useRef<number | null>(null);
-  const countdownTimerRef = useRef<number | null>(null);
-
+  /* snapshot */
   const pushHistory = useCallback((s: Snapshot, tLabel?: string) => {
-    setHistory((prev) => [
-      ...prev.slice(-240),
-      { t: tLabel ?? new Date().toLocaleTimeString(), production_tph: s.production_tph, o2_percent: s.o2_percent, specific_power_kwh_per_ton: s.specific_power_kwh_per_ton },
-    ]);
+    setHistory(prev => [...prev.slice(-240), {
+      t: tLabel ?? new Date().toLocaleTimeString(),
+      production_tph: s.production_tph, o2_percent: s.o2_percent, specific_power_kwh_per_ton: s.specific_power_kwh_per_ton
+    }]);
   }, []);
-
   const fetchSnapshotFast = useCallback(async (): Promise<Snapshot | null> => {
     if (!base) return null;
-    const urls = [`${base}/snapshot`, `${base}/snapshot?source=bq`];
-    for (const u of urls) {
+    for (const p of ["/snapshot","/snapshot?source=bq"]) {
       try {
-        const r = await fetch(u, { headers: getHeaders });
+        const r = await fetch(`${base}${p}`, { headers: getHeaders });
         if (!r.ok) continue;
-        const j = (await r.json()) as Snapshot;
-        setSnap(j);
-        pushHistory(j);
-        return j;
+        const j = await r.json(); setSnap(j); pushHistory(j); return j;
       } catch {}
     }
     return null;
   }, [base, getHeaders, pushHistory]);
-
   const fetchSnapshot = useCallback(async () => {
-    if (!base) return;
     const s = await fetchSnapshotFast();
     if (!s) setErrorMsg("Failed to fetch snapshot");
-  }, [base, fetchSnapshotFast]);
+  }, [fetchSnapshotFast]);
 
+  /* trends */
   const fetchTrends = useCallback(async () => {
     if (!base) return;
-    setErrorMsg("");
     try {
-      const pathAuto = `/trends?minutes=120&limit=240&source=auto`;
-      const pathBQ = `/trends?minutes=120&limit=240&source=bq`;
-      const paths = trendSource === "bq" ? [pathBQ, pathAuto] : [pathAuto, pathBQ];
-      const { json: data, url } = await tryFetchJSON(base, getHeaders, paths);
-      if (!Array.isArray(data)) return;
-
-      setTrendEndpoint(url.replace(base, ""));
-      const diag = diagnoseTrends(data);
-      info(`Fetched ${data.length} trend rows from ${url}`, diag);
-
-      const cleaned = cleanTrends(data);
-      setTrends(cleaned.slice(-240));
-
-      if (snap && cleaned.length) {
-        const last = cleaned[cleaned.length - 1];
-        const diffPct = (a?: number | null, b?: number | null) => a != null && b != null && a !== 0 ? Math.abs((b - a) / a) * 100 : null;
-        info("Trend vs Snapshot mismatch (%)", {
-          prod: diffPct(last.production_tph ?? null, snap.production_tph ?? null),
-          o2: diffPct(last.o2_percent ?? null, snap.o2_percent ?? null),
-          sp: diffPct(last.specific_power_kwh_per_ton ?? null, snap.specific_power_kwh_per_ton ?? null),
-        });
+      const pathAuto = "/trends?minutes=120&limit=240&source=auto";
+      const pathBQ   = "/trends?minutes=120&limit=240&source=bq";
+      const { json, path } = await tryFetchJSON(base, getHeaders, trendSource === "bq" ? [pathBQ,pathAuto] : [pathAuto,pathBQ]);
+      setTrendEndpoint(path);
+      if (Array.isArray(json)) {
+        const sorted = json.slice().sort((a,b)=>new Date(a.ts??0).getTime()-new Date(b.ts??0).getTime());
+        const out: TrendPoint[] = [];
+        let lastProd: number | undefined;
+        for (const row of sorted) {
+          const parse = (v:any) => { if (v==null) return NaN; const s = typeof v === "string" ? v.replace(/,/g,"") : String(v); const n = Number(s); return Number.isFinite(n)?n:NaN; };
+          const prod = parse(row.production_tph), o2 = parse(row.o2_percent), sp = parse(row.specific_power_kwh_per_ton);
+          const prodGood = Number.isFinite(prod) && prod >= 0.5 && prod < 1000;
+          const o2Good = Number.isFinite(o2) && o2 >= 0 && o2 < 30;
+          const spGood = Number.isFinite(sp) && sp > 0 && sp < 200;
+          const spike = lastProd && prodGood ? Math.abs(prod-lastProd)/Math.max(1e-9,lastProd) > 0.30 : false;
+          const keepProd = prodGood && !spike ? prod : null;
+          if (keepProd !== null) lastProd = keepProd;
+          out.push({ t: row.ts ? new Date(row.ts).toLocaleTimeString() : "", production_tph: keepProd, o2_percent: o2Good?o2:null, specific_power_kwh_per_ton: spGood?sp:null });
+        }
+        setTrends(out.slice(-240));
       }
-    } catch (e: any) {
-      setErrorMsg((prev) => prev || e?.message || "Failed to fetch trends");
-      warn("fetchTrends failed", e);
+    } catch (e:any) {
+      setErrorMsg(prev => prev || e?.message || "Failed to fetch trends");
     }
-  }, [base, getHeaders, trendSource, snap]);
+  }, [base, getHeaders, trendSource]);
 
-  // last_runs with GET→POST fallback
+  /* last_runs */
   const fetchLastRuns = useCallback(async () => {
     if (!base || disableLastRunsRef.current) return;
     try {
-      const candidates = [`/debug/last_runs`, `/snapshot/last_runs`, `/last_runs`, `/debug/schedule`];
-      const { json, url, method } = await fetchJSONWithMethodFallback(base, getHeaders, postHeaders, candidates);
+      const { json } = await methodFallback(base, getHeaders, postHeaders, [
+        "/debug/last_runs", "/debug/last_runs/", "/snapshot/last_runs", "/snapshot/last_runs/", "/last_runs", "/last_runs/", "/debug/schedule", "/debug/schedule/"
+      ]);
       const j = json as LastRuns;
-      info(`last_runs via ${method} from ${url}`, j);
       setLastRuns(j);
-      setCountdown(j.seconds_to_next ?? null);
+      setCountdown(j?.seconds_to_next ?? null);
       setCountdownCause("");
-    } catch (e: any) {
-      // If we constantly get 405/Method Not Allowed for every candidate, stop polling to reduce noise.
+    } catch (e:any) {
       const msg = String(e?.message || e);
-      const looksLikeNoMethod = /405/.test(msg) || /Method Not Allowed/i.test(msg);
-      if (looksLikeNoMethod) {
-        disableLastRunsRef.current = true; // stop subsequent interval hits
-      }
-      setCountdown(null);
-      setLastRuns(null);
-      setCountdownCause(`Countdown unavailable: ${msg}. Tried GET then POST.`);
-      warn("fetchLastRuns error", msg);
+      if (/405|Method Not Allowed/i.test(msg)) disableLastRunsRef.current = true;
+      setCountdown(null); setLastRuns(null); setCountdownCause(`Countdown unavailable: ${msg}`);
     }
   }, [base, getHeaders, postHeaders]);
 
-  // --------- New: Routine latest probing ----------
-  const [routineOut, setRoutineOut] = useState<RoutineResp | null>(null);
-  const [lastSuggestionAt, setLastSuggestionAt] = useState<string | null>(null);
-  const cronProbeRef = useRef<number | null>(null);
-
+  /* /routine/latest (probe before/after ETA) */
   const fetchRoutineLatest = useCallback(async () => {
     if (!base) return false;
     try {
-      const r = await fetch(`${base}/routine/latest`, { headers: getHeaders });
-      if (!r.ok) return false;
-      const j: RoutineResp = await r.json();
-      const created = j?.created_at || null;
-      const isNewer =
-        created && (!lastSuggestionAt || new Date(created).getTime() > new Date(lastSuggestionAt).getTime());
-      const hasProposal = !!j?.proposed_setpoints && Object.keys(j.proposed_setpoints).length > 0;
-
-      if (isNewer || hasProposal) {
-        setRoutineOut(j);
-        setLastSuggestionAt(created);
-        info("Fetched /routine/latest", j);
+      const { json, method } = await methodFallback(base, getHeaders, postHeaders, ["/routine/latest","/routine/latest/"]);
+      setRoutineRaw(json);
+      const created = pickLatestTimestamp(json);
+      const proposed = pickProposal(json);
+      if (created) {
+        const isNewer = !latestSeenAt || new Date(created).getTime() > new Date(latestSeenAt).getTime();
+        if (isNewer) setLatestSeenAt(created);
+      }
+      if (proposed && Object.keys(proposed).length > 0) {
+        setRoutineOut({
+          suggestion_id: json?.suggestion_id,
+          created_at: created ?? undefined,
+          proposed_setpoints: proposed,
+          mode: json?.mode,
+          current: json?.current,
+          actuation: json?.actuation,
+          bq_log: json?.bq_log
+        });
+        info(`Fetched routine latest via ${method}`, json);
         return true;
       }
       return false;
     } catch {
       return false;
     }
-  }, [base, getHeaders, lastSuggestionAt]);
+  }, [base, getHeaders, postHeaders, latestSeenAt]);
 
-  // Kick a fetch once at mount / base change
-  useEffect(() => {
-    fetchRoutineLatest();
-  }, [fetchRoutineLatest]);
-
-  // When countdown reaches 0, probe /routine/latest for ~20s (every 2s)
-  useEffect(() => {
-    if (countdown !== 0) return;
-    let tries = 0;
+  const startCronProbe = useCallback(() => {
     if (cronProbeRef.current) window.clearInterval(cronProbeRef.current);
+    let elapsed = 0;
     cronProbeRef.current = window.setInterval(async () => {
-      tries += 1;
       const ok = await fetchRoutineLatest();
-      if (ok || tries >= 10) {
+      if (ok || elapsed >= 60000) {
         if (cronProbeRef.current) window.clearInterval(cronProbeRef.current);
         cronProbeRef.current = null;
       }
+      elapsed += 2000;
     }, 2000);
-    return () => {
-      if (cronProbeRef.current) window.clearInterval(cronProbeRef.current);
-      cronProbeRef.current = null;
-    };
-  }, [countdown, fetchRoutineLatest]);
+  }, [fetchRoutineLatest]);
 
-  // Also refresh when backend's last_cron_routine advances
   useEffect(() => {
-    if (!lastRuns?.last_cron_routine) return;
-    const isNewer =
-      !lastSuggestionAt ||
-      new Date(lastRuns.last_cron_routine).getTime() > new Date(lastSuggestionAt).getTime();
-    if (isNewer) {
-      fetchRoutineLatest();
-    }
-  }, [lastRuns?.last_cron_routine, lastSuggestionAt, fetchRoutineLatest]);
-  // ------------------------------------------------
+    if (countdown == null) return;
+    if (countdown <= 5) startCronProbe();
+  }, [countdown, startCronProbe]);
 
-  // polling (snapshot + last_runs)
   useEffect(() => {
-    const enabled = autoPoll === "1";
-    if (!enabled || !base) {
-      if (pollRef.current) window.clearInterval(pollRef.current);
-      pollRef.current = null;
-      return;
+    const ts = lastRuns?.last_cron_routine || null;
+    if (!ts) return;
+    if (!lastCronRef.current || new Date(ts).getTime() > new Date(lastCronRef.current).getTime()) {
+      lastCronRef.current = ts;
+      startCronProbe();
     }
-    // reset disabling if base changes or toggled
+  }, [lastRuns?.last_cron_routine, startCronProbe]);
+
+  /* polling */
+  useEffect(() => {
+    const enabled = autoPoll === "1" && !!base;
+    if (!enabled) { if (pollRef.current) window.clearInterval(pollRef.current); pollRef.current = null; return; }
     disableLastRunsRef.current = false;
 
-    fetchSnapshot().catch(() => {});
-    fetchLastRuns().catch(() => {});
+    fetchSnapshot().catch(()=>{});
+    fetchTrends().catch(()=>{});
+    fetchLastRuns().catch(()=>{});
     pollRef.current = window.setInterval(() => {
-      fetchSnapshot().catch(() => {});
-      fetchLastRuns().catch(() => {});
+      fetchSnapshot().catch(()=>{});
+      fetchLastRuns().catch(()=>{});
     }, 5000);
-    return () => {
-      if (pollRef.current) window.clearInterval(pollRef.current);
-      pollRef.current = null;
-    };
-  }, [autoPoll, base, fetchSnapshot, fetchLastRuns]);
+    return () => { if (pollRef.current) window.clearInterval(pollRef.current); pollRef.current = null; };
+  }, [autoPoll, base, fetchSnapshot, fetchTrends, fetchLastRuns]);
 
-  // countdown timer (single interval)
+  /* countdown tick */
   useEffect(() => {
-    if (countdown === null) {
-      if (countdownTimerRef.current) { window.clearInterval(countdownTimerRef.current); countdownTimerRef.current = null; }
-      return;
-    }
-    if (countdownTimerRef.current) window.clearInterval(countdownTimerRef.current);
-    countdownTimerRef.current = window.setInterval(() => {
-      setCountdown((c) => (c === null ? c : Math.max(0, c - 1)));
+    if (countdown === null) { if (countRef.current) window.clearInterval(countRef.current); countRef.current = null; return; }
+    if (countRef.current) window.clearInterval(countRef.current);
+    countRef.current = window.setInterval(() => {
+      setCountdown(c => (c==null ? c : Math.max(0, c - 1)));
     }, 1000);
-    return () => {
-      if (countdownTimerRef.current) window.clearInterval(countdownTimerRef.current);
-      countdownTimerRef.current = null;
-    };
+    return () => { if (countRef.current) window.clearInterval(countRef.current); countRef.current = null; };
   }, [countdown]);
 
-  // Metrics
-  const [metrics, setMetrics] = useState<any>(null);
-  const getMetrics = useCallback(async () => {
-    setErrorMsg("");
-    try {
-      const { json } = await tryFetchJSON(base, getHeaders, [`/metrics`, `/snapshot/metrics`]);
-      setMetrics(json);
-    } catch (e: any) { setErrorMsg(e?.message || "Failed to fetch metrics"); }
-  }, [base, getHeaders]);
-
-  // Routine controls
-  const [o2Min, setO2Min] = useState<string>("2.3");
-  const [o2Max, setO2Max] = useState<string>("4.5");
-  const [applyTop, setApplyTop] = useState<boolean>(false);
-  const [logSugg, setLogSugg] = useState<boolean>(true);
-  const [routineBefore, setRoutineBefore] = useState<Snapshot | null>(null);
-  const [routineAfter, setRoutineAfter] = useState<Snapshot | null>(null);
-
+  /* routine actions */
   const runRoutine = useCallback(async () => {
+    if (!base) return;
     setErrorMsg("");
     try {
-      const body: RoutineReq = {
-        constraints: { o2_percent: { min: Number(o2Min) || undefined, max: Number(o2Max) || undefined } },
-        apply_top: applyTop, log_suggestions: logSugg,
-      };
-      const s0 = snap ?? (await fetchSnapshotFast());
-      if (s0) setRoutineBefore({ ...s0 });
-
+      const body = { constraints: { o2_percent: { min: Number(o2Min)||undefined, max: Number(o2Max)||undefined } }, apply_top: applyTop, log_suggestions: logSugg };
+      const s0 = snap ?? (await fetchSnapshotFast()); if (s0) setRoutineBefore({ ...s0 });
       const r = await fetch(`${base}/optimize/routine`, { method: "POST", headers: postHeaders, body: JSON.stringify(body) });
       if (!r.ok) throw new Error(`/optimize/routine ${r.status}`);
       const j: RoutineResp = await r.json();
-      setRoutineOut(j);
-      setLastSuggestionAt(j?.created_at ?? null);
-
-      fetchLastRuns().catch(() => {});
-      if (j.applied && j.actuation?.after) {
+      setRoutineRaw(j);
+      setRoutineOut({
+        suggestion_id: j?.suggestion_id,
+        created_at: pickLatestTimestamp(j) ?? undefined,
+        proposed_setpoints: pickProposal(j),
+        mode: j?.mode,
+        current: j?.current,
+        actuation: j?.actuation,
+        bq_log: j?.bq_log
+      });
+      fetchLastRuns().catch(()=>{});
+      if (j?.actuation?.after) {
         const after = j.actuation.after as Snapshot;
-        setSnap(after); pushHistory(after); setRoutineAfter({ ...after }); await fetchTrends();
+        setSnap(after); setRoutineAfter({ ...after }); await fetchTrends();
       }
-    } catch (e: any) { setErrorMsg(e?.message || "Run routine failed"); }
-  }, [base, postHeaders, o2Min, o2Max, applyTop, logSugg, snap, fetchSnapshotFast, pushHistory, fetchTrends, fetchLastRuns]);
+    } catch (e:any) { setErrorMsg(e?.message || "Run routine failed"); }
+  }, [base, postHeaders, o2Min, o2Max, applyTop, logSugg, snap, fetchSnapshotFast, fetchTrends, fetchLastRuns]);
 
   const applyRoutineProposal = useCallback(async () => {
-    if (!routineOut?.proposed_setpoints) return;
-    setErrorMsg("");
+    const proposed = pickProposal(routineOut);
+    if (!proposed) return;
     try {
-      const body = { proposal: routineOut.proposed_setpoints, mode: "routine" };
-      const r = await fetch(`${base}/actuate/apply_stage`, { method: "POST", headers: postHeaders, body: JSON.stringify(body) });
+      const r = await fetch(`${base}/actuate/apply_stage`, { method: "POST", headers: postHeaders, body: JSON.stringify({ proposal: proposed, mode: "routine" }) });
       if (!r.ok) throw new Error(`/actuate/apply_stage ${r.status}`);
       const j: ApplyResp = await r.json();
-      let after: Snapshot | null = j.after ? (j.after as Snapshot) : await fetchSnapshotFast();
-      if (after) { setSnap(after); pushHistory(after); setRoutineAfter({ ...after }); await fetchTrends(); }
-      fetchLastRuns().catch(() => {});
-    } catch (e: any) { setErrorMsg(e?.message || "Apply failed"); }
-  }, [base, postHeaders, routineOut, fetchSnapshotFast, pushHistory, fetchTrends, fetchLastRuns]);
+      const after: Snapshot | null = (j.after as Snapshot) || (await fetchSnapshotFast());
+      if (after) { setSnap(after); setRoutineAfter({ ...after }); await fetchTrends(); }
+      fetchLastRuns().catch(()=>{});
+    } catch (e:any) { setErrorMsg(e?.message || "Apply failed"); }
+  }, [base, postHeaders, routineOut, fetchSnapshotFast, fetchTrends, fetchLastRuns]);
 
   const rejectRoutine = useCallback(() => {
-    setRoutineOut((x) => (x ? { ...x, applied: false } : x));
-    setRoutineBefore(null); setRoutineAfter(null);
+    setRoutineOut(null); setRoutineBefore(null); setRoutineAfter(null);
   }, []);
 
-  const suggestionLines = useMemo(
-    () => deriveSuggestionLines(snap, routineOut?.proposed_setpoints, { o2_percent: { min: Number(o2Min), max: Number(o2Max) } }),
-    [snap, routineOut, o2Min, o2Max]
-  );
-
-  // Load planning
-  const [loadMode, setLoadMode] = useState<"pct" | "abs" | "target">("pct");
-  const [steps, setSteps] = useState<string>("3");
-  const [direction, setDirection] = useState<"up" | "down">("up");
-  const [val, setVal] = useState<string>("8");
-  const [loadOut, setLoadOut] = useState<LoadResp | null>(null);
-  const [loadBefore, setLoadBefore] = useState<Snapshot | null>(null);
-  const [loadAfter, setLoadAfter] = useState<Snapshot | null>(null);
+  /* load planning */
+  const [loadMode, setLoadMode] = useState<"pct"|"abs"|"target">("pct");
+  const [steps, setSteps] = useState("3");
+  const [direction, setDirection] = useState<"up"|"down">("up");
+  const [val, setVal] = useState("8");
 
   const runLoad = useCallback(async () => {
-    setErrorMsg("");
+    if (!base) return;
     try {
-      const body: LoadReq = { steps: Number(steps) || 3, direction } as any;
-      if (loadMode === "pct") body.delta_pct = Number(val);
-      if (loadMode === "abs") body.delta_abs = Number(val);
-      if (loadMode === "target") body.target_tph = Number(val);
-
+      const body: any = { steps: Number(steps)||3, direction };
+      if (loadMode==="pct") body.delta_pct = Number(val);
+      if (loadMode==="abs") body.delta_abs = Number(val);
+      if (loadMode==="target") body.target_tph = Number(val);
       const r = await fetch(`${base}/optimize/load`, { method: "POST", headers: postHeaders, body: JSON.stringify(body) });
       if (!r.ok) throw new Error(`/optimize/load ${r.status}`);
-      const j: LoadResp = await r.json();
-      setLoadOut(j);
-
-      const s0 = snap ?? (await fetchSnapshotFast());
-      if (s0) setLoadBefore({ ...s0 });
-      setLoadAfter(null);
-    } catch (e: any) { setErrorMsg(e?.message || "Create plan failed"); }
+      const j: LoadResp = await r.json(); setLoadOut(j);
+      const s0 = snap ?? (await fetchSnapshotFast()); if (s0) setLoadBefore({ ...s0 }); setLoadAfter(null);
+    } catch (e:any) { setErrorMsg(e?.message || "Create plan failed"); }
   }, [base, postHeaders, steps, direction, val, loadMode, fetchSnapshotFast, snap]);
 
-  const parseStepDwells = useCallback((nStages: number): number[] => {
-    const parts = stepDwellCsv.split(",").map((s) => Number(s.trim())).filter((x) => Number.isFinite(x) && x >= 0);
-    if (parts.length === 0) return Array(nStages).fill(20);
-    const out: number[] = [];
-    for (let i = 0; i < nStages; i++) out.push(parts[i] ?? parts[0]);
-    return out;
+  const parseStepDwells = useCallback((n: number) => {
+    const parts = stepDwellCsv.split(",").map(s=>Number(s.trim())).filter(x=>Number.isFinite(x)&&x>=0);
+    if (parts.length===0) return Array(n).fill(20);
+    return Array.from({length:n}, (_,i)=>parts[i] ?? parts[0]);
   }, [stepDwellCsv]);
 
   const applyStage = useCallback(async (i: number) => {
     if (!loadOut) return;
-    setErrorMsg("");
     try {
-      const body = { stage: loadOut.stages[i], mode: loadOut.mode, plan_id: loadOut.plan_id, stage_index: i };
-      const r = await fetch(`${base}/actuate/apply_stage`, { method: "POST", headers: postHeaders, body: JSON.stringify(body) });
+      const r = await fetch(`${base}/actuate/apply_stage`, {
+        method: "POST", headers: postHeaders,
+        body: JSON.stringify({ stage: loadOut.stages[i], mode: loadOut.mode, plan_id: loadOut.plan_id, stage_index: i })
+      });
       if (!r.ok) throw new Error(`/actuate/apply_stage ${r.status}`);
       const j: ApplyResp = await r.json();
-
-      let after: Snapshot | null = j.after ? (j.after as Snapshot) : await fetchSnapshotFast();
+      const after: Snapshot | null = (j.after as Snapshot) || (await fetchSnapshotFast());
       if (after) {
-        setSnap(after); pushHistory(after);
+        setSnap(after);
         if (i === loadOut.stages.length - 1) setLoadAfter({ ...after });
-        setRoutineBefore(null); setRoutineAfter(null);
         await fetchTrends();
       }
-      fetchLastRuns().catch(() => {});
-    } catch (e: any) { setErrorMsg(e?.message || `Apply stage ${i + 1} failed`); }
-  }, [base, postHeaders, loadOut, fetchSnapshotFast, pushHistory, fetchTrends, fetchLastRuns]);
+      fetchLastRuns().catch(()=>{});
+    } catch (e:any) { setErrorMsg(e?.message || `Apply stage ${i+1} failed`); }
+  }, [base, postHeaders, loadOut, fetchSnapshotFast, fetchTrends, fetchLastRuns]);
 
-  const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
-  const applyAllStages = useCallback(async () => {
+  const sleep = (ms:number)=>new Promise(res=>setTimeout(res,ms));
+  const applyAllStages = useCallback( async () => {
     if (!loadOut) return;
-    if (!loadBefore) {
-      const s0 = snap ?? (await fetchSnapshotFast());
-      if (s0) setLoadBefore({ ...s0 });
-    }
+    if (!loadBefore) { const s0 = snap ?? (await fetchSnapshotFast()); if (s0) setLoadBefore({ ...s0 }); }
     const dwells = parseStepDwells(loadOut.stages.length);
-    for (let i = 0; i < loadOut.stages.length; i++) {
-      await applyStage(i);
-      await sleep(Math.max(0, (dwells[i] ?? 0) * 1000));
-    }
-    if (!loadAfter) {
-      const s1 = await fetchSnapshotFast();
-      if (s1) setLoadAfter({ ...s1 });
-    }
+    for (let i=0;i<loadOut.stages.length;i++){ await applyStage(i); await sleep(Math.max(0,(dwells[i]??0)*1000)); }
+    if (!loadAfter) { const s1 = await fetchSnapshotFast(); if (s1) setLoadAfter({ ...s1 }); }
   }, [loadOut, applyStage, loadBefore, fetchSnapshotFast, snap, loadAfter, parseStepDwells]);
 
-  const acceptPlan = useCallback(async () => { if (loadOut) await applyAllStages(); }, [loadOut, applyAllStages]);
-  const rejectPlan = useCallback(() => { setLoadOut(null); setLoadBefore(null); setLoadAfter(null); }, []);
-
-  const kpi = snap;
-  const chartData: TrendPoint[] = trends.length ? trends : history;
-
+  /* deltas */
   const finalDeltaLoad = useMemo(() => {
     if (!loadBefore || !loadAfter) return null;
     const keys: (keyof Snapshot)[] = [
@@ -642,39 +465,42 @@ export default function PlantAgentDashboard() {
     });
   }, [routineBefore, routineAfter]);
 
+  /* responsive chart */
   const chartBoxRef = useRef<HTMLDivElement | null>(null);
   const [chartBoxSize, setChartBoxSize] = useState({ w: 0, h: 0 });
   useEffect(() => {
     if (!chartBoxRef.current) return;
     const ro = new ResizeObserver((entries) => {
-      for (const e of entries) setChartBoxSize({ w: Math.floor(e.contentRect.width), h: Math.floor(e.contentRect.height) });
+      for (const e of entries) setChartBoxSize({ w: Math.floor(e.contentRect.width), h: 224 });
     });
     ro.observe(chartBoxRef.current);
     return () => ro.disconnect();
   }, []);
 
+  const kpi = snap;
+  const chartData: TrendPoint[] = trends.length ? trends : history;
   const nextLabel = useMemo(() => {
-    if (countdown === null || countdown === undefined) return "-";
-    const m = Math.floor(countdown / 60); const ss = countdown % 60;
-    return `${m}:${String(ss).padStart(2, "0")} to next routine`;
+    if (countdown == null) return "-";
+    const m = Math.floor(countdown/60); const s = countdown%60;
+    return `${m}:${String(s).padStart(2,"0")} to next routine`;
   }, [countdown]);
-
-  const mismatchBanner = useMemo(() => {
-    if (!snap || chartData.length === 0) return null;
-    const last = chartData[chartData.length - 1];
-    const pct = (a?: number | null, b?: number | null) => a != null && b != null && a !== 0 ? Math.abs((b - a) / a) * 100 : null;
-    const prod = pct(last.production_tph, snap.production_tph) ?? 0;
-    const o2 = pct(last.o2_percent, snap.o2_percent) ?? 0;
-    const sp = pct(last.specific_power_kwh_per_ton, snap.specific_power_kwh_per_ton) ?? 0;
-    const bad = (prod > 8) || (o2 > 8) || (sp > 8);
-    if (!bad) return null;
-    return (
-      <div className="banner-warn">
-        Trend latest vs snapshot differs &gt;8% — check data source or timezone/ordering.
-        <span className="ml-2 font-mono">Δ% prod={fmt(prod,2)}, O₂={fmt(o2,2)}, SP={fmt(sp,2)} • trends from {trendEndpoint}</span>
-      </div>
-    );
-  }, [snap, chartData, trendEndpoint]);
+  const suggestionLines = useMemo(() => {
+    const proposed = pickProposal(routineOut);
+    if (!snap || !proposed) return [];
+    const out: string[] = [];
+    for (const [lever, p] of Object.entries(proposed)) {
+      const cur = Number((snap as any)[lever]); const prop = Number(p);
+      const pct = Number.isFinite(cur) && cur !== 0 && Number.isFinite(prop) ? ((prop - cur) / cur) * 100 : undefined;
+      const base =
+        pct == null ? `${lever}: set to ${fmt(prop)}`
+        : pct > 0 ? `Increase ${lever} by ~${fmt(Math.abs(pct),1)}% to ${fmt(prop)}`
+        : pct < 0 ? `Reduce ${lever} by ~${fmt(Math.abs(pct),1)}% to ${fmt(prop)}`
+        : `Hold ${lever} at ${fmt(prop)}`;
+      const deltaAbs = Number.isFinite(cur) && Number.isFinite(prop) ? prop - cur : undefined;
+      out.push(base + (deltaAbs !== undefined ? ` (Δabs ${deltaAbs >= 0 ? "+" : ""}${fmt(deltaAbs)})` : ""));
+    }
+    return out;
+  }, [snap, routineOut]);
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900">
@@ -682,19 +508,12 @@ export default function PlantAgentDashboard() {
         <div className="mx-auto max-w-7xl px-4 py-3 flex items-center gap-3">
           <div className="text-xl font-semibold">Plant Agent – Dashboard</div>
           <div className="ml-auto flex items-center gap-2 text-sm">
-            <Chip tone="slate">ver {ver || "-"}</Chip>
-            <Chip tone={health === "200" ? "green" : "rose"}>health {health || "-"}</Chip>
-            <Chip tone="indigo">
-              {lastRuns?.last_cron_routine ? `last routine: ${new Date(lastRuns.last_cron_routine).toLocaleString()}` : "last routine: -"}
-            </Chip>
+            <Chip tone="slate">ver {ver}</Chip>
+            <Chip tone={health==="200"?"green":"rose"}>health {health}</Chip>
+            <Chip tone="indigo">{lastRuns?.last_cron_routine ? `last routine: ${new Date(lastRuns.last_cron_routine).toLocaleString()}` : "last routine: -"}</Chip>
             <Chip tone="amber">{nextLabel}</Chip>
             <label className="ml-2 inline-flex items-center gap-1 text-xs cursor-pointer">
-              <input
-                type="checkbox"
-                checked={debugUI}
-                onChange={(e) => { setDebug(e.target.checked); setDebugUI(e.target.checked); info("Debug toggled", e.target.checked); }}
-              />
-              Debug
+              <input type="checkbox" checked={getDebug()} onChange={(e)=>{ setDebug(e.target.checked); }} /> Debug
             </label>
           </div>
         </div>
@@ -703,47 +522,42 @@ export default function PlantAgentDashboard() {
       <main className="mx-auto max-w-7xl p-4 space-y-6">
         {/* Connection */}
         <section className="bg-white rounded-2xl shadow-sm border border-slate-200 p-4">
-          <div className="flex flex-col md:flex-row gap-3 md:items-end">
+          <div className="flex flex-col lg:flex-row gap-3 lg:items-end">
             <div className="flex-1">
               <label className="text-xs text-slate-500">API Base URL</label>
-              <input value={baseRaw} onChange={(e) => setBaseRaw(e.target.value)} placeholder="https://<cloud-run-url>" className="w-full mt-1 px-3 py-2 border rounded-xl" />
+              <input value={baseRaw} onChange={(e)=>setBaseRaw(e.target.value)} placeholder="https://<cloud-run-url>" className="w-full mt-1 px-3 py-2 border rounded-xl" />
               <div className="mt-1 text-[11px] text-slate-500">Using: <span className="font-mono">{base || "—"}</span></div>
             </div>
             <div className="flex-1">
               <label className="text-xs text-slate-500">ID Token (optional for private)</label>
-              <input value={token} onChange={(e) => setToken(e.target.value)} placeholder="paste gcloud-issued ID token" className="w-full mt-1 px-3 py-2 border rounded-xl" />
+              <input value={token} onChange={(e)=>setToken(e.target.value)} placeholder="paste gcloud-issued ID token" className="w-full mt-1 px-3 py-2 border rounded-xl" />
             </div>
+            <button onClick={()=>setBaseRaw(RECOMMENDED_HOST)} className="btn-secondary">Use recommended host</button>
             <button onClick={fetchHealth} className="btn-outline" disabled={!base}>Check</button>
           </div>
           <div className="mt-3 flex items-center gap-3 text-sm flex-wrap">
             <label className="inline-flex items-center gap-2">
-              <input type="checkbox" checked={autoPoll === "1"} onChange={(e) => setAutoPoll(e.target.checked ? "1" : "0")} /> Auto-refresh snapshot
+              <input type="checkbox" checked={autoPoll==="1"} onChange={(e)=>setAutoPoll(e.target.checked?"1":"0")} /> Auto-refresh snapshot
             </label>
             <div className="inline-flex items-center gap-2">
               <span className="text-xs text-slate-500">Trend source</span>
-              <select value={trendSource} onChange={(e) => setTrendSource(e.target.value)} className="px-2 py-1 border rounded-xl text-xs">
+              <select value={trendSource} onChange={(e)=>setTrendSource(e.target.value)} className="px-2 py-1 border rounded-xl text-xs">
                 <option value="auto">auto</option>
                 <option value="bq">bq</option>
               </select>
               <span className="text-xs text-slate-500">from <span className="font-mono">{trendEndpoint}</span></span>
             </div>
-            <button onClick={() => { fetchSnapshot(); getMetrics(); fetchTrends(); fetchLastRuns(); fetchRoutineLatest(); }} className="btn-outline">Refresh now</button>
+            <button onClick={()=>{ fetchSnapshot(); fetchTrends(); fetchLastRuns(); fetchRoutineLatest(); }} className="btn-outline">Refresh now</button>
             {errorMsg ? <span className="text-rose-600">• {errorMsg}</span> : null}
           </div>
-
-          {/* Countdown fetch cause */}
           {countdown == null && (
             <div className="banner-info mt-3">
-              {countdownCause
-                ? <span>{countdownCause}</span>
-                : <span>Countdown unavailable.</span>}
-              {" "}If your backend only supports POST for last-run info, we already retried with POST.
-              Exposed keys expected: <code>seconds_to_next, next_cron_eta, sched_period_sec</code>.
+              {countdownCause || "Countdown unavailable."} We try both GET and POST for last-run info.
             </div>
           )}
         </section>
 
-        {/* KPI Tiles */}
+        {/* KPI */}
         <section className="grid md:grid-cols-5 gap-4">
           {[
             { label: "Production (tph)", val: kpi?.production_tph },
@@ -752,53 +566,47 @@ export default function PlantAgentDashboard() {
             { label: "Kiln Feed (tph)", val: kpi?.kiln_feed_tph },
             { label: "Separator ΔP (Pa)", val: kpi?.separator_dp_pa },
           ].map((t, idx) => (
-            <div key={idx} className="bg-white rounded-2xl shadow-sm border border-slate-200 p-4">
+            <div key={idx} className="tile">
               <div className="text-xs text-slate-500">{t.label}</div>
               <div className="text-2xl font-semibold mt-1">{fmt(t.val, 3)}</div>
             </div>
           ))}
         </section>
 
-        {/* Mismatch banner */}
-        {mismatchBanner}
-
-        {/* Suggestions (Routine) */}
-        <section className="bg-white rounded-2xl shadow-sm border border-slate-200 p-4">
+        {/* Suggestions */}
+        <section className="card">
           <div className="flex items-center justify-between">
             <div className="font-semibold">Suggestions</div>
             <div className="text-xs text-slate-500">
-              latest routine run: {routineOut?.created_at ? new Date(routineOut.created_at).toLocaleString() : "-"}
+              latest routine run: {pickLatestTimestamp(routineOut) ? new Date(pickLatestTimestamp(routineOut) as string).toLocaleString() : "-"}
               {routineOut?.suggestion_id ? <span className="ml-2">• id: <span className="font-mono">{routineOut.suggestion_id}</span></span> : null}
             </div>
           </div>
-          {(() => {
-            const lines = suggestionLines;
-            return lines.length ? (
-              <ul className="mt-3 list-disc pl-6 text-sm space-y-1">{lines.map((s, i) => (<li key={i}>{s}</li>))}</ul>
-            ) : (
-              <div className="mt-3 text-sm text-slate-500">
-                {countdown === 0
-                  ? "Waiting for cron suggestion… probing /routine/latest."
-                  : "Run a routine optimization to populate suggestions."}
-              </div>
-            );
-          })()}
+          {suggestionLines.length ? (
+            <ul className="mt-3 list-disc pl-6 text-sm space-y-1">
+              {suggestionLines.map((s,i)=><li key={i}>{s}</li>)}
+            </ul>
+          ) : (
+            <div className="mt-3 text-sm text-slate-500">
+              {countdown !== null ? "Waiting for the next cron suggestion… we’ll auto-fetch around the scheduled time." : "Run a routine optimization to populate suggestions."}
+            </div>
+          )}
           <div className="mt-3 flex gap-2">
-            <button onClick={applyRoutineProposal} disabled={!routineOut?.proposed_setpoints} className="btn-primary">Accept & Apply</button>
+            <button onClick={applyRoutineProposal} disabled={!pickProposal(routineOut)} className="btn-primary">Accept & Apply</button>
             <button onClick={rejectRoutine} className="btn-danger">Reject</button>
           </div>
         </section>
 
         {/* Trends + Snapshot */}
         <section className="grid md:grid-cols-2 gap-4">
-          <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-4">
+          <div className="card">
             <div className="font-semibold mb-1">Important Trends (last 2 hours)</div>
             <div className="text-xs text-slate-500 mb-2">
-              {(trends.length ? trends : history).length ? `Loaded ${(trends.length ? trends : history).length} points from ${trendEndpoint}` : "Waiting for data…"}
+              {chartData.length ? `Loaded ${chartData.length} points from ${trendEndpoint}` : "Waiting for data…"}
             </div>
             <div ref={chartBoxRef} className="h-56 w-full">
-              {(trends.length ? trends : history).length > 0 && chartBoxSize.w > 0 && chartBoxSize.h > 0 ? (
-                <LineChart width={chartBoxSize.w} height={chartBoxSize.h} data={trends.length ? trends : history} margin={{ top: 8, right: 32, left: 8, bottom: 8 }}>
+              {(chartData.length && chartBoxSize.w>0) ? (
+                <LineChart width={chartBoxSize.w} height={chartBoxSize.h} data={chartData} margin={{ top: 8, right: 32, left: 8, bottom: 8 }}>
                   <CartesianGrid stroke="#e2e8f0" strokeDasharray="3 3" />
                   <XAxis dataKey="t" tick={{ fill: "#334155", fontSize: 12 }} axisLine={{ stroke: "#94a3b8" }} tickLine={{ stroke: "#94a3b8" }} />
                   <YAxis yAxisId="left" domain={["auto","auto"]} tick={{ fill: "#334155", fontSize: 12 }} axisLine={{ stroke: "#94a3b8" }} tickLine={{ stroke: "#94a3b8" }} />
@@ -814,43 +622,41 @@ export default function PlantAgentDashboard() {
             </div>
           </div>
 
-          <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-4">
+          <div className="card">
             <div className="font-semibold mb-2">Current Snapshot</div>
             {snap ? (
               <div className="grid grid-cols-2 gap-2 text-sm">
-                {Object.entries(snap).map(([k, v]) => (
+                {Object.entries(snap).map(([k,v])=>(
                   <div key={k} className="flex justify-between border-b py-1">
                     <span className="text-slate-500">{k}</span>
                     <span className="font-mono">{fmt(Number(v))}</span>
                   </div>
                 ))}
               </div>
-            ) : (
-              <div className="text-slate-500 text-sm">No snapshot yet.</div>
-            )}
+            ) : <div className="text-slate-500 text-sm">No snapshot yet.</div>}
           </div>
         </section>
 
         {/* Routine Controls */}
-        <section className="bg-white rounded-2xl shadow-sm border border-slate-200 p-4">
+        <section className="card">
           <div className="flex items-center justify-between">
             <div className="font-semibold">Routine Optimization</div>
-            <div className="text-xs text-slate-500">Logs to routine_suggestions_v2 (+ suggestions_v1)</div>
+            <div className="text-xs text-slate-500">Logs to routine_suggestions_v2 (and suggestions_v1)</div>
           </div>
           <div className="mt-3 grid md:grid-cols-7 gap-3 items-end">
             <div>
               <label className="text-xs text-slate-500">O₂ min</label>
-              <input value={o2Min} onChange={(e) => setO2Min(e.target.value)} className="w-full mt-1 px-3 py-2 border rounded-xl" />
+              <input value={o2Min} onChange={(e)=>setO2Min(e.target.value)} className="w-full mt-1 px-3 py-2 border rounded-xl" />
             </div>
             <div>
               <label className="text-xs text-slate-500">O₂ max</label>
-              <input value={o2Max} onChange={(e) => setO2Max(e.target.value)} className="w-full mt-1 px-3 py-2 border rounded-xl" />
+              <input value={o2Max} onChange={(e)=>setO2Max(e.target.value)} className="w-full mt-1 px-3 py-2 border rounded-xl" />
             </div>
             <label className="inline-flex items-center gap-2 text-sm">
-              <input type="checkbox" checked={applyTop} onChange={(e) => setApplyTop(e.target.checked)} /> Apply top
+              <input type="checkbox" checked={applyTop} onChange={(e)=>setApplyTop(e.target.checked)} /> Apply top
             </label>
             <label className="inline-flex items-center gap-2 text-sm">
-              <input type="checkbox" checked={logSugg} onChange={(e) => setLogSugg(e.target.checked)} /> Log suggestions
+              <input type="checkbox" checked={logSugg} onChange={(e)=>setLogSugg(e.target.checked)} /> Log suggestions
             </label>
             <button onClick={runRoutine} className="btn-secondary" disabled={!base}>Run routine</button>
             <div className="text-xs text-slate-500 col-span-2">
@@ -860,15 +666,15 @@ export default function PlantAgentDashboard() {
         </section>
 
         {/* Load Planning */}
-        <section className="bg-white rounded-2xl shadow-sm border border-slate-200 p-4">
+        <section className="card">
           <div className="flex items-center justify-between">
             <div className="font-semibold">Load Planning</div>
-            <div className="text-xs text-slate-500">latest plan: {loadOut?.created_at ? new Date(loadOut.created_at).toLocaleString() : "-"} • id: {loadOut?.plan_id || "-"}</div>
+            <div className="text-xs text-slate-500">latest plan: {loadOut?.created_at ? new Date(loadOut.created_at).toLocaleString() : "-" } • id: {loadOut?.plan_id || "-"}</div>
           </div>
           <div className="mt-3 grid md:grid-cols-7 gap-3 items-end">
             <div>
               <label className="text-xs text-slate-500">Approach</label>
-              <select value={loadMode} onChange={(e) => setLoadMode(e.target.value as any)} className="w-full mt-1 px-3 py-2 border rounded-xl">
+              <select value={loadMode} onChange={(e)=>setLoadMode(e.target.value as any)} className="w-full mt-1 px-3 py-2 border rounded-xl">
                 <option value="pct">delta_pct %</option>
                 <option value="abs">delta_abs (tph)</option>
                 <option value="target">target_tph</option>
@@ -876,22 +682,22 @@ export default function PlantAgentDashboard() {
             </div>
             <div>
               <label className="text-xs text-slate-500">Value</label>
-              <input value={val} onChange={(e) => setVal(e.target.value)} className="w-full mt-1 px-3 py-2 border rounded-xl" />
+              <input value={val} onChange={(e)=>setVal(e.target.value)} className="w-full mt-1 px-3 py-2 border rounded-xl" />
             </div>
             <div>
               <label className="text-xs text-slate-500">Steps</label>
-              <input value={steps} onChange={(e) => setSteps(e.target.value)} className="w-full mt-1 px-3 py-2 border rounded-xl" />
+              <input value={steps} onChange={(e)=>setSteps(e.target.value)} className="w-full mt-1 px-3 py-2 border rounded-xl" />
             </div>
             <div>
               <label className="text-xs text-slate-500">Direction</label>
-              <select value={direction} onChange={(e) => setDirection(e.target.value as any)} className="w-full mt-1 px-3 py-2 border rounded-xl">
+              <select value={direction} onChange={(e)=>setDirection(e.target.value as any)} className="w-full mt-1 px-3 py-2 border rounded-xl">
                 <option value="up">up</option>
                 <option value="down">down</option>
               </select>
             </div>
             <div className="col-span-2">
               <label className="text-xs text-slate-500">Step dwell seconds (CSV; per-stage)</label>
-              <input value={stepDwellCsv} onChange={(e) => setStepDwellCsv(e.target.value)} className="w-full mt-1 px-3 py-2 border rounded-xl font-mono" />
+              <input value={stepDwellCsv} onChange={(e)=>setStepDwellCsv(e.target.value)} className="w-full mt-1 px-3 py-2 border rounded-xl font-mono" />
             </div>
             <button onClick={runLoad} className="btn-indigo" disabled={!base}>Create plan</button>
           </div>
@@ -913,7 +719,7 @@ export default function PlantAgentDashboard() {
                       </div>
                     ))}
                   </div>
-                  <button onClick={acceptPlan} className="mt-3 btn-primary">Accept & Apply All</button>
+                  <button onClick={applyAllStages} className="mt-3 btn-primary">Accept & Apply All</button>
                 </div>
                 <div>
                   <div className="text-sm font-medium mb-1">BigQuery log</div>
@@ -926,7 +732,7 @@ export default function PlantAgentDashboard() {
 
         {/* Final After Routine Summary */}
         {(routineBefore && routineAfter && finalDeltaRoutine) && (
-          <section className="bg-white rounded-2xl shadow-sm border border-emerald-200 p-4">
+          <section className="card border-emerald-200">
             <div className="flex items-center justify-between">
               <div className="font-semibold">Final Changes After Routine</div>
               <div className="text-xs text-slate-500">id: {routineOut?.suggestion_id || "-"}</div>
@@ -940,15 +746,15 @@ export default function PlantAgentDashboard() {
                 </thead>
                 <tbody>
                   {finalDeltaRoutine.map((r) => (
-                    <tr key={r.k} className="border-b last:border-0">
+                    <tr key={String(r.k)} className="border-b last:border-0">
                       <td className="py-2 pr-4 font-medium">{String(r.k)}</td>
-                      <td className="py-2 pr-4 font-mono">{fmt(r.before)}</td>
-                      <td className="py-2 pr-4 font-mono">{fmt(r.after)}</td>
-                      <td className={cls("py-2 pr-4 font-mono", (r.delta ?? 0) >= 0 ? "text-emerald-700" : "text-rose-700")}>
-                        {r.delta !== undefined ? (r.delta >= 0 ? "+" : "") + fmt(r.delta) : "-"}
+                      <td className="py-2 pr-4 font-mono">{fmt((r as any).before)}</td>
+                      <td className="py-2 pr-4 font-mono">{fmt((r as any).after)}</td>
+                      <td className={cls("py-2 pr-4 font-mono", ((r as any).delta ?? 0) >= 0 ? "text-emerald-700" : "text-rose-700")}>
+                        {(r as any).delta !== undefined ? (((r as any).delta >= 0 ? "+" : "") + fmt((r as any).delta)) : "-"}
                       </td>
-                      <td className={cls("py-2 pr-4 font-mono", (r.pct ?? 0) >= 0 ? "text-emerald-700" : "text-rose-700")}>
-                        {r.pct !== undefined ? (r.pct >= 0 ? "+" : "") + fmt(r.pct, 2) + "%" : "-"}
+                      <td className={cls("py-2 pr-4 font-mono", ((r as any).pct ?? 0) >= 0 ? "text-emerald-700" : "text-rose-700")}>
+                        {(r as any).pct !== undefined ? (((r as any).pct >= 0 ? "+" : "") + fmt((r as any).pct, 2) + "%") : "-"}
                       </td>
                     </tr>
                   ))}
@@ -960,7 +766,7 @@ export default function PlantAgentDashboard() {
 
         {/* Final After Load-Up Summary */}
         {(loadBefore && loadAfter && finalDeltaLoad) && (
-          <section className="bg-white rounded-2xl shadow-sm border border-emerald-200 p-4">
+          <section className="card border-emerald-200">
             <div className="flex items-center justify-between">
               <div className="font-semibold">Final Changes After Load-Up</div>
               <div className="text-xs text-slate-500">plan id: {loadOut?.plan_id || "-"}</div>
@@ -974,15 +780,15 @@ export default function PlantAgentDashboard() {
                 </thead>
                 <tbody>
                   {finalDeltaLoad.map((r) => (
-                    <tr key={r.k} className="border-b last:border-0">
+                    <tr key={String(r.k)} className="border-b last:border-0">
                       <td className="py-2 pr-4 font-medium">{String(r.k)}</td>
-                      <td className="py-2 pr-4 font-mono">{fmt(r.before)}</td>
-                      <td className="py-2 pr-4 font-mono">{fmt(r.after)}</td>
-                      <td className={cls("py-2 pr-4 font-mono", (r.delta ?? 0) >= 0 ? "text-emerald-700" : "text-rose-700")}>
-                        {r.delta !== undefined ? (r.delta >= 0 ? "+" : "") + fmt(r.delta) : "-"}
+                      <td className="py-2 pr-4 font-mono">{fmt((r as any).before)}</td>
+                      <td className="py-2 pr-4 font-mono">{fmt((r as any).after)}</td>
+                      <td className={cls("py-2 pr-4 font-mono", ((r as any).delta ?? 0) >= 0 ? "text-emerald-700" : "text-rose-700")}>
+                        {(r as any).delta !== undefined ? (((r as any).delta >= 0 ? "+" : "") + fmt((r as any).delta)) : "-"}
                       </td>
-                      <td className={cls("py-2 pr-4 font-mono", (r.pct ?? 0) >= 0 ? "text-emerald-700" : "text-rose-700")}>
-                        {r.pct !== undefined ? (r.pct >= 0 ? "+" : "") + fmt(r.pct, 2) + "%" : "-"}
+                      <td className={cls("py-2 pr-4 font-mono", ((r as any).pct ?? 0) >= 0 ? "text-emerald-700" : "text-rose-700")}>
+                        {(r as any).pct !== undefined ? (((r as any).pct >= 0 ? "+" : "") + fmt((r as any).pct, 2) + "%") : "-"}
                       </td>
                     </tr>
                   ))}
@@ -993,43 +799,72 @@ export default function PlantAgentDashboard() {
         )}
 
         {/* Metrics */}
-        <section className="bg-white rounded-2xl shadow-sm border border-slate-200 p-4">
-          <div className="flex items-center justify-between">
-            <div className="font-semibold">Metrics</div>
-            <button onClick={getMetrics} className="btn-outline">Refresh</button>
-          </div>
-          <pre className="text-xs bg-slate-50 border rounded-2xl p-3 overflow-auto mt-2">{JSON.stringify(metrics, null, 2)}</pre>
-        </section>
-      </main>
+        <MetricsBlock base={base} getHeaders={getHeaders} />
 
-      {/* Debug panel */}
-      {getDebug() && (
-        <section className="bg-slate-900 text-slate-100 rounded-2xl border border-slate-700 p-4">
-          <div className="font-semibold mb-2">Debug</div>
-          <div className="grid md:grid-cols-3 gap-4 text-xs">
-            <div>
-              <div className="opacity-80 mb-1">last_runs (raw)</div>
-              <pre className="bg-black/50 p-2 rounded-lg overflow-auto max-h-40">{JSON.stringify(lastRuns, null, 2)}</pre>
+        {/* Debug */}
+        {getDebug() && (
+          <section className="debug-card">
+            <div className="font-semibold mb-2">Debug</div>
+            <div className="grid md:grid-cols-3 gap-4 text-xs">
+              <div>
+                <div className="opacity-80 mb-1">last_runs</div>
+                <pre className="debug-pre">{JSON.stringify(lastRuns,null,2)}</pre>
+              </div>
+              <div>
+                <div className="opacity-80 mb-1">/routine/latest (raw)</div>
+                <pre className="debug-pre">{JSON.stringify(routineRaw ?? routineOut,null,2)}</pre>
+              </div>
+              <div>
+                <div className="opacity-80 mb-1">countdown</div>
+                <div className="font-mono text-lg">{countdown ?? "-"}</div>
+                {countdownCause && <div className="mt-1 text-amber-300">cause: {countdownCause}</div>}
+              </div>
             </div>
-            <div>
-              <div className="opacity-80 mb-1">countdown</div>
-              <div className="font-mono text-lg">{countdown ?? "-"}</div>
-              {countdownCause && <div className="mt-1 text-amber-300">cause: {countdownCause}</div>}
+            <div className="mt-3 flex gap-2">
+              <button className="btn-outline" onClick={()=>fetchTrends()}>Re-fetch trends</button>
+              <button className="btn-outline" onClick={()=>{ disableLastRunsRef.current=false; fetchLastRuns(); }}>Re-fetch last_runs</button>
+              <button className="btn-outline" onClick={()=>fetchRoutineLatest()}>Fetch /routine/latest now</button>
             </div>
-            <div>
-              <div className="opacity-80 mb-1">latest trend points</div>
-              <pre className="bg-black/50 p-2 rounded-lg overflow-auto max-h-40">
-{JSON.stringify((trends.length ? trends : history).slice(-5), null, 2)}
-              </pre>
-            </div>
-          </div>
-          <div className="mt-3 flex gap-2">
-            <button className="btn-outline" onClick={() => fetchTrends()}>Re-fetch trends</button>
-            <button className="btn-outline" onClick={() => { disableLastRunsRef.current = false; fetchLastRuns(); }}>Re-fetch last_runs</button>
-            <button className="btn-outline" onClick={() => fetchRoutineLatest()}>Re-fetch /routine/latest</button>
-          </div>
-        </section>
-      )}
+          </section>
+        )}
+      </main>
     </div>
+  );
+}
+
+/* Metrics sub-block */
+function MetricsBlock({ base, getHeaders }: { base: string; getHeaders: Record<string,string> }) {
+  const [metrics, setMetrics] = useState<any>(null);
+  const [err, setErr] = useState<string>("");
+
+  const tryFetchJSON = async (paths: string[]) => {
+    let last: any;
+    for (const p of paths) {
+      try {
+        const r = await fetch(`${base}${p}`, { headers: getHeaders });
+        if (r.ok) return await r.json();
+        last = new Error(`${p} ${r.status}`);
+      } catch (e) { last = e; }
+    }
+    throw last ?? new Error("metrics not found");
+  };
+
+  const getMetrics = useCallback(async () => {
+    setErr("");
+    try { const j = await tryFetchJSON(["/metrics","/snapshot/metrics"]); setMetrics(j); }
+    catch (e:any) { setErr(e?.message || "Failed to fetch metrics"); }
+  }, [base, getHeaders]);
+
+  useEffect(() => { if (base) getMetrics().catch(()=>{}); }, [base, getMetrics]);
+
+  return (
+    <section className="card">
+      <div className="flex items-center justify-between">
+        <div className="font-semibold">Metrics</div>
+        <button onClick={getMetrics} className="btn-outline">Refresh</button>
+      </div>
+      {err && <div className="text-rose-600 text-sm mt-2">{err}</div>}
+      <pre className="text-xs bg-slate-50 border rounded-2xl p-3 overflow-auto mt-2">{JSON.stringify(metrics, null, 2)}</pre>
+    </section>
   );
 }
