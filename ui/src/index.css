@@ -148,3 +148,30 @@ pre {
     background: #0b2546; border-color: #60a5fa; color: #bfdbfe;
   }
 }
+
+/* Buttons */
+.btn-primary{background:#10b981;color:#fff;border:1px solid #059669;padding:.5rem .8rem;border-radius:.75rem}
+.btn-primary:disabled{opacity:.6}
+.btn-secondary{background:#0ea5e9;color:#fff;border:1px solid #0284c7;padding:.5rem .8rem;border-radius:.75rem}
+.btn-indigo{background:#6366f1;color:#fff;border:1px solid #4f46e5;padding:.5rem .8rem;border-radius:.75rem}
+.btn-outline{background:#fff;color:#0f172a;border:1px solid #cbd5e1;padding:.5rem .8rem;border-radius:.75rem}
+.btn-danger{background:#ef4444;color:#fff;border:1px solid #dc2626;padding:.5rem .8rem;border-radius:.75rem}
+
+/* Chips */
+.chip{padding:.15rem .5rem;border-radius:9999px;border:1px solid #e5e7eb;font-size:.75rem}
+.chip-slate{background:#f1f5f9;color:#334155}
+.chip-green{background:#dcfce7;color:#166534}
+.chip-rose{background:#ffe4e6;color:#9f1239}
+.chip-amber{background:#fef3c7;color:#92400e}
+.chip-indigo{background:#e0e7ff;color:#3730a3}
+
+/* Cards / tiles */
+.card{background:#fff;border:1px solid #e2e8f0;border-radius:1rem;padding:1rem}
+.tile{background:#fff;border:1px solid #e2e8f0;border-radius:1rem;padding:1rem}
+
+/* Debug */
+.debug-card{background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:1rem;padding:1rem}
+.debug-pre{background:rgba(0,0,0,.45);padding:.5rem;border-radius:.5rem;overflow:auto;max-height:10rem}
+
+/* Banners */
+.banner-info{background:#eff6ff;border:1px solid #bfdbfe;color:#1e3a8a;border-radius:.75rem;padding:.5rem .75rem}
