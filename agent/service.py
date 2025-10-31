@@ -9,6 +9,7 @@ import threading
 import time
 import uuid
 import math
+import hashlib
 from typing import Any, Dict, List, Optional, Tuple
 from collections import deque
 
@@ -108,6 +109,16 @@ AUTO_INGEST_ON_APPLY = int(os.getenv("AUTO_INGEST_ON_APPLY", "1"))
 # Scheduler cadence hint for UI countdowns
 SCHED_PERIOD_SEC = int(os.getenv("SCHED_PERIOD_SEC", "300"))  # default 5 min
 
+# --- routine min-change thresholds (envs) ---
+MIN_PCT_DELTA = float(os.getenv("MIN_PCT_DELTA", "0.0"))           # fraction, e.g. 0.001 = 0.1%
+MIN_ABS_ID_FAN = float(os.getenv("MIN_ABS_ID_FAN", "0.0"))         # Nm3/h
+MIN_ABS_COOLER = float(os.getenv("MIN_ABS_COOLER", "0.0"))         # Nm3/h
+
+# Cron defaults (symmetric config)
+CRON_APPLY_TOP = os.getenv("CRON_APPLY_TOP", "false").lower() in ("1","true","yes")
+CRON_NUDGE_IF_NEUTRAL = os.getenv("CRON_NUDGE_IF_NEUTRAL", "true").lower() in ("1","true","yes")
+CRON_LOG_SUGGESTIONS = os.getenv("CRON_LOG_SUGGESTIONS", "true").lower() in ("1","true","yes")
+
 # Project (prefer explicit env)
 PROJECT_ID = (
     os.getenv("PROJECT_ID")
@@ -150,8 +161,6 @@ _default_ui_origins = [
     "http://localhost:3000",
     "https://your-ui.example.com",
     "https://garvit2801.github.io",
-    # Note: origins never include a path; this next entry is redundant but harmless:
-    # "https://garvit2801.github.io/Plant_Agent",
 ]
 _env_ui = [o.strip() for o in os.getenv("UI_ORIGINS", "").split(",") if o.strip()]
 UI_ORIGINS = _env_ui or _default_ui_origins
@@ -303,6 +312,13 @@ def _format_suggestion_text(lever: str, current: Optional[float], proposed: Opti
         bounds = f" (bounds {lo}…{hi})"
     return base + bounds
 
+def _md5_short(d: Dict[str, Any]) -> str:
+    try:
+        s = json.dumps(d, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.md5(s).hexdigest()[:8]
+    except Exception:
+        return "00000000"
+
 # -------------------------
 # Mock plant state & thread (with SPs) + history ring buffer
 # -------------------------
@@ -405,8 +421,10 @@ class RoutineOptimizeReq(BaseModel):
     snapshot: Optional[Dict[str, Any]] = None
     targets: Optional[Dict[str, Any]] = None
     constraints: Optional[Dict[str, Any]] = None
-    apply_top: Optional[bool] = False
-    log_suggestions: Optional[bool] = True
+    # Set to Optional[bool] and resolve via _normalize_routine_flags so manual == cron
+    apply_top: Optional[bool] = None
+    log_suggestions: Optional[bool] = None
+    nudge_if_neutral: Optional[bool] = None
 
 class LoadOptimizeReq(BaseModel):
     snapshot: Optional[Dict[str, Any]] = None
@@ -494,12 +512,18 @@ def _latest_snapshot_from_bq() -> Dict[str, Any]:
         production_tph, kiln_feed_tph, separator_dp_pa,
         id_fan_flow_Nm3_h, cooler_airflow_Nm3_h,
         kiln_speed_rpm, o2_percent,
-        specific_power_kwh_per_ton
+        specific_power_kwh_per_ton, ts
       FROM `{table}`
+      ORDER BY ts DESC
       LIMIT 1
     """
     rows = list(_bq_client.query(sql, location=BQ_LOCATION).result())
-    return dict(rows[0]) if rows else {}
+    if not rows:
+        return {}
+    r = dict(rows[0])
+    if "ts" in r and isinstance(r["ts"], datetime.datetime):
+        r["ts"] = r["ts"].isoformat()
+    return r
 
 # ---------- Flexible BQ helpers & recent-attempt memory ----------
 _BQ_RECENT: List[Dict[str, Any]] = []
@@ -624,13 +648,17 @@ def _bq_ingest_snapshot(snapshot: Dict[str, Any], source: str = "apply") -> Opti
 # -------------------------
 # Internal helpers: apply setpoints (reused by routes)
 # -------------------------
+_ACTS_RECENT: deque = deque(maxlen=50)
+
 def _apply_setpoints_internal(setpts: Dict[str, float],
                               mode: Optional[str] = None,
                               plan_id: Optional[str] = None,
                               stage_index: Optional[int] = None,
                               stage_name: Optional[str] = None) -> Dict[str, Any]:
     if not APPLY_ENABLED:
-        return {"ok": True, "note": "APPLY_ENABLED=0; dry-run"}
+        res = {"ok": True, "note": "APPLY_ENABLED=0; dry-run"}
+        _ACTS_RECENT.append(res)
+        return res
 
     if not isinstance(setpts, dict) or not setpts:
         raise HTTPException(status_code=422, detail="No setpoints provided")
@@ -672,11 +700,9 @@ def _apply_setpoints_internal(setpts: Dict[str, float],
 
     applied_at = _now_ts()
 
-    # Record ingest time if we auto-ingest after apply
     if AUTO_INGEST_ON_APPLY and after:
         try:
             _bq_ingest_snapshot(after, source=f"apply:{mode or 'manual'}")
-            # reflect on /debug/last_runs
             global _LAST_INGEST_RUN
             _LAST_INGEST_RUN = applied_at
         except Exception as e:
@@ -725,13 +751,15 @@ def _apply_setpoints_internal(setpts: Dict[str, float],
                 out[k] = v
         return out
 
-    return {
+    res = {
         "ok": True,
         "applied_at": applied_at.isoformat(),
         "before": _round_map(before) if isinstance(before, dict) else None,
         "after": _round_map(after) if isinstance(after, dict) else None,
         "bq_log": {"table": tbl, "insert_error": err},
     }
+    _ACTS_RECENT.append(res)
+    return res
 
 # -------------------------
 # Last-run memory for scheduler & ingest (for countdowns)
@@ -774,6 +802,7 @@ def root():
             "/optimize/routine", "/optimize/load", "/cron/routine",
             "/routine/latest",
             "/actuate/apply_stage", "/actuate/rollback",
+            "/actuations/latest", "/compare/latest",
             "/ingest", "/metrics",
             "/predict/spower",
         ],
@@ -979,14 +1008,9 @@ def snapshot_set(req: SnapshotSetReq):
 # /trends → BQ (or mock) time-series  (+ sanitization & logs)
 # -------------------------
 def _sanitize_trend_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Keep timestamps ascending, coerce to floats, clamp ranges,
-    and drop obvious spikes (e.g., >30% jump for production).
-    """
     def _f(v):
         try:
             if isinstance(v, str):
-                # handle formatted strings like "12,000.000"
                 v = v.replace(",", "")
             return float(v)
         except Exception:
@@ -1002,14 +1026,12 @@ def _sanitize_trend_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         o2 = _f(r.get("o2_percent"))
         sp = _f(r.get("specific_power_kwh_per_ton"))
 
-        # clamp reasonable operating bounds
         ok_p = p is not None and 0.5 <= p <= 1000
         ok_o2 = o2 is not None and 0.0 <= o2 <= 30.0
         ok_sp = sp is not None and 0.1 <= sp <= 300.0
 
-        # anti-spike (relative) for prod & sp
         if ok_p and last_p is not None:
-            if abs(p - last_p) / max(1e-6, last_p) > 0.30:  # >30% jump = likely spike
+            if abs(p - last_p) / max(1e-6, last_p) > 0.30:
                 p = None
                 ok_p = False
         if ok_sp and last_sp is not None:
@@ -1035,15 +1057,13 @@ def trends(
     minutes: int = Query(default=60, ge=1, le=24*60),
     limit: int = Query(default=180, ge=1, le=5000),
     source: str = Query(default="auto", description="'auto'|'mock'|'bq'"),
-    clean: int = Query(default=1, ge=0, le=1),  # enable sanitizer by default
+    clean: int = Query(default=1, ge=0, le=1),
 ):
-    # Prefer the in-memory ring buffer whenever we're in mock mode.
     if source == "mock" or (source == "auto" and USE_MOCK):
         cutoff = _now_ts() - datetime.timedelta(minutes=minutes)
         pts = [p for p in list(_HIST) if datetime.datetime.fromisoformat(p["ts"].replace("Z","")).astimezone(datetime.timezone.utc) >= cutoff]
         pts = pts[-limit:]
         out = _sanitize_trend_rows(pts) if clean else pts
-        # brief diff vs current snapshot for diagnostics
         try:
             with _state_lock:
                 snap = {k: v for k, v in _STATE.items() if k != "sp"}
@@ -1058,7 +1078,6 @@ def trends(
             pass
         return out
 
-    # BQ path
     if not _BQ_ENABLED or _bq_client is None:
         raise HTTPException(status_code=503, detail="BigQuery disabled")
 
@@ -1103,6 +1122,142 @@ def trends(
         pass
 
     return out
+
+# -------------------------
+# Internal: threshold filter & optional neutral nudge
+# -------------------------
+def _build_per_lever_audit(s: Dict[str, Any],
+                           naive: Dict[str, Any],
+                           levers_meta: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for k, v in naive.items():
+        cur = s.get(k)
+        try:
+            cur_f = float(cur) if cur is not None else None
+        except Exception:
+            cur_f = None
+        try:
+            prop_f = float(v) if v is not None else None
+        except Exception:
+            prop_f = None
+
+        if cur_f is not None and prop_f is not None:
+            d_abs = prop_f - cur_f
+            d_pct = (prop_f / cur_f - 1.0) if cur_f != 0 else None
+        else:
+            d_abs, d_pct = None, None
+
+        out[k] = {
+            "current": cur_f,
+            "proposed_before_filter": prop_f,
+            "delta_abs": d_abs,
+            "delta_pct": d_pct,
+            "bounds": {
+                "min": levers_meta.get(k, {}).get("min"),
+                "max": levers_meta.get(k, {}).get("max"),
+            },
+            "decision": "pending",
+            "rule": None,
+        }
+    return out
+
+def _apply_threshold_filters(per: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    filtered: Dict[str, float] = {}
+    for k, info in per.items():
+        cur = info["current"]
+        prop = info["proposed_before_filter"]
+        d_abs = info["delta_abs"]
+        d_pct = info["delta_pct"]
+        lo = info["bounds"]["min"]
+        hi = info["bounds"]["max"]
+
+        if cur is None or prop is None:
+            info["decision"] = "skip_missing"
+            info["rule"] = "missing_current_or_proposed"
+            continue
+
+        if MIN_PCT_DELTA > 0 and cur != 0 and d_pct is not None and abs(d_pct) < MIN_PCT_DELTA:
+            info["decision"] = "skip_small"
+            info["rule"] = f"abs(delta_pct)<{MIN_PCT_DELTA}"
+            continue
+
+        if k == "id_fan_flow_Nm3_h" and MIN_ABS_ID_FAN > 0 and abs(d_abs) < MIN_ABS_ID_FAN:
+            info["decision"] = "skip_small"
+            info["rule"] = f"abs(delta_abs)<{MIN_ABS_ID_FAN}"
+            continue
+
+        if k == "cooler_airflow_Nm3_h" and MIN_ABS_COOLER > 0 and abs(d_abs) < MIN_ABS_COOLER:
+            info["decision"] = "skip_small"
+            info["rule"] = f"abs(delta_abs)<{MIN_ABS_COOLER}"
+            continue
+
+        proposed = prop
+        if lo is not None:
+            proposed = max(float(lo), proposed)
+        if hi is not None:
+            proposed = min(float(hi), proposed)
+
+        info["proposed"] = round(float(proposed), 3)
+        info["decision"] = "keep"
+        info["rule"] = "passed_thresholds"
+        filtered[k] = info["proposed"]
+    return filtered, per
+
+def _maybe_neutral_nudge(s: Dict[str, Any],
+                         levers_meta: Dict[str, Any],
+                         want_nudge: bool) -> Tuple[Dict[str, float], Dict[str, Any], Optional[str]]:
+    if not want_nudge:
+        return {}, {}, None
+
+    out: Dict[str, float] = {}
+    per: Dict[str, Any] = {}
+    detail_bits = []
+    for k, min_abs in (("id_fan_flow_Nm3_h", MIN_ABS_ID_FAN), ("cooler_airflow_Nm3_h", MIN_ABS_COOLER)):
+        cur = s.get(k)
+        if cur is None:
+            continue
+        try:
+            cur_f = float(cur)
+        except Exception:
+            continue
+        base_step = max(min_abs, 0.01 * abs(cur_f))
+        tgt = cur_f - base_step
+        lo = levers_meta.get(k, {}).get("min", -1e12)
+        hi = levers_meta.get(k, {}).get("max", 1e12)
+        tgt = clamp(tgt, lo, hi)
+        out[k] = round(tgt, 3)
+        d_abs = tgt - cur_f
+        d_pct = (tgt / cur_f - 1.0) if cur_f != 0 else None
+        per[k] = {
+            "current": cur_f,
+            "proposed_before_filter": tgt,
+            "proposed": tgt,
+            "delta_abs": d_abs,
+            "delta_pct": d_pct,
+            "bounds": {"min": lo, "max": hi},
+            "decision": "nudge",
+            "rule": "neutral_nudge",
+        }
+        detail_bits.append(f"{k}: {cur_f:.0f}→{tgt:.0f} (−{abs(d_abs):.0f})")
+    reason_extra = ("Applied neutral nudge — " + ", ".join(detail_bits)) if detail_bits else None
+    return out, per, reason_extra
+
+# -------------------------
+# Routine flag normalization (manual == cron)
+# -------------------------
+def _normalize_routine_flags(req: RoutineOptimizeReq) -> Dict[str, bool]:
+    """
+    Ensure /optimize/routine (manual) and /cron/routine (auto) resolve to the
+    SAME effective flags when fields are omitted. Defaults use CRON_* envs.
+    """
+    apply_top = CRON_APPLY_TOP if req.apply_top is None else bool(req.apply_top)
+    log_suggestions = CRON_LOG_SUGGESTIONS if req.log_suggestions is None else bool(req.log_suggestions)
+    nudge_if_neutral = CRON_NUDGE_IF_NEUTRAL if req.nudge_if_neutral is None else bool(req.nudge_if_neutral)
+    return {
+        "apply_top": apply_top,
+        "log_suggestions": log_suggestions,
+        "nudge_if_neutral": nudge_if_neutral,
+    }
 
 # -------------------------
 # Optimize (Routine)
@@ -1167,26 +1322,36 @@ def _insert_suggestions_rows(suggestion_id: str,
 
 @app.post("/optimize/routine")
 def optimize_routine(req: RoutineOptimizeReq):
-    # Treat manual routine runs as a "cron run" for dashboard freshness
+    # Treat routine runs (manual or via cron) as a "cron run" for dashboard freshness
     global _LAST_CRON_RUN
     _LAST_CRON_RUN = _now_ts()
+
+    flags = _normalize_routine_flags(req)
 
     # snapshot
     if req.snapshot and isinstance(req.snapshot, dict):
         s = dict(req.snapshot)
+        used_source = "request.snapshot"
+        used_ts = s.get("ts")
     else:
         if USE_MOCK:
             with _state_lock:
                 s = {k: v for k, v in _STATE.items() if k != "sp"}
+            used_source = "mock"
+            used_ts = _now_ts().isoformat()
         else:
             s = _latest_snapshot_from_bq()
+            used_source = "bq"
+            used_ts = s.get("ts")
         if not s:
             raise HTTPException(status_code=422, detail="No snapshot provided and none available")
+
+    used_hash = _md5_short(s)
 
     cfg = get_config()
     levers: Dict[str, Any] = cfg.get("levers", {})
 
-    # Build routine recipe
+    # Build routine recipe (original logic)
     recipe: Dict[str, float] = {}
     for lever, meta in levers.items():
         if meta.get("hold_in_routine"):
@@ -1201,9 +1366,9 @@ def optimize_routine(req: RoutineOptimizeReq):
             recipe[lever] = max(meta.get("min", 0), min(meta.get("max", 1e12), base))
 
     proposal_list = propose_actions(s, recipe, levers)
-    proposal = proposal_list[0] if proposal_list else {}
+    naive_proposal = proposal_list[0] if proposal_list else {}
 
-    if not proposal:
+    if not naive_proposal:
         fallback = {}
         if "id_fan_flow_Nm3_h" in s and "id_fan_flow_Nm3_h" in levers:
             lo, hi = levers["id_fan_flow_Nm3_h"].get("min", -1e12), levers["id_fan_flow_Nm3_h"].get("max", 1e12)
@@ -1214,7 +1379,35 @@ def optimize_routine(req: RoutineOptimizeReq):
         if "separator_dp_pa" in s and "separator_dp_pa" in levers:
             lo, hi = levers["separator_dp_pa"].get("min", -1e12), levers["separator_dp_pa"].get("max", 1e12)
             fallback["separator_dp_pa"] = clamp(600.0, lo, hi)
-        proposal = {k: round(v, 3) for k, v in fallback.items()}
+        naive_proposal = {k: round(v, 3) for k, v in fallback.items()}
+
+    # --- explainability & thresholding
+    per_lever = _build_per_lever_audit(s, naive_proposal, levers)
+    filtered_proposal, per_lever = _apply_threshold_filters(per_lever)
+
+    reason = None
+    reason_detail = None
+
+    if filtered_proposal:
+        reason = "proposed"
+        kept = [f"{k}→{v}" for k, v in filtered_proposal.items()]
+        reason_detail = f"Changes passed thresholds (MIN_PCT_DELTA={MIN_PCT_DELTA}, MIN_ABS_ID_FAN={MIN_ABS_ID_FAN}, MIN_ABS_COOLER={MIN_ABS_COOLER}). Kept: {', '.join(kept)}"
+    else:
+        # Everything suppressed → maybe nudge
+        reason = "neutral"
+        suppressed = [k for k, info in per_lever.items() if info.get("decision") in ("skip_small", "skip_missing")]
+        reason_detail = f"All candidate changes below thresholds (MIN_PCT_DELTA={MIN_PCT_DELTA}, MIN_ABS_ID_FAN={MIN_ABS_ID_FAN}, MIN_ABS_COOLER={MIN_ABS_COOLER}). Suppressed: {', '.join(suppressed) if suppressed else '—'}"
+
+        nudge_prop, nudge_per, nudge_detail = _maybe_neutral_nudge(s, levers, bool(flags["nudge_if_neutral"]))
+        if nudge_prop:
+            for k, info in nudge_per.items():
+                per_lever[k] = info
+            filtered_proposal = nudge_prop
+            reason = "nudge_applied"
+            if nudge_detail:
+                reason_detail = (reason_detail + " | " + nudge_detail) if reason_detail else nudge_detail
+
+    proposed_final = {k: round(float(v), 3) for k, v in filtered_proposal.items()} if filtered_proposal else {}
 
     pred = {"specific_power_kwh_per_ton": predict_specific_power(s)}
     payload = {
@@ -1222,8 +1415,18 @@ def optimize_routine(req: RoutineOptimizeReq):
         "current": s,
         "predicted_after": pred,
         "actions": {"apply_stage": True, "apply_all": False, "rollback": True},
-        "proposed_setpoints": proposal,
+        "proposed_setpoints": proposed_final,
+        "per_lever": per_lever,
+        "reason": reason,
+        "reason_detail": reason_detail,
         "match_info": {"candidates_used": 2008},
+        "used_snapshot_source": used_source,
+        "used_snapshot_ts": used_ts,
+        "used_snapshot_hash": used_hash,
+        # expose effective flags for parity debugging
+        "flags_effective": flags,
+        "constraints": req.constraints,
+        "targets": req.targets,
     }
 
     # Log to routine_suggestions_v2
@@ -1233,19 +1436,24 @@ def optimize_routine(req: RoutineOptimizeReq):
     created_at = _now_ts()
     if _BQ_ENABLED and tbl:
         schema = _bq_get_schema(tbl)
-        proposed = proposal
-        if schema.get("proposed_setpoints") == "JSON" and isinstance(proposal, (dict, list)):
-            proposed = _as_json_string(proposal)
+        proposed_for_bq = proposed_final
+        if schema.get("proposed_setpoints") == "JSON" and isinstance(proposed_for_bq, (dict, list)):
+            proposed_for_bq = _as_json_string(proposed_for_bq)
 
         suggestion_row = {
             "suggestion_id": suggestion_id,
             "created_at": created_at,
             "snapshot": s,
-            "proposed_setpoints": proposed,
+            "proposed_setpoints": proposed_for_bq,
             "predicted_after": pred,
             "targets": req.targets,
             "constraints": req.constraints,
             "mode": "routine",
+            "reason": reason,
+            "reason_detail": reason_detail,
+            "used_snapshot_source": used_source,
+            "used_snapshot_ts": used_ts,
+            "used_snapshot_hash": used_hash,
         }
         err = _bq_insert_flexible(tbl, suggestion_row)
         _remember_bq_attempt("routine_insert", tbl, list(suggestion_row.keys()), err)
@@ -1256,19 +1464,19 @@ def optimize_routine(req: RoutineOptimizeReq):
 
     # Insert normalized suggestions (per lever)
     sugg_log = None
-    if req.log_suggestions:
+    if flags["log_suggestions"] and proposed_final:
         try:
-            sugg_log = _insert_suggestions_rows(suggestion_id, created_at, s, proposal, req.constraints or {}, pred)
+            sugg_log = _insert_suggestions_rows(suggestion_id, created_at, s, proposed_final, req.constraints or {}, pred)
         except Exception as e:
             logging.warning("suggestions_v1 insert exception: %s", e)
             sugg_log = {"table": _suggestions_table(), "insert_error": str(e), "rows_inserted": 0}
 
-    # Optional auto-apply
+    # Optional auto-apply (based on normalized flag)
     actuation = None
     applied = False
-    if req.apply_top and isinstance(proposal, dict) and proposal:
+    if flags["apply_top"] and isinstance(proposed_final, dict) and proposed_final:
         try:
-            actuation = _apply_setpoints_internal(proposal, mode="routine", plan_id=None,
+            actuation = _apply_setpoints_internal(proposed_final, mode="routine", plan_id=None,
                                                   stage_index=None, stage_name="routine_auto_apply")
             applied = True and (actuation.get("bq_log", {}).get("insert_error") is None)
         except HTTPException as e:
@@ -1287,12 +1495,12 @@ def optimize_routine(req: RoutineOptimizeReq):
     payload["suggestion_id"] = suggestion_id
     payload["created_at"] = created_at.isoformat()
 
-    # --- remember latest suggestion for quick UI retrieval
+    # remember latest suggestion for quick UI retrieval
     try:
         _ROUTINE_RECENT.append({
             "suggestion_id": suggestion_id,
             "created_at": created_at.isoformat(),
-            "proposed_setpoints": proposal,
+            "proposed_setpoints": proposed_final,
             "applied": bool(applied),
             "actuation": actuation,
             "bq_log": payload.get("bq_log"),
@@ -1300,6 +1508,13 @@ def optimize_routine(req: RoutineOptimizeReq):
             "current": s,
             "predicted_after": pred,
             "mode": "routine",
+            "per_lever": per_lever,
+            "reason": reason,
+            "reason_detail": reason_detail,
+            "used_snapshot_source": used_source,
+            "used_snapshot_ts": used_ts,
+            "used_snapshot_hash": used_hash,
+            "flags_effective": flags,
         })
     except Exception:
         pass
@@ -1308,14 +1523,21 @@ def optimize_routine(req: RoutineOptimizeReq):
 
 @app.post("/cron/routine")
 def cron_routine(body: dict = Body(default={})):
+    """
+    Cron entry point. We simply map incoming fields onto RoutineOptimizeReq without
+    embedding defaults here; optimize_routine() will normalize flags the same way,
+    so auto == manual for identical plant state.
+    """
     global _LAST_CRON_RUN
-    _LAST_CRON_RUN = _now_ts()  # record for UI countdowns
+    _LAST_CRON_RUN = _now_ts()
+
     req = RoutineOptimizeReq(
         snapshot=body.get("snapshot"),
         targets=body.get("targets"),
         constraints=body.get("constraints"),
-        apply_top=bool(body.get("apply_top", True)),
-        log_suggestions=bool(body.get("log_suggestions", True)),
+        apply_top=body.get("apply_top"),                  # may be None → normalized inside
+        log_suggestions=body.get("log_suggestions"),      # may be None → normalized inside
+        nudge_if_neutral=body.get("nudge_if_neutral"),    # may be None → normalized inside
     )
     return optimize_routine(req)
 
@@ -1324,18 +1546,17 @@ def cron_routine(body: dict = Body(default={})):
 # -------------------------
 @app.get("/routine/latest")
 def routine_latest():
-    # 1) Try in-memory first (covers recent cron/optimize hits on this instance)
     if _ROUTINE_RECENT:
         return _ROUTINE_RECENT[-1]
 
-    # 2) Fallback to BigQuery history
     if not _BQ_ENABLED or _bq_client is None:
         raise HTTPException(status_code=404, detail="No routine suggestions available")
 
     from google.cloud import bigquery  # type: ignore
     table = _routine_table()
     sql = f"""
-      SELECT suggestion_id, created_at, proposed_setpoints, predicted_after, snapshot
+      SELECT suggestion_id, created_at, proposed_setpoints, predicted_after, snapshot,
+             reason, reason_detail, used_snapshot_source, used_snapshot_ts, used_snapshot_hash
       FROM `{table}`
       ORDER BY created_at DESC
       LIMIT 1
@@ -1353,6 +1574,11 @@ def routine_latest():
         "current": _maybe_parse_json(r.get("snapshot")),
         "applied": False,
         "mode": "routine",
+        "reason": r.get("reason") or "from_bq_history",
+        "reason_detail": r.get("reason_detail") or "latest suggestion loaded from BigQuery history; per_lever audit only available for in-memory recent runs on this instance",
+        "used_snapshot_source": r.get("used_snapshot_source"),
+        "used_snapshot_ts": r.get("used_snapshot_ts"),
+        "used_snapshot_hash": r.get("used_snapshot_hash"),
     }
 
 # -------------------------
@@ -1525,6 +1751,50 @@ def actuate_rollback():
     if USE_MOCK:
         return {"ok": True, "note": "mock: nothing to rollback"}
     return {"ok": True, "note": "Live plant rollback not implemented"}
+
+# -------------------------
+# NEW: support endpoints for UI comparison & latest actuation
+# -------------------------
+@app.get("/actuations/latest")
+def actuations_latest():
+    if not _ACTS_RECENT:
+        raise HTTPException(status_code=404, detail="No recent actuation")
+    return _ACTS_RECENT[-1]
+
+@app.get("/compare/latest")
+def compare_latest():
+    """
+    Returns a minimal structure the UI can use to render the comparison table.
+    If the latest routine suggestion was auto-applied, return before→after.
+    Else, return current→proposed_setpoints for preview.
+    """
+    if not _ROUTINE_RECENT:
+        raise HTTPException(status_code=404, detail="No routine suggestions yet")
+
+    r = _ROUTINE_RECENT[-1]
+    if r.get("applied") and isinstance(r.get("actuation"), dict):
+        act = r["actuation"]
+        return {
+            "mode": "applied",
+            "applied_at": act.get("applied_at"),
+            "before": act.get("before"),
+            "after": act.get("after"),
+            "used_snapshot_source": r.get("used_snapshot_source"),
+            "used_snapshot_ts": r.get("used_snapshot_ts"),
+            "used_snapshot_hash": r.get("used_snapshot_hash"),
+        }
+
+    return {
+        "mode": "preview",
+        "current": r.get("current"),
+        "proposed_setpoints": r.get("proposed_setpoints"),
+        "used_snapshot_source": r.get("used_snapshot_source"),
+        "used_snapshot_ts": r.get("used_snapshot_ts"),
+        "used_snapshot_hash": r.get("used_snapshot_hash"),
+        "reason": r.get("reason"),
+        "reason_detail": r.get("reason_detail"),
+        "per_lever": r.get("per_lever"),
+    }
 
 # -------------------------
 # /ingest → BigQuery (snapshots base table)
@@ -1718,6 +1988,16 @@ def metrics():
         "levers": list(cfg.get("levers", {}).keys()),
         "bq_enabled": _BQ_ENABLED,
         "sched_period_sec": SCHED_PERIOD_SEC,
+        "thresholds": {
+            "MIN_PCT_DELTA": MIN_PCT_DELTA,
+            "MIN_ABS_ID_FAN": MIN_ABS_ID_FAN,
+            "MIN_ABS_COOLER": MIN_ABS_COOLER,
+        },
+        "cron_defaults": {
+            "CRON_APPLY_TOP": CRON_APPLY_TOP,
+            "CRON_NUDGE_IF_NEUTRAL": CRON_NUDGE_IF_NEUTRAL,
+            "CRON_LOG_SUGGESTIONS": CRON_LOG_SUGGESTIONS,
+        }
     }
 
 # -------------------------

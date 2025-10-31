@@ -2,11 +2,13 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { LineChart, Line, XAxis, YAxis, Tooltip, Legend, CartesianGrid } from "recharts";
 
 /**
- * Plant Agent – Operations Dashboard UI (FINAL)
- * - /routine/latest: prefer GET without trailing slash; never bail on 405; try both variants, GET only
- * - last_runs: GET→POST fallback; tolerate /debug/last_runs, /snapshot/last_runs, /last_runs, /debug/schedule
- * - Countdown + cron probing (before/after ETA & when last_cron_routine advances)
- * - Responsive tiles, cards, debug panel; small trend cleaning; snapshot/trends/metrics
+ * Plant Agent – Operations Dashboard UI (SYNCED)
+ * Objective: manual routine == cron routine (same flags & behavior)
+ *
+ * Changes:
+ *  - Added "Nudge if neutral" toggle (default: ON) to mirror cron behavior
+ *  - POST /optimize/routine now sends { nudge_if_neutral } alongside other flags
+ *  - Minor copy updates to make parity explicit
  */
 
 const RECOMMENDED_HOST = "https://plant-agent-i32khy5nrq-el.a.run.app";
@@ -21,6 +23,7 @@ const LS_KEYS = {
   AUTOPOLL: "plant_ui.autopoll",
   STEP_DWELL: "plant_ui.step_dwell",
   TREND_SOURCE: "plant_ui.trend_source",
+  NUDGE: "plant_ui.nudge_if_neutral",
 };
 
 function useLocalStorage(key: string, initial: string) {
@@ -53,6 +56,7 @@ type RoutineResp = {
   bq_log?: { table?: string; insert_error?: string | null };
   suggestions_log?: any;
   predicted_after?: any;
+  reason?: string; reason_detail?: string;
 };
 
 type LoadResp = {
@@ -87,7 +91,6 @@ async function getJsonCandidates(base: string, headers: Record<string, string>, 
     try {
       const r = await fetch(url, { headers });
       if (r.ok) return { json: await r.json(), path: p, status: r.status, method: "GET" as const };
-      // continue on 405/404 etc., do not bail
       const txt = await r.text().catch(()=> "");
       last = new Error(`GET ${p} ${r.status}${txt ? ` – ${txt.slice(0,140)}` : ""}`);
     } catch (e) { last = e; }
@@ -145,6 +148,8 @@ export default function PlantAgentDashboard() {
   const [autoPoll, setAutoPoll] = useLocalStorage(LS_KEYS.AUTOPOLL, "1");
   const [trendSource, setTrendSource] = useLocalStorage(LS_KEYS.TREND_SOURCE, "auto");
   const [stepDwellCsv, setStepDwellCsv] = useLocalStorage(LS_KEYS.STEP_DWELL, "20");
+  // NEW: nudge parity with cron (default ON)
+  const [nudgeFlag, setNudgeFlag] = useLocalStorage(LS_KEYS.NUDGE, "1");
 
   const getHeaders = useMemo(() => {
     const h: Record<string,string> = {};
@@ -186,7 +191,7 @@ export default function PlantAgentDashboard() {
   const [routineAfter, setRoutineAfter] = useState<Snapshot | null>(null);
 
   const pollRef = useRef<number | null>(null);
-  const countRef = useRef<number | null>(null);
+  const countTimerRef = useRef<number | null>(null);
   const disableLastRunsRef = useRef(false);
   const cronProbeRef = useRef<number | null>(null);
   const lastCronRef = useRef<string | null>(null);
@@ -287,7 +292,8 @@ export default function PlantAgentDashboard() {
           actuation: json?.actuation,
           bq_log: json?.bq_log,
           suggestions_log: json?.suggestions_log,
-          predicted_after: json?.predicted_after
+          predicted_after: json?.predicted_after,
+          reason: json?.reason, reason_detail: json?.reason_detail
         });
         info(`Fetched routine latest via ${path}`, json);
         return true;
@@ -345,7 +351,6 @@ export default function PlantAgentDashboard() {
   }, [autoPoll, base, fetchSnapshot, fetchTrends, fetchLastRuns, fetchRoutineLatest]);
 
   /* countdown tick */
-  const countTimerRef = useRef<number | null>(null);
   useEffect(() => {
     if (countdown === null) { if (countTimerRef.current) window.clearInterval(countTimerRef.current); countTimerRef.current = null; return; }
     if (countTimerRef.current) window.clearInterval(countTimerRef.current);
@@ -360,12 +365,17 @@ export default function PlantAgentDashboard() {
     if (!base) return;
     setErrorMsg("");
     try {
-      const body = { constraints: { o2_percent: { min: Number(o2Min)||undefined, max: Number(o2Max)||undefined } }, apply_top: applyTop, log_suggestions: logSugg };
+      const body = {
+        constraints: { o2_percent: { min: Number(o2Min)||undefined, max: Number(o2Max)||undefined } },
+        apply_top: applyTop,
+        log_suggestions: logSugg,
+        // NEW: ensure parity with cron defaults
+        nudge_if_neutral: nudgeFlag === "1",
+      };
       const s0 = snap ?? (await fetchSnapshotFast()); if (s0) setRoutineBefore({ ...s0 });
       const r = await fetch(`${base}/optimize/routine`, { method: "POST", headers: postHeaders, body: JSON.stringify(body) });
       if (!r.ok) throw new Error(`/optimize/routine ${r.status}`);
       const j: RoutineResp = await r.json();
-      // immediately show any proposals
       setRoutineRaw(j);
       const created = pickLatestTimestamp(j);
       const proposed = pickProposal(j);
@@ -379,7 +389,8 @@ export default function PlantAgentDashboard() {
         actuation: j?.actuation,
         bq_log: j?.bq_log,
         suggestions_log: j?.suggestions_log,
-        predicted_after: j?.predicted_after
+        predicted_after: j?.predicted_after,
+        reason: j?.reason, reason_detail: j?.reason_detail
       });
       if (created) setLatestSeenAt(created);
       fetchLastRuns().catch(()=>{});
@@ -388,7 +399,7 @@ export default function PlantAgentDashboard() {
         setSnap(after); setRoutineAfter({ ...after }); await fetchTrends();
       }
     } catch (e:any) { setErrorMsg(e?.message || "Run routine failed"); }
-  }, [base, postHeaders, o2Min, o2Max, applyTop, logSugg, snap, fetchSnapshotFast, fetchTrends, fetchLastRuns]);
+  }, [base, postHeaders, o2Min, o2Max, applyTop, logSugg, nudgeFlag, snap, fetchSnapshotFast, fetchTrends, fetchLastRuns]);
 
   const applyRoutineProposal = useCallback(async () => {
     const proposed = pickProposal(routineOut);
@@ -604,6 +615,7 @@ export default function PlantAgentDashboard() {
             <div className="text-xs text-slate-500">
               latest routine run: {pickLatestTimestamp(routineOut) ? new Date(pickLatestTimestamp(routineOut) as string).toLocaleString() : "-"}
               {routineOut?.suggestion_id ? <span className="ml-2">• id: <span className="font-mono">{routineOut.suggestion_id}</span></span> : null}
+              {routineOut?.reason ? <span className="ml-2">• {routineOut.reason}</span> : null}
             </div>
           </div>
           {suggestionLines.length ? (
@@ -665,9 +677,9 @@ export default function PlantAgentDashboard() {
         <section className="card">
           <div className="flex items-center justify-between">
             <div className="font-semibold">Routine Optimization</div>
-            <div className="text-xs text-slate-500">Logs to routine_suggestions_v2 (and suggestions_v1)</div>
+            <div className="text-xs text-slate-500">Manual run mirrors cron defaults (parity ON)</div>
           </div>
-          <div className="mt-3 grid md:grid-cols-7 gap-3 items-end">
+          <div className="mt-3 grid md:grid-cols-8 gap-3 items-end">
             <div>
               <label className="text-xs text-slate-500">O₂ min</label>
               <input value={o2Min} onChange={(e)=>setO2Min(e.target.value)} className="w-full mt-1 px-3 py-2 border rounded-xl" />
@@ -681,6 +693,10 @@ export default function PlantAgentDashboard() {
             </label>
             <label className="inline-flex items-center gap-2 text-sm">
               <input type="checkbox" checked={logSugg} onChange={(e)=>setLogSugg(e.target.checked)} /> Log suggestions
+            </label>
+            {/* NEW: nudge parity toggle */}
+            <label className="inline-flex items-center gap-2 text-sm">
+              <input type="checkbox" checked={nudgeFlag==="1"} onChange={(e)=>setNudgeFlag(e.target.checked ? "1" : "0")} /> Nudge if neutral (cron parity)
             </label>
             <button onClick={runRoutine} className="btn-secondary" disabled={!base}>Run routine</button>
             <div className="text-xs text-slate-500 col-span-2">
