@@ -117,9 +117,6 @@ CRON_APPLY_TOP = os.getenv("CRON_APPLY_TOP", "false").lower() in ("1","true","ye
 CRON_NUDGE_IF_NEUTRAL = os.getenv("CRON_NUDGE_IF_NEUTRAL", "true").lower() in ("1","true","yes")
 CRON_LOG_SUGGESTIONS = os.getenv("CRON_LOG_SUGGESTIONS", "true").lower() in ("1","true","yes")
 
-# Allow default constraints for cron via env (JSON)
-CRON_DEFAULT_CONSTRAINTS_ENV = os.getenv("CRON_DEFAULT_CONSTRAINTS", "")
-
 # Project (prefer explicit env)
 PROJECT_ID = (
     os.getenv("PROJECT_ID")
@@ -704,6 +701,67 @@ def _bq_ingest_snapshot(snapshot: Dict[str, Any], source: str = "apply") -> Opti
     return err
 
 # -------------------------
+# NEW: insert per-lever suggestions helper (present & above usage)
+# -------------------------
+def _insert_suggestions_rows(suggestion_id: str,
+                             created_at: datetime.datetime,
+                             current: Dict[str, Any],
+                             proposed_setpoints: Dict[str, Any],
+                             constraints: Optional[Dict[str, Any]],
+                             prediction_after: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    tbl = _suggestions_table()
+    err_any: Optional[str] = None
+    count = 0
+    for lever, proposed in (proposed_setpoints or {}).items():
+        cur = current.get(lever)
+        try:
+            cur_f = float(cur) if cur is not None else None
+        except Exception:
+            cur_f = None
+        try:
+            prop_f = float(proposed) if proposed is not None else None
+        except Exception:
+            prop_f = None
+        delta_abs = (prop_f - cur_f) if (cur_f is not None and prop_f is not None) else None
+        delta_pct = ((prop_f - cur_f) / cur_f * 100.0) if (cur_f not in (None, 0) and prop_f is not None) else None
+
+        cmin = cmax = None
+        if isinstance(constraints, dict):
+            cmeta = constraints.get(lever, {})
+            if isinstance(cmeta, dict):
+                cmin = cmeta.get("min")
+                cmax = cmeta.get("max")
+
+        suggestion_text = _format_suggestion_text(lever, cur_f, prop_f, delta_pct, cmin, cmax)
+
+        row = {
+            "suggestion_row_id": str(uuid.uuid4()),
+            "suggestion_id": suggestion_id,
+            "created_at": created_at,
+            "source": "routine",
+            "lever": lever,
+            "current_value": cur_f,
+            "proposed_value": prop_f,
+            "delta_abs": delta_abs,
+            "delta_pct": delta_pct,
+            "constraint_min": cmin,
+            "constraint_max": cmax,
+            "confidence": None,
+            "suggestion_text": suggestion_text,
+            "proposed_setpoints": proposed_setpoints,
+            "snapshot_before": current,
+            "prediction_after": prediction_after or None,
+        }
+        if _BQ_ENABLED and tbl:
+            err = _bq_insert_flexible(tbl, row)
+            _remember_bq_attempt("suggestion_insert", tbl, list(row.keys()), err)
+            if err:
+                logging.warning("suggestions_v1 insert error: %s", err)
+                err_any = err
+        count += 1
+    return {"table": tbl, "insert_error": err_any, "rows_inserted": count}
+
+# -------------------------
 # Internal helpers: apply setpoints (reused by routes)
 # -------------------------
 _ACTS_RECENT: deque = deque(maxlen=50)
@@ -837,33 +895,6 @@ def _maybe_parse_json(v: Any) -> Any:
         return json.loads(v)
     except Exception:
         return v
-
-# -------------------------
-# Explicitness helper: only auto-apply if request explicitly set apply_top
-# -------------------------
-def _is_explicit_apply_top(req: RoutineOptimizeReq) -> bool:
-    # Pydantic BaseModel exposes __fields_set__ in v1; if missing, be conservative (False)
-    try:
-        return "apply_top" in getattr(req, "__fields_set__", set())
-    except Exception:
-        return False
-
-# -------------------------
-# Cron default constraints (parity with UI, configurable via env)
-# -------------------------
-def _cron_default_constraints() -> Dict[str, Any]:
-    raw = (CRON_DEFAULT_CONSTRAINTS_ENV or "").strip()
-    if not raw:
-        return {"o2_percent": {"min": 2.3, "max": 4.5}}
-    try:
-        cfg = json.loads(raw)
-        if isinstance(cfg, dict):
-            return cfg
-        logging.warning("CRON_DEFAULT_CONSTRAINTS is not a JSON object; using fallback")
-        return {"o2_percent": {"min": 2.3, "max": 4.5}}
-    except Exception:
-        logging.warning("Invalid CRON_DEFAULT_CONSTRAINTS JSON; using fallback")
-        return {"o2_percent": {"min": 2.3, "max": 4.5}}
 
 # -------------------------
 # Routes
@@ -1257,7 +1288,7 @@ def _apply_threshold_filters(per: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[
         hi = info["bounds"]["max"]
 
         if cur is None or prop is None:
-            info["decision"] = "skip_missing"
+            info["decision"] = "skip_missing_neutral"
             info["rule"] = "missing_current_or_proposed"
             continue
 
@@ -1337,64 +1368,6 @@ def _normalize_routine_flags(req: RoutineOptimizeReq) -> Dict[str, bool]:
         "nudge_if_neutral": nudge_if_neutral,
     }
 
-def _insert_suggestions_rows(suggestion_id: str,
-                             created_at: datetime.datetime,
-                             current: Dict[str, Any],
-                             proposed_setpoints: Dict[str, Any],
-                             constraints: Optional[Dict[str, Any]],
-                             prediction_after: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    tbl = _suggestions_table()
-    err_any: Optional[str] = None
-    count = 0
-    for lever, proposed in (proposed_setpoints or {}).items():
-        cur = current.get(lever)
-        try:
-            cur_f = float(cur) if cur is not None else None
-        except Exception:
-            cur_f = None
-        try:
-            prop_f = float(proposed) if proposed is not None else None
-        except Exception:
-            prop_f = None
-        delta_abs = (prop_f - cur_f) if (cur_f is not None and prop_f is not None) else None
-        delta_pct = ((prop_f - cur_f) / cur_f * 100.0) if (cur_f not in (None, 0) and prop_f is not None) else None
-
-        cmin = cmax = None
-        if isinstance(constraints, dict):
-            cmeta = constraints.get(lever, {})
-            if isinstance(cmeta, dict):
-                cmin = cmeta.get("min")
-                cmax = cmeta.get("max")
-
-        suggestion_text = _format_suggestion_text(lever, cur_f, prop_f, delta_pct, cmin, cmax)
-
-        row = {
-            "suggestion_row_id": str(uuid.uuid4()),
-            "suggestion_id": suggestion_id,
-            "created_at": created_at,
-            "source": "routine",
-            "lever": lever,
-            "current_value": cur_f,
-            "proposed_value": prop_f,
-            "delta_abs": delta_abs,
-            "delta_pct": delta_pct,
-            "constraint_min": cmin,
-            "constraint_max": cmax,
-            "confidence": None,
-            "suggestion_text": suggestion_text,
-            "proposed_setpoints": proposed_setpoints,
-            "snapshot_before": current,
-            "prediction_after": prediction_after or None,
-        }
-        if _BQ_ENABLED and tbl:
-            err = _bq_insert_flexible(tbl, row)
-            _remember_bq_attempt("suggestion_insert", tbl, list(row.keys()), err)
-            if err:
-                logging.warning("suggestions_v1 insert error: %s", err)
-                err_any = err
-        count += 1
-    return {"table": tbl, "insert_error": err_any, "rows_inserted": count}
-
 @app.post("/optimize/routine")
 def optimize_routine(req: RoutineOptimizeReq):
     global _LAST_CRON_RUN
@@ -1469,7 +1442,7 @@ def optimize_routine(req: RoutineOptimizeReq):
     else:
         # Everything suppressed → maybe nudge
         reason = "neutral"
-        suppressed = [k for k, info in per_lever.items() if info.get("decision") in ("skip_small", "skip_missing")]
+        suppressed = [k for k, info in per_lever.items() if info.get("decision") in ("skip_small", "skip_missing_neutral")]
         reason_detail = f"All candidate changes below thresholds (MIN_PCT_DELTA={MIN_PCT_DELTA}, MIN_ABS_ID_FAN={MIN_ABS_ID_FAN}, MIN_ABS_COOLER={MIN_ABS_COOLER}). Suppressed: {', '.join(suppressed) if suppressed else '—'}"
 
         nudge_prop, nudge_per, nudge_detail = _maybe_neutral_nudge(s, levers, bool(flags["nudge_if_neutral"]))
@@ -1544,10 +1517,10 @@ def optimize_routine(req: RoutineOptimizeReq):
             logging.warning("suggestions_v1 insert exception: %s", e)
             sugg_log = {"table": _suggestions_table(), "insert_error": str(e), "rows_inserted": 0}
 
-    # Optional auto-apply (ONLY if request explicitly set apply_top)
+    # Optional auto-apply (based on normalized flag)
     actuation = None
     applied = False
-    if flags["apply_top"] and _is_explicit_apply_top(req) and isinstance(proposed_final, dict) and proposed_final:
+    if flags["apply_top"] and isinstance(proposed_final, dict) and proposed_final:
         try:
             actuation = _apply_setpoints_internal(proposed_final, mode="routine", plan_id=None,
                                                   stage_index=None, stage_name="routine_auto_apply")
@@ -1595,37 +1568,16 @@ def optimize_routine(req: RoutineOptimizeReq):
 
 @app.post("/cron/routine")
 def cron_routine(body: dict = Body(default={})):
-    """
-    Cron wrapper:
-    - Injects default constraints if none provided (parity with UI)
-    - Defaults nudge_if_neutral to env (true) if absent
-    - NEVER auto-apply unless explicitly set in body
-    """
     global _LAST_CRON_RUN
     _LAST_CRON_RUN = _now_ts()
 
-    b = dict(body or {})
-
-    # 1) Constraints parity with UI
-    if "constraints" not in b or not isinstance(b.get("constraints"), dict):
-        b["constraints"] = _cron_default_constraints()
-
-    # 2) Nudge parity with env (UI default ON)
-    if "nudge_if_neutral" not in b:
-        b["nudge_if_neutral"] = CRON_NUDGE_IF_NEUTRAL
-
-    # 3) NEVER auto-apply for cron unless explicitly requested in this body
-    #    (and optimize_routine will further require explicitness to pass)
-    if "apply_top" not in b:
-        b["apply_top"] = False
-
     req = RoutineOptimizeReq(
-        snapshot=b.get("snapshot"),
-        targets=b.get("targets"),
-        constraints=b.get("constraints"),
-        apply_top=b.get("apply_top"),
-        log_suggestions=b.get("log_suggestions"),
-        nudge_if_neutral=b.get("nudge_if_neutral"),
+        snapshot=body.get("snapshot"),
+        targets=body.get("targets"),
+        constraints=body.get("constraints"),
+        apply_top=body.get("apply_top"),
+        log_suggestions=body.get("log_suggestions"),
+        nudge_if_neutral=body.get("nudge_if_neutral"),
     )
     return optimize_routine(req)
 
@@ -2027,7 +1979,7 @@ def predict_spower_route(doc: dict = Body(default={})):
           @separator_dp_pa       AS separator_dp_pa,
           @id_fan_flow_Nm3_h     AS id_fan_flow_Nm3_h,
           @cooler_airflow_Nm3_h  AS cooler_airflow_Nm3_h,
-          @kilnr_speed_rpm       AS kilnr_speed_rpm,
+          @kiln_speed_rpm        AS kilnr_speed_rpm,
           @o2_percent            AS o2_percent
         )
       )
@@ -2040,9 +1992,9 @@ def predict_spower_route(doc: dict = Body(default={})):
                 bigquery.ScalarQueryParameter("production_tph", "FLOAT64", params["production_tph"]),
                 bigquery.ScalarQueryParameter("kiln_feed_tph", "FLOAT64", params["kiln_feed_tph"]),
                 bigquery.ScalarQueryParameter("separator_dp_pa", "FLOAT64", params["separator_dp_pa"]),
+                bigquery.ScalarQueryParameter("kilnr_speed_rpm", "FLOAT64", params["kiln_speed_rpm"]),
                 bigquery.ScalarQueryParameter("id_fan_flow_Nm3_h", "FLOAT64", params["id_fan_flow_Nm3_h"]),
                 bigquery.ScalarQueryParameter("cooler_airflow_Nm3_h", "FLOAT64", params["cooler_airflow_Nm3_h"]),
-                bigquery.ScalarQueryParameter("kilnr_speed_rpm", "FLOAT64", params["kiln_speed_rpm"]),
                 bigquery.ScalarQueryParameter("o2_percent", "FLOAT64", params["o2_percent"]),
             ]
         ),

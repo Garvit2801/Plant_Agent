@@ -2,17 +2,15 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { LineChart, Line, XAxis, YAxis, Tooltip, Legend, CartesianGrid } from "recharts";
 
 /**
- * Plant Agent – Operations Dashboard UI (SYNCED)
- * Objective: manual routine == cron routine (same flags & behavior)
- *
- * Parity Notes:
- *  - "Nudge if neutral" toggle (default: ON) mirrors cron behavior
- *  - POST /optimize/routine sends { nudge_if_neutral } and O2 constraints
- *  - Manual never auto-applies unless you check "Apply top" OR click Accept
+ * Plant Agent – Operations Dashboard (Updated)
+ * - Auto-apply toggle for routine (defaults OFF)
+ * - Shows flags_effective (apply_top/log_suggestions/nudge_if_neutral)
+ * - Per-lever audit table (decision / rule / deltas / bounds)
+ * - Diagnostics footer (/metrics + /debug/last_runs)
+ * - Kept your trends, load planning, and apply flows
  */
 
 const RECOMMENDED_HOST = "https://plant-agent-i32khy5nrq-el.a.run.app";
-
 const DEBUG_KEY = "plant_ui.debug";
 const getDebug = () => (localStorage.getItem(DEBUG_KEY) ?? "0") === "1";
 const setDebug = (b: boolean) => localStorage.setItem(DEBUG_KEY, b ? "1" : "0");
@@ -24,6 +22,7 @@ const LS_KEYS = {
   STEP_DWELL: "plant_ui.step_dwell",
   TREND_SOURCE: "plant_ui.trend_source",
   NUDGE: "plant_ui.nudge_if_neutral",
+  AUTO_APPLY: "plant_ui.routine_auto_apply",
 };
 
 function useLocalStorage(key: string, initial: string) {
@@ -38,52 +37,73 @@ function normalizeBase(u: string) { if (!u) return ""; let s = u.trim(); s = s.r
 function info(msg: string, extra?: any) { if (getDebug()) console.log(`[PlantUI] ${msg}`, extra ?? ""); }
 function warn(msg: string, extra?: any) { console.warn(`[PlantUI] ${msg}`, extra ?? ""); }
 
+/* =========================
+   Types (align to backend)
+   ========================= */
 type Snapshot = {
   production_tph: number; kiln_feed_tph: number; separator_dp_pa: number;
   id_fan_flow_Nm3_h: number; cooler_airflow_Nm3_h: number; kiln_speed_rpm: number;
   o2_percent: number; specific_power_kwh_per_ton: number;
 };
+
 type TrendPoint = { t: string; production_tph: number | null; o2_percent: number | null; specific_power_kwh_per_ton: number | null; };
+
 type LastRuns = { last_cron_routine: string | null; last_ingest: string | null; sched_period_sec: number; now: string; next_cron_eta: string | null; seconds_to_next: number | null; };
 
+type LeverAudit = {
+  current: number | null;
+  proposed_before_filter: number | null;
+  proposed?: number;
+  delta_abs: number | null;
+  delta_pct: number | null; // fraction (e.g., 0.012 for +1.2%)
+  bounds: { min?: number; max?: number };
+  decision: "keep" | "skip_small" | "skip_missing" | "skip_missing_neutral" | "nudge" | "pending";
+  rule: string | null;
+};
+
+type ApplyResp = { ok: boolean; before?: Partial<Snapshot> | null; after?: Partial<Snapshot> | null; applied_at?: string; bq_log?: { table?: string | null; insert_error?: string | null }; note?: string; error?: string };
+
 type RoutineResp = {
-  mode?: string; current?: Snapshot;
+  mode: "routine";
+  current: Snapshot;
+  predicted_after?: { specific_power_kwh_per_ton?: number };
+  actions?: { apply_stage?: boolean; apply_all?: boolean; rollback?: boolean };
   proposed_setpoints?: Record<string, number>;
-  suggestion_id?: string;
-  created_at?: string; createdAt?: string; ts?: string; timestamp?: string;
+  per_lever?: Record<string, LeverAudit>;
+  reason?: "proposed" | "neutral" | "nudge_applied" | string;
+  reason_detail?: string;
+  match_info?: any;
+  used_snapshot_source?: string;
+  used_snapshot_ts?: string;
+  used_snapshot_hash?: string;
+  flags_effective?: { apply_top: boolean; log_suggestions: boolean; nudge_if_neutral: boolean };
+  constraints?: any;
+  targets?: any;
+  bq_log?: { table?: string | null; insert_error?: string | null };
+  suggestions_log?: { table?: string | null; insert_error?: string | null; rows_inserted?: number };
   applied?: boolean;
-  actuation?: { after?: Snapshot } | null;
-  bq_log?: { table?: string; insert_error?: string | null };
-  suggestions_log?: any;
-  predicted_after?: any;
-  reason?: string; reason_detail?: string;
+  actuation?: ApplyResp | null;
+  suggestion_id?: string;
+  created_at?: string;
 };
 
 type LoadResp = {
-  plan_id: string; created_at: string; mode: string; current: Snapshot;
+  plan_id: string; created_at: string; mode: "load_up" | "load_down";
+  current: Snapshot;
+  predicted_after?: { specific_power_kwh_per_ton?: number };
+  actions?: { apply_stage?: boolean; apply_all?: boolean; rollback?: boolean };
   stages: { name?: string; checks?: string[]; setpoints: Record<string, number> }[];
-  target?: any;
-  bq_log?: { table?: string; insert_error?: string | null };
+  target: { production_tph: number; delta_pct?: number | null; delta_abs?: number | null; requested?: any };
+  bq_log?: { table?: string | null; insert_error?: string | null };
+  match_info?: any; targets?: any; steps_cfg?: any;
 };
 
-type ApplyResp = { ok: boolean; before?: Partial<Snapshot> | null; after?: Partial<Snapshot> | null; applied_at?: string; };
+/* =========================
+   Helpers used by UI
+   ========================= */
+function pickLatestTimestamp(j: any): string | null { return j?.created_at || j?.createdAt || j?.ts || j?.timestamp || null; }
+function pickProposal(j: any): Record<string, number> | undefined { return j?.proposed_setpoints || j?.proposal?.setpoints || j?.top?.proposed_setpoints; }
 
-function Chip({ children, tone="slate" }: { children: React.ReactNode; tone?: "slate" | "green" | "rose" | "amber" | "indigo" }) {
-  const map: Record<string, string> = {
-    slate: "chip chip-slate", green: "chip chip-green", rose: "chip chip-rose", amber: "chip chip-amber", indigo: "chip chip-indigo",
-  };
-  return <span className={map[tone]}>{children}</span>;
-}
-
-/* tolerant pickers */
-function pickLatestTimestamp(j: any): string | null {
-  return j?.created_at || j?.createdAt || j?.ts || j?.timestamp || null;
-}
-function pickProposal(j: any): Record<string, number> | undefined {
-  return j?.proposed_setpoints || j?.proposal?.setpoints || j?.top?.proposed_setpoints;
-}
-
-/* GET-only helper that tries multiple paths (used for /routine/latest) */
 async function getJsonCandidates(base: string, headers: Record<string, string>, paths: string[]) {
   let last: any;
   for (const p of paths) {
@@ -98,7 +118,6 @@ async function getJsonCandidates(base: string, headers: Record<string, string>, 
   throw last ?? new Error("No candidate path succeeded");
 }
 
-/* GET→POST fallback (used for schedule/last_runs style endpoints) */
 async function methodFallback(base: string, getHeaders: Record<string,string>, postHeaders: Record<string,string>, paths: string[]) {
   let last: any;
   for (const p of paths) {
@@ -122,7 +141,7 @@ async function methodFallback(base: string, getHeaders: Record<string,string>, p
   throw last ?? new Error("No candidate path via GET/POST");
 }
 
-/* trend cleaning */
+/* trend cleaning (unchanged) */
 function cleanTrends(rows: any[]): TrendPoint[] {
   const sorted = rows.slice().sort((a,b)=>new Date(a.ts??0).getTime()-new Date(b.ts??0).getTime());
   const out: TrendPoint[] = [];
@@ -141,6 +160,9 @@ function cleanTrends(rows: any[]): TrendPoint[] {
   return out;
 }
 
+/* =========================
+   Main Component
+   ========================= */
 export default function PlantAgentDashboard() {
   const [baseRaw, setBaseRaw] = useLocalStorage(LS_KEYS.BASE, RECOMMENDED_HOST);
   const base = useMemo(() => normalizeBase(baseRaw), [baseRaw]);
@@ -148,8 +170,8 @@ export default function PlantAgentDashboard() {
   const [autoPoll, setAutoPoll] = useLocalStorage(LS_KEYS.AUTOPOLL, "1");
   const [trendSource, setTrendSource] = useLocalStorage(LS_KEYS.TREND_SOURCE, "auto");
   const [stepDwellCsv, setStepDwellCsv] = useLocalStorage(LS_KEYS.STEP_DWELL, "20");
-  // NEW: nudge parity with cron (default ON)
   const [nudgeFlag, setNudgeFlag] = useLocalStorage(LS_KEYS.NUDGE, "1");
+  const [autoApplyRoutine, setAutoApplyRoutine] = useLocalStorage(LS_KEYS.AUTO_APPLY, "0"); // default OFF
 
   const getHeaders = useMemo(() => {
     const h: Record<string,string> = {};
@@ -190,13 +212,16 @@ export default function PlantAgentDashboard() {
   const [routineBefore, setRoutineBefore] = useState<Snapshot | null>(null);
   const [routineAfter, setRoutineAfter] = useState<Snapshot | null>(null);
 
+  const [metrics, setMetrics] = useState<any>(null); // diagnostics
+  const [metricsErr, setMetricsErr] = useState<string>("");
+
   const pollRef = useRef<number | null>(null);
   const countTimerRef = useRef<number | null>(null);
   const disableLastRunsRef = useRef(false);
   const cronProbeRef = useRef<number | null>(null);
   const lastCronRef = useRef<string | null>(null);
 
-  /* health/version */
+  /* Health/version */
   const fetchHealth = useCallback(async () => {
     if (!base) return;
     try {
@@ -214,7 +239,7 @@ export default function PlantAgentDashboard() {
     }
   }, [base, getHeaders]);
 
-  /* snapshot */
+  /* Snapshot & trend helpers */
   const pushHistory = useCallback((s: Snapshot, tLabel?: string) => {
     setHistory(prev => [...prev.slice(-240), {
       t: tLabel ?? new Date().toLocaleTimeString(),
@@ -237,7 +262,6 @@ export default function PlantAgentDashboard() {
     if (!s) setErrorMsg("Failed to fetch snapshot");
   }, [fetchSnapshotFast]);
 
-  /* trends */
   const fetchTrends = useCallback(async () => {
     if (!base) return;
     try {
@@ -251,17 +275,16 @@ export default function PlantAgentDashboard() {
     }
   }, [base, getHeaders, trendSource]);
 
-  /* last_runs (GET→POST fallback) */
+  /* last_runs + countdown */
   const fetchLastRuns = useCallback(async () => {
     if (!base || disableLastRunsRef.current) return;
     try {
       const { json } = await methodFallback(base, getHeaders, postHeaders, [
-        "/debug/last_runs", "/debug/last_runs/", "/snapshot/last_runs", "/snapshot/last_runs/", "/last_runs", "/last_runs/", "/debug/schedule", "/debug/schedule/"
+        "/debug/last_runs", "/debug/last_runs/", "/snapshot/last_runs", "/snapshot/last_runs/",
+        "/last_runs", "/last_runs/", "/debug/schedule", "/debug/schedule/"
       ]);
       const j = json as LastRuns;
-      setLastRuns(j);
-      setCountdown(j?.seconds_to_next ?? null);
-      setCountdownCause("");
+      setLastRuns(j); setCountdown(j?.seconds_to_next ?? null); setCountdownCause("");
     } catch (e:any) {
       const msg = String(e?.message || e);
       if (/405|Method Not Allowed/i.test(msg)) disableLastRunsRef.current = true;
@@ -269,7 +292,6 @@ export default function PlantAgentDashboard() {
     }
   }, [base, getHeaders, postHeaders]);
 
-  /* /routine/latest (GET-only; prefer no trailing slash) */
   const fetchRoutineLatest = useCallback(async () => {
     if (!base) return false;
     try {
@@ -282,19 +304,7 @@ export default function PlantAgentDashboard() {
         if (isNewer) setLatestSeenAt(created);
       }
       if (proposed && Object.keys(proposed).length > 0) {
-        setRoutineOut({
-          suggestion_id: json?.suggestion_id,
-          created_at: created ?? undefined,
-          proposed_setpoints: proposed,
-          mode: json?.mode,
-          current: json?.current,
-          applied: json?.applied,
-          actuation: json?.actuation,
-          bq_log: json?.bq_log,
-          suggestions_log: json?.suggestions_log,
-          predicted_after: json?.predicted_after,
-          reason: json?.reason, reason_detail: json?.reason_detail
-        });
+        setRoutineOut(json);
         info(`Fetched routine latest via ${path}`, json);
         return true;
       }
@@ -304,7 +314,6 @@ export default function PlantAgentDashboard() {
     }
   }, [base, getHeaders, latestSeenAt]);
 
-  /* probe around countdown reaching 0 */
   const startCronProbe = useCallback(() => {
     if (cronProbeRef.current) window.clearInterval(cronProbeRef.current);
     let elapsed = 0;
@@ -318,17 +327,12 @@ export default function PlantAgentDashboard() {
     }, 2000);
   }, [fetchRoutineLatest]);
 
-  useEffect(() => {
-    if (countdown == null) return;
-    if (countdown <= 5) startCronProbe();
-  }, [countdown, startCronProbe]);
-
+  useEffect(() => { if (countdown != null && countdown <= 5) startCronProbe(); }, [countdown, startCronProbe]);
   useEffect(() => {
     const ts = lastRuns?.last_cron_routine || null;
     if (!ts) return;
     if (!lastCronRef.current || new Date(ts).getTime() > new Date(lastCronRef.current).getTime()) {
-      lastCronRef.current = ts;
-      startCronProbe();
+      lastCronRef.current = ts; startCronProbe();
     }
   }, [lastRuns?.last_cron_routine, startCronProbe]);
 
@@ -354,22 +358,31 @@ export default function PlantAgentDashboard() {
   useEffect(() => {
     if (countdown === null) { if (countTimerRef.current) window.clearInterval(countTimerRef.current); countTimerRef.current = null; return; }
     if (countTimerRef.current) window.clearInterval(countTimerRef.current);
-    countTimerRef.current = window.setInterval(() => {
-      setCountdown(c => (c==null ? c : Math.max(0, c - 1)));
-    }, 1000);
+    countTimerRef.current = window.setInterval(() => { setCountdown(c => (c==null ? c : Math.max(0, c - 1))); }, 1000);
     return () => { if (countTimerRef.current) window.clearInterval(countTimerRef.current); countTimerRef.current = null; };
   }, [countdown]);
 
-  /* routine actions */
+  /* metrics (diagnostics) */
+  const getMetrics = useCallback(async () => {
+    if (!base) return;
+    setMetricsErr("");
+    try {
+      const r = await fetch(`${base}/metrics`, { headers: getHeaders });
+      if (!r.ok) throw new Error(`${r.status}`);
+      const j = await r.json(); setMetrics(j);
+    } catch (e:any) { setMetricsErr(e?.message || "Failed to fetch metrics"); }
+  }, [base, getHeaders]);
+
+  /* Routine actions */
   const runRoutine = useCallback(async () => {
     if (!base) return;
     setErrorMsg("");
     try {
       const body = {
         constraints: { o2_percent: { min: Number(o2Min)||undefined, max: Number(o2Max)||undefined } },
-        apply_top: applyTop,
+        // UI toggles (explicit): default auto-apply OFF unless user enables it
+        apply_top: autoApplyRoutine === "1" || applyTop,
         log_suggestions: logSugg,
-        // parity with cron defaults
         nudge_if_neutral: nudgeFlag === "1",
       };
       const s0 = snap ?? (await fetchSnapshotFast()); if (s0) setRoutineBefore({ ...s0 });
@@ -379,19 +392,7 @@ export default function PlantAgentDashboard() {
       setRoutineRaw(j);
       const created = pickLatestTimestamp(j);
       const proposed = pickProposal(j);
-      setRoutineOut({
-        suggestion_id: j?.suggestion_id,
-        created_at: created ?? undefined,
-        proposed_setpoints: proposed,
-        mode: j?.mode,
-        current: j?.current,
-        applied: j?.applied,
-        actuation: j?.actuation,
-        bq_log: j?.bq_log,
-        suggestions_log: j?.suggestions_log,
-        predicted_after: j?.predicted_after,
-        reason: j?.reason, reason_detail: j?.reason_detail
-      });
+      setRoutineOut(j);
       if (created) setLatestSeenAt(created);
       fetchLastRuns().catch(()=>{});
       if (j?.actuation?.after) {
@@ -399,13 +400,13 @@ export default function PlantAgentDashboard() {
         setSnap(after); setRoutineAfter({ ...after }); await fetchTrends();
       }
     } catch (e:any) { setErrorMsg(e?.message || "Run routine failed"); }
-  }, [base, postHeaders, o2Min, o2Max, applyTop, logSugg, nudgeFlag, snap, fetchSnapshotFast, fetchTrends, fetchLastRuns]);
+  }, [base, postHeaders, o2Min, o2Max, applyTop, logSugg, nudgeFlag, autoApplyRoutine, snap, fetchSnapshotFast, fetchTrends, fetchLastRuns]);
 
   const applyRoutineProposal = useCallback(async () => {
     const proposed = pickProposal(routineOut);
     if (!proposed) return;
     try {
-      const r = await fetch(`${base}/actuate/apply_stage`, { method: "POST", headers: postHeaders, body: JSON.stringify({ proposal: proposed, mode: "routine" }) });
+      const r = await fetch(`${base}/actuate/apply_stage`, { method: "POST", headers: postHeaders, body: JSON.stringify({ proposed_setpoints: proposed, mode: "routine" }) });
       if (!r.ok) throw new Error(`/actuate/apply_stage ${r.status}`);
       const j: ApplyResp = await r.json();
       const after: Snapshot | null = (j.after as Snapshot) || (await fetchSnapshotFast());
@@ -418,7 +419,7 @@ export default function PlantAgentDashboard() {
     setRoutineOut(null); setRoutineBefore(null); setRoutineAfter(null);
   }, []);
 
-  /* load planning */
+  /* Load planning */
   const [loadMode, setLoadMode] = useState<"pct"|"abs"|"target">("pct");
   const [steps, setSteps] = useState("3");
   const [direction, setDirection] = useState<"up"|"down">("up");
@@ -507,8 +508,7 @@ export default function PlantAgentDashboard() {
     const ro = new ResizeObserver((entries) => {
       for (const e of entries) setChartBoxSize({ w: Math.floor(e.contentRect.width), h: 224 });
     });
-    ro.observe(chartBoxRef.current);
-    return () => ro.disconnect();
+    ro.observe(chartBoxRef.current); return () => ro.disconnect();
   }, []);
 
   const kpi = snap;
@@ -537,6 +537,7 @@ export default function PlantAgentDashboard() {
     return out;
   }, [snap, routineOut]);
 
+  /* UI */
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900">
       <header className="sticky top-0 z-10 backdrop-blur bg-white/70 border-b border-slate-200">
@@ -564,7 +565,7 @@ export default function PlantAgentDashboard() {
               <div className="mt-1 text-[11px] text-slate-500">Using: <span className="font-mono">{base || "—"}</span></div>
             </div>
             <div className="flex-1">
-              <label className="text-xs text-slate-500">ID Token (optional for private)</label>
+              <label className="text-xs text-slate-500">ID Token (optional)</label>
               <input value={token} onChange={(e)=>setToken(e.target.value)} placeholder="paste gcloud-issued ID token" className="w-full mt-1 px-3 py-2 border rounded-xl" />
             </div>
             <button onClick={()=>setBaseRaw(RECOMMENDED_HOST)} className="btn-outline">Use recommended host</button>
@@ -582,7 +583,7 @@ export default function PlantAgentDashboard() {
               </select>
               <span className="text-xs text-slate-500">from <span className="font-mono">{trendEndpoint}</span></span>
             </div>
-            <button onClick={()=>{ fetchSnapshot(); fetchTrends(); fetchLastRuns(); fetchRoutineLatest(); }} className="btn-outline">Refresh now</button>
+            <button onClick={()=>{ fetchSnapshot(); fetchTrends(); fetchLastRuns(); fetchRoutineLatest(); getMetrics(); }} className="btn-outline">Refresh now</button>
             {errorMsg ? <span className="text-rose-600">• {errorMsg}</span> : null}
           </div>
           {countdown == null && (
@@ -616,8 +617,16 @@ export default function PlantAgentDashboard() {
               latest routine run: {pickLatestTimestamp(routineOut) ? new Date(pickLatestTimestamp(routineOut) as string).toLocaleString() : "-"}
               {routineOut?.suggestion_id ? <span className="ml-2">• id: <span className="font-mono">{routineOut.suggestion_id}</span></span> : null}
               {routineOut?.reason ? <span className="ml-2">• {routineOut.reason}</span> : null}
+              {routineOut?.flags_effective && (
+                <span className="ml-2">
+                  • flags: apply_top=<b>{String(routineOut.flags_effective.apply_top)}</b>,
+                  log=<b>{String(routineOut.flags_effective.log_suggestions)}</b>,
+                  nudge=<b>{String(routineOut.flags_effective.nudge_if_neutral)}</b>
+                </span>
+              )}
             </div>
           </div>
+
           {suggestionLines.length ? (
             <ul className="mt-3 list-disc pl-6 text-sm space-y-1">
               {suggestionLines.map((s,i)=><li key={i}>{s}</li>)}
@@ -627,9 +636,52 @@ export default function PlantAgentDashboard() {
               {countdown !== null ? "Waiting for the next cron suggestion… we’ll auto-fetch around the scheduled time." : "Run a routine optimization to populate suggestions."}
             </div>
           )}
-          <div className="mt-3 flex gap-2">
+
+          {/* per-lever audit table */}
+          {routineOut?.per_lever && (
+            <div className="mt-4 overflow-x-auto">
+              <div className="text-sm font-medium mb-1">Per-lever audit</div>
+              <table className="min-w-full text-xs">
+                <thead>
+                  <tr className="text-left text-slate-500 border-b">
+                    <th className="py-2 pr-4">Lever</th>
+                    <th className="py-2 pr-4">Decision</th>
+                    <th className="py-2 pr-4">Rule</th>
+                    <th className="py-2 pr-4">Current</th>
+                    <th className="py-2 pr-4">Proposed</th>
+                    <th className="py-2 pr-4">Δabs</th>
+                    <th className="py-2 pr-4">Δ%</th>
+                    <th className="py-2 pr-4">Bounds</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {Object.entries(routineOut.per_lever).map(([k, v]) => (
+                    <tr key={k} className="border-b last:border-0">
+                      <td className="py-2 pr-4 font-medium">{k}</td>
+                      <td className="py-2 pr-4">{v.decision}</td>
+                      <td className="py-2 pr-4">{v.rule ?? "—"}</td>
+                      <td className="py-2 pr-4 font-mono">{fmt(v.current)}</td>
+                      <td className="py-2 pr-4 font-mono">{v.proposed != null ? fmt(v.proposed) : (v.proposed_before_filter != null ? fmt(v.proposed_before_filter) : "—")}</td>
+                      <td className="py-2 pr-4 font-mono">{v.delta_abs != null ? ((v.delta_abs >= 0 ? "+" : "") + fmt(v.delta_abs)) : "—"}</td>
+                      <td className="py-2 pr-4 font-mono">{v.delta_pct != null ? ((v.delta_pct*100 >= 0 ? "+" : "") + fmt(v.delta_pct*100, 2) + "%") : "—"}</td>
+                      <td className="py-2 pr-4">{v.bounds.min ?? "−∞"}…{v.bounds.max ?? "+∞"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              {routineOut.reason_detail && (
+                <div className="mt-2 text-[11px] text-slate-600">Details: {routineOut.reason_detail}</div>
+              )}
+            </div>
+          )}
+
+          <div className="mt-3 flex flex-wrap gap-2 items-center">
             <button onClick={applyRoutineProposal} disabled={!pickProposal(routineOut)} className="btn-primary">Accept & Apply</button>
             <button onClick={rejectRoutine} className="btn-danger">Reject</button>
+            {routineOut?.applied ? <Chip tone="green">Auto-applied ✓</Chip> : <Chip tone="slate">Not auto-applied</Chip>}
+            {routineOut?.actuation?.bq_log?.insert_error && (
+              <span className="text-rose-600 text-xs">BQ: {routineOut.actuation.bq_log.insert_error}</span>
+            )}
           </div>
         </section>
 
@@ -677,7 +729,7 @@ export default function PlantAgentDashboard() {
         <section className="card">
           <div className="flex items-center justify-between">
             <div className="font-semibold">Routine Optimization</div>
-            <div className="text-xs text-slate-500">Manual run mirrors cron defaults</div>
+            <div className="text-xs text-slate-500">Manual run mirrors cron defaults unless toggles override</div>
           </div>
           <div className="mt-3 grid md:grid-cols-8 gap-3 items-end">
             <div>
@@ -689,14 +741,20 @@ export default function PlantAgentDashboard() {
               <input value={o2Max} onChange={(e)=>setO2Max(e.target.value)} className="w-full mt-1 px-3 py-2 border rounded-xl" />
             </div>
             <label className="inline-flex items-center gap-2 text-sm">
-              <input type="checkbox" checked={applyTop} onChange={(e)=>setApplyTop(e.target.checked)} /> Apply top
-            </label>
-            <label className="inline-flex items-center gap-2 text-sm">
               <input type="checkbox" checked={logSugg} onChange={(e)=>setLogSugg(e.target.checked)} /> Log suggestions
             </label>
-            {/* parity toggle */}
             <label className="inline-flex items-center gap-2 text-sm">
               <input type="checkbox" checked={nudgeFlag==="1"} onChange={(e)=>setNudgeFlag(e.target.checked ? "1" : "0")} /> Nudge if neutral
+            </label>
+            <label className="inline-flex items-center gap-2 text-sm">
+              <input type="checkbox" checked={applyTop} onChange={(e)=>setApplyTop(e.target.checked)} /> Apply top (this click)
+            </label>
+            <label className="inline-flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={autoApplyRoutine==="1"}
+                onChange={(e)=>setAutoApplyRoutine(e.target.checked ? "1" : "0")}
+              /> Auto-apply routine run (UI default)
             </label>
             <button onClick={runRoutine} className="btn-secondary" disabled={!base}>Run routine</button>
             <div className="text-xs text-slate-500 col-span-2">
@@ -839,7 +897,7 @@ export default function PlantAgentDashboard() {
         )}
 
         {/* Metrics */}
-        <MetricsBlock base={base} getHeaders={getHeaders} />
+        <MetricsBlock base={base} getHeaders={getHeaders} metrics={metrics} metricsErr={metricsErr} onRefresh={getMetrics} />
 
         {/* Debug */}
         {getDebug() && (
@@ -864,47 +922,63 @@ export default function PlantAgentDashboard() {
               <button className="btn-outline" onClick={()=>fetchTrends()}>Re-fetch trends</button>
               <button className="btn-outline" onClick={()=>{ disableLastRunsRef.current=false; fetchLastRuns(); }}>Re-fetch last_runs</button>
               <button className="btn-outline" onClick={()=>fetchRoutineLatest()}>Fetch /routine/latest now</button>
+              <button className="btn-outline" onClick={()=>getMetrics()}>Refresh metrics</button>
             </div>
           </section>
         )}
       </main>
+
+      {/* Diagnostics footer */}
+      <footer className="mt-6 border-t border-slate-200 bg-white/70">
+        <div className="mx-auto max-w-7xl px-4 py-3 text-xs text-slate-600 flex flex-wrap gap-x-4 gap-y-1">
+          <span>Sched period: <b>{metrics?.sched_period_sec ?? "-"}</b>s</span>
+          <span>Apply enabled: <b>{String(metrics?.apply_enabled)}</b></span>
+          <span>SPower: mode=<b>{metrics?.spower?.mode}</b>, tol=<b>{metrics?.spower?.tol}</b></span>
+          <span>Thresholds: pct=<b>{metrics?.thresholds?.MIN_PCT_DELTA}</b>, idfan=<b>{metrics?.thresholds?.MIN_ABS_ID_FAN}</b>, cooler=<b>{metrics?.thresholds?.MIN_ABS_COOLER}</b></span>
+          <span>Cron defaults: apply_top=<b>{String(metrics?.cron_defaults?.CRON_APPLY_TOP)}</b>, nudge=<b>{String(metrics?.cron_defaults?.CRON_NUDGE_IF_NEUTRAL)}</b>, log=<b>{String(metrics?.cron_defaults?.CRON_LOG_SUGGESTIONS)}</b></span>
+        </div>
+      </footer>
     </div>
   );
 }
 
-/* Metrics sub-block */
-function MetricsBlock({ base, getHeaders }: { base: string; getHeaders: Record<string,string> }) {
-  const [metrics, setMetrics] = useState<any>(null);
-  const [err, setErr] = useState<string>("");
-
-  const tryFetchJSON = async (paths: string[]) => {
-    let last: any;
-    for (const p of paths) {
-      try {
-        const r = await fetch(`${base}${p}`, { headers: getHeaders });
-        if (r.ok) return await r.json();
-        last = new Error(`${p} ${r.status}`);
-      } catch (e) { last = e; }
-    }
-    throw last ?? new Error("metrics not found");
+/* Small chip + styles */
+function Chip({ children, tone="slate" }: { children: React.ReactNode; tone?: "slate" | "green" | "rose" | "amber" | "indigo" }) {
+  const map: Record<string, string> = {
+    slate: "chip chip-slate", green: "chip chip-green", rose: "chip chip-rose", amber: "chip chip-amber", indigo: "chip chip-indigo",
   };
+  return <span className={map[tone]}>{children}</span>;
+}
 
-  const getMetrics = useCallback(async () => {
-    setErr("");
-    try { const j = await tryFetchJSON(["/metrics","/snapshot/metrics"]); setMetrics(j); }
-    catch (e:any) { setErr(e?.message || "Failed to fetch metrics"); }
-  }, [base, getHeaders]);
-
-  useEffect(() => { if (base) getMetrics().catch(()=>{}); }, [base, getMetrics]);
-
+/* Metrics sub-block (diagnostics) */
+function MetricsBlock({ base, getHeaders, metrics, metricsErr, onRefresh }: { base: string; getHeaders: Record<string,string>; metrics:any; metricsErr:string; onRefresh:()=>void; }) {
   return (
     <section className="card">
       <div className="flex items-center justify-between">
         <div className="font-semibold">Metrics</div>
-        <button onClick={getMetrics} className="btn-outline">Refresh</button>
+        <button onClick={onRefresh} className="btn-outline">Refresh</button>
       </div>
-      {err && <div className="text-rose-600 text-sm mt-2">{err}</div>}
+      {metricsErr && <div className="text-rose-600 text-sm mt-2">{metricsErr}</div>}
       <pre className="text-xs bg-slate-50 border rounded-2xl p-3 overflow-auto mt-2">{JSON.stringify(metrics, null, 2)}</pre>
     </section>
   );
 }
+
+/* ======= minimal styles (Tailwind-friendly) ======= */
+/* In your global.css (or keep utility classes). This block assumes you already use Tailwind.
+.card { @apply bg-white border border-slate-200 rounded-2xl p-4; }
+.tile { @apply bg-white border border-slate-200 rounded-2xl p-3; }
+.btn-outline { @apply px-3 py-2 border rounded-xl text-sm hover:bg-slate-50; }
+.btn-secondary { @apply px-3 py-2 rounded-xl text-sm bg-slate-800 text-white hover:bg-slate-700; }
+.btn-indigo { @apply px-3 py-2 rounded-xl text-sm bg-indigo-600 text-white hover:bg-indigo-500; }
+.btn-primary { @apply px-3 py-2 rounded-xl text-sm bg-emerald-600 text-white hover:bg-emerald-500; }
+.btn-danger { @apply px-3 py-2 rounded-xl text-sm bg-rose-600 text-white hover:bg-rose-500; }
+.banner-info { @apply text-xs text-slate-700 bg-slate-100 border border-slate-200 rounded-xl px-3 py-2; }
+.debug-card { @apply bg-slate-900 text-slate-100 rounded-2xl p-4; }
+.debug-pre { @apply bg-slate-800 border border-slate-700 rounded-xl p-3 overflow-auto; }
+.chip { @apply inline-flex items-center px-2 py-0.5 rounded-full text-[11px] border; }
+.chip-slate { @apply bg-slate-50 text-slate-700 border-slate-200; }
+.chip-green { @apply bg-emerald-50 text-emerald-700 border-emerald-200; }
+.chip-rose { @apply bg-rose-50 text-rose-700 border-rose-200; }
+.chip-amber { @apply bg-amber-50 text-amber-700 border-amber-200; }
+.chip-indigo { @apply bg-indigo-50 text-indigo-700 border-indigo-200; } */
