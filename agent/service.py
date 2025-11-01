@@ -1,4 +1,4 @@
-# agent/service.py
+# service.py
 from __future__ import annotations
 
 import os
@@ -117,9 +117,6 @@ CRON_APPLY_TOP = os.getenv("CRON_APPLY_TOP", "false").lower() in ("1","true","ye
 CRON_NUDGE_IF_NEUTRAL = os.getenv("CRON_NUDGE_IF_NEUTRAL", "true").lower() in ("1","true","yes")
 CRON_LOG_SUGGESTIONS = os.getenv("CRON_LOG_SUGGESTIONS", "true").lower() in ("1","true","yes")
 
-# Auth
-AUTH_BEARER = os.getenv("AUTH_BEARER", "superlongrandomsecret")
-
 # Project (prefer explicit env)
 PROJECT_ID = (
     os.getenv("PROJECT_ID")
@@ -161,12 +158,13 @@ async def stamp_and_log(request: Request, call_next):
     resp.headers["Vary"] = "Origin"
     return resp
 
-
 _default_ui_origins = [
     "http://localhost:5173",
     "http://localhost:3000",
     "https://your-ui.example.com",
     "https://garvit2801.github.io",
+    "https://garvit2801.github.io/Plant_Agent",
+    "https://storage.googleapis.com/my-plant-agent-123456-plant-ui/index.html",
 ]
 _env_ui = [o.strip() for o in os.getenv("UI_ORIGINS", "").split(",") if o.strip()]
 UI_ORIGINS = _env_ui or _default_ui_origins
@@ -346,7 +344,6 @@ _STATE.setdefault("sp", {
     "cooler_airflow_Nm3_h": _STATE["cooler_airflow_Nm3_h"],
     "kiln_speed_rpm": _STATE["kiln_speed_rpm"],
 })
-# Track last drivers that affect specific power so we can gate updates
 _STATE["_spower_drivers"] = {
     "production_tph": _STATE["production_tph"],
     "separator_dp_pa_sp": _STATE["sp"]["separator_dp_pa"],
@@ -363,7 +360,6 @@ def _append_history(snapshot: Dict[str, Any]):
         "specific_power_kwh_per_ton": snapshot.get("specific_power_kwh_per_ton"),
     })
 
-# >>> PHYSICS LOGGING helper
 def _log_phys(tag: str, **kw):
     if LOG_PHYSICS:
         try:
@@ -372,7 +368,6 @@ def _log_phys(tag: str, **kw):
             pass
 
 def _drivers_changed_enough(state: Dict[str, float], sp: Dict[str, float]) -> Tuple[bool, Dict[str, float]]:
-    """Check if any driver for specific power changed beyond tolerance."""
     last = state.get("_spower_drivers") or {}
     cur = {
         "production_tph": float(state.get("production_tph", 0.0)),
@@ -440,7 +435,6 @@ def _physics_tick(state: Dict[str, float], dt_sec: float) -> None:
         else:
             state["_spower_drivers"] = cur_drivers
 
-    # 4) Specific power (only when allowed)
     if do_spower:
         k_base = (
             12.2
@@ -484,7 +478,6 @@ class RoutineOptimizeReq(BaseModel):
     apply_top: Optional[bool] = None
     log_suggestions: Optional[bool] = None
     nudge_if_neutral: Optional[bool] = None
-    # new: distinguish cron vs manual for last-run stamping
     trigger: Optional[str] = Field(default=None, description="'cron'|'manual'")
 
 class LoadOptimizeReq(BaseModel):
@@ -706,7 +699,7 @@ def _bq_ingest_snapshot(snapshot: Dict[str, Any], source: str = "apply") -> Opti
     return err
 
 # -------------------------
-# NEW: insert per-lever suggestions helper (present & above usage)
+# NEW: insert per-lever suggestions helper
 # -------------------------
 def _insert_suggestions_rows(suggestion_id: str,
                              created_at: datetime.datetime,
@@ -772,22 +765,16 @@ def _insert_suggestions_rows(suggestion_id: str,
 _ACTS_RECENT: deque = deque(maxlen=50)
 
 def _strip_debug_keys(m: Dict[str, Any]) -> Dict[str, Any]:
-    """Remove nested debug keys that are not part of BQ schema."""
     if isinstance(m, dict):
         m.pop("_spower_drivers", None)
     return m
 
-def _check_bearer_ok(request: Request) -> bool:
-    auth = request.headers.get("authorization") or request.headers.get("Authorization")
-    if not auth or not auth.lower().startswith("bearer "):
-        return False
-    token = auth.split(" ", 1)[1].strip()
-    return token == AUTH_BEARER
-
 def _is_manual_actuation_request(request: Request) -> bool:
-    confirmed = (request.headers.get("X-Confirm-Apply", "") or request.headers.get("x-confirm-apply", "")).lower() == "yes"
-    authorized = _check_bearer_ok(request)
-    return confirmed and authorized
+    """
+    DEV MODE: Only requires 'X-Confirm-Apply: yes' header.
+    (No Bearer token required.)
+    """
+    return (request.headers.get("X-Confirm-Apply", "") or request.headers.get("x-confirm-apply", "")).lower() == "yes"
 
 def _apply_setpoints_internal(setpts: Dict[str, float],
                               mode: Optional[str] = None,
@@ -837,7 +824,6 @@ def _apply_setpoints_internal(setpts: Dict[str, float],
     else:
         after = {}
 
-    # strip debug keys before any logging/response
     before_clean = _strip_debug_keys(dict(before)) if isinstance(before, dict) else None
     after_clean  = _strip_debug_keys(dict(after)) if isinstance(after, dict) else None
 
@@ -905,7 +891,7 @@ def _apply_setpoints_internal(setpts: Dict[str, float],
     return res
 
 # -------------------------
-# Last-run memory for scheduler & ingest (for countdowns)
+# Last-run memory for scheduler & ingest
 # -------------------------
 _LAST_CRON_RUN: Optional[datetime.datetime] = None
 _LAST_INGEST_RUN: Optional[datetime.datetime] = None
@@ -1056,7 +1042,7 @@ def debug_bq_recent():
         "bq_error": _BQ_ERR,
     }
 
-# ---------- Countdown (GET/POST/OPTIONS on all aliases) ----------
+# ---------- Countdown aliases ----------
 @app.api_route("/debug/last_runs", methods=["GET","POST","OPTIONS"])
 @app.api_route("/last_runs", methods=["GET","POST","OPTIONS"])
 @app.api_route("/snapshot/last_runs", methods=["GET","POST","OPTIONS"])
@@ -1064,14 +1050,11 @@ def debug_bq_recent():
 def debug_last_runs(request: Request):
     now = _now_ts()
 
-    # In-memory times set by /cron/routine and /ingest
     last_cron = _LAST_CRON_RUN
     last_ing  = _LAST_INGEST_RUN
 
-    # Fallback to BQ once per request if needed
     if (last_cron is None or last_ing is None) and _BQ_ENABLED and (_bq_client is not None):
         try:
-            # last routine suggestion time ~ "cron last run"
             if last_cron is None:
                 sql_cron = f"SELECT MAX(created_at) AS ts FROM `{_routine_table()}`"
                 rows_cron = list(_bq_client.query(sql_cron, location=BQ_LOCATION).result())
@@ -1080,7 +1063,6 @@ def debug_last_runs(request: Request):
                     last_cron = ts if isinstance(ts, datetime.datetime) else datetime.datetime.fromisoformat(str(ts))
                     if last_cron.tzinfo is None:
                         last_cron = last_cron.replace(tzinfo=datetime.timezone.utc)
-            # last ingest time from base snapshots table
             if last_ing is None:
                 sql_ing = f"SELECT MAX(ts) AS ts FROM `{_snapshots_table()}`"
                 rows_ing = list(_bq_client.query(sql_ing, location=BQ_LOCATION).result())
@@ -1109,7 +1091,6 @@ def debug_last_runs(request: Request):
     logging.info("last_runs seconds_to_next=%s next=%s", out["seconds_to_next"], out["next_cron_eta"])
     return out
 
-# ---- Trailing-slash aliases to avoid 405s on /path/ ----
 @app.api_route("/debug/last_runs/", methods=["GET","POST","OPTIONS"])
 @app.api_route("/last_runs/", methods=["GET","POST","OPTIONS"])
 @app.api_route("/snapshot/last_runs/", methods=["GET","POST","OPTIONS"])
@@ -1148,7 +1129,7 @@ def snapshot_set(req: SnapshotSetReq):
     return {"ok": True, "state": snap}
 
 # -------------------------
-# /trends → BQ (or mock) time-series  (+ sanitization & logs)
+# /trends
 # -------------------------
 def _sanitize_trend_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     def _f(v):
@@ -1397,11 +1378,8 @@ def _normalize_routine_flags(req: RoutineOptimizeReq) -> Dict[str, bool]:
 
 @app.post("/optimize/routine")
 def optimize_routine(req: RoutineOptimizeReq):
-    # Only cron sets last cron time; manual runs shouldn't update the cron clock
-    # (cron route below sets trigger='cron' explicitly)
     flags = _normalize_routine_flags(req)
 
-    # snapshot
     if req.snapshot and isinstance(req.snapshot, dict):
         s = dict(req.snapshot)
         used_source = "request.snapshot"
@@ -1424,7 +1402,6 @@ def optimize_routine(req: RoutineOptimizeReq):
     cfg = get_config()
     levers: Dict[str, Any] = cfg.get("levers", {})
 
-    # Build routine recipe (original logic)
     recipe: Dict[str, float] = {}
     for lever, meta in levers.items():
         if meta.get("hold_in_routine"):
@@ -1454,7 +1431,6 @@ def optimize_routine(req: RoutineOptimizeReq):
             fallback["separator_dp_pa"] = clamp(600.0, lo, hi)
         naive_proposal = {k: round(v, 3) for k, v in fallback.items()}
 
-    # --- explainability & thresholding
     per_lever = _build_per_lever_audit(s, naive_proposal, levers)
     filtered_proposal, per_lever = _apply_threshold_filters(per_lever)
 
@@ -1466,7 +1442,6 @@ def optimize_routine(req: RoutineOptimizeReq):
         kept = [f"{k}→{v}" for k, v in filtered_proposal.items()]
         reason_detail = f"Changes passed thresholds (MIN_PCT_DELTA={MIN_PCT_DELTA}, MIN_ABS_ID_FAN={MIN_ABS_ID_FAN}, MIN_ABS_COOLER={MIN_ABS_COOLER}). Kept: {', '.join(kept)}"
     else:
-        # Everything suppressed → maybe nudge
         reason = "neutral"
         suppressed = [k for k, info in per_lever.items() if info.get("decision") in ("skip_small", "skip_missing_neutral")]
         reason_detail = f"All candidate changes below thresholds (MIN_PCT_DELTA={MIN_PCT_DELTA}, MIN_ABS_ID_FAN={MIN_ABS_ID_FAN}, MIN_ABS_COOLER={MIN_ABS_COOLER}). Suppressed: {', '.join(suppressed) if suppressed else '—'}"
@@ -1501,7 +1476,6 @@ def optimize_routine(req: RoutineOptimizeReq):
         "targets": req.targets,
     }
 
-    # Log to routine_suggestions_v2
     tbl = _routine_table()
     err = None
     suggestion_id = str(uuid.uuid4())
@@ -1534,7 +1508,6 @@ def optimize_routine(req: RoutineOptimizeReq):
     else:
         logging.info("Skipping routine suggestion logging: BQ_ENABLED=%s, table=%s", _BQ_ENABLED, tbl)
 
-    # Insert normalized suggestions (per lever)
     sugg_log = None
     if flags["log_suggestions"] and proposed_final:
         try:
@@ -1543,7 +1516,6 @@ def optimize_routine(req: RoutineOptimizeReq):
             logging.warning("suggestions_v1 insert exception: %s", e)
             sugg_log = {"table": _suggestions_table(), "insert_error": str(e), "rows_inserted": 0}
 
-    # Optional auto-apply (manual flows only)
     actuation = None
     applied = False
     if (req.trigger or "").lower() != "cron":
@@ -1599,7 +1571,6 @@ def cron_routine(body: dict = Body(default={})):
     global _LAST_CRON_RUN
     _LAST_CRON_RUN = _now_ts()
 
-    # Force apply_top False regardless of env/body (cron must be preview-only)
     req = RoutineOptimizeReq(
         snapshot=body.get("snapshot"),
         targets=body.get("targets"),
@@ -1611,9 +1582,6 @@ def cron_routine(body: dict = Body(default={})):
     )
     return optimize_routine(req)
 
-# -------------------------
-# NEW: expose latest routine suggestion for the UI
-# -------------------------
 @app.get("/routine/latest")
 def routine_latest():
     if _ROUTINE_RECENT:
@@ -1806,9 +1774,12 @@ def optimize_load(req: LoadOptimizeReq):
 # -------------------------
 @app.post("/actuate/apply_stage")
 def actuate_apply_stage(request: Request, req: ApplyStageReq = Body(default={})):
-    # Require explicit manual confirmation + bearer for safety
+    # DEV MODE: require only X-Confirm-Apply: yes from an allowed Origin
+    origin = request.headers.get("Origin") or request.headers.get("origin")
+    if origin and not _origin_allowed(origin):
+        raise HTTPException(status_code=403, detail=f"Origin not allowed: {origin}")
     if not _is_manual_actuation_request(request):
-        raise HTTPException(status_code=403, detail="Manual actuation requires X-Confirm-Apply: yes and a valid Bearer token.")
+        raise HTTPException(status_code=403, detail="Manual actuation requires X-Confirm-Apply: yes")
     setpts = req.extract_setpoints()
     res = _apply_setpoints_internal(
         setpts=setpts,
@@ -2090,7 +2061,7 @@ def physics_flags():
     }
 
 # -------------------------
-# Startup diagnostics: print route table (one-time)
+# Startup diagnostics
 # -------------------------
 @app.on_event("startup")
 def _log_routes_on_startup():

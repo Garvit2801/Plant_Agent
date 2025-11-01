@@ -2,11 +2,10 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { LineChart, Line, XAxis, YAxis, Tooltip, Legend, CartesianGrid } from "recharts";
 
 /**
- * Plant Agent – Operations Dashboard (Updated)
- * - Fix: add X-Confirm-Apply: yes for /actuate/apply_stage
- * - “ID Token” field relabeled to the actual Apply bearer
- * - Guard rails: warn if Apply is clicked without a bearer
- * - Rest of features unchanged
+ * Plant Agent – Operations Dashboard (No-Auth Variant)
+ * - Removed all Authorization bearer handling (no token, no header, no guards)
+ * - Kept X-Confirm-Apply: yes for /actuate/apply_stage
+ * - Everything else unchanged
  */
 
 const RECOMMENDED_HOST = "https://plant-agent-i32khy5nrq-el.a.run.app";
@@ -16,7 +15,6 @@ const setDebug = (b: boolean) => localStorage.setItem(DEBUG_KEY, b ? "1" : "0");
 
 const LS_KEYS = {
   BASE: "plant_ui.base_url",
-  TOKEN: "plant_ui.id_token", // used as Apply bearer
   AUTOPOLL: "plant_ui.autopoll",
   STEP_DWELL: "plant_ui.step_dwell",
   TREND_SOURCE: "plant_ui.trend_source",
@@ -34,7 +32,6 @@ function cls(...xs: (string | false | undefined | null)[]) { return xs.filter(Bo
 function fmt(n: number | undefined | null, d = 3) { if (n == null || Number.isNaN(n)) return "-"; return Number(n).toFixed(d); }
 function normalizeBase(u: string) { if (!u) return ""; let s = u.trim(); s = s.replace(/\/+$/, ""); s = s.replace(/\/snapshot$/i, ""); return s; }
 function info(msg: string, extra?: any) { if (getDebug()) console.log(`[PlantUI] ${msg}`, extra ?? ""); }
-function warn(msg: string, extra?: any) { console.warn(`[PlantUI] ${msg}`, extra ?? ""); }
 
 /* =========================
    Types (align to backend)
@@ -166,36 +163,21 @@ export default function PlantAgentDashboard() {
   const [baseRaw, setBaseRaw] = useLocalStorage(LS_KEYS.BASE, RECOMMENDED_HOST);
   const base = useMemo(() => normalizeBase(baseRaw), [baseRaw]);
 
-  // This token is the bearer required by the backend for Apply calls.
-  const [token, setToken] = useLocalStorage(LS_KEYS.TOKEN, "");
-
   const [autoPoll, setAutoPoll] = useLocalStorage(LS_KEYS.AUTOPOLL, "1");
   const [trendSource, setTrendSource] = useLocalStorage(LS_KEYS.TREND_SOURCE, "auto");
   const [stepDwellCsv, setStepDwellCsv] = useLocalStorage(LS_KEYS.STEP_DWELL, "20");
   const [nudgeFlag, setNudgeFlag] = useLocalStorage(LS_KEYS.NUDGE, "1");
   const [autoApplyRoutine, setAutoApplyRoutine] = useLocalStorage(LS_KEYS.AUTO_APPLY, "0"); // default OFF
 
-  // General GET/POST headers (no confirm)
-  const getHeaders = useMemo(() => {
-    const h: Record<string,string> = {};
-    if (token.trim()) h.Authorization = `Bearer ${token.trim()}`;
-    return h;
-  }, [token]);
-  const postHeaders = useMemo(() => {
-    const h: Record<string,string> = {"Content-Type":"application/json"};
-    if (token.trim()) h.Authorization = `Bearer ${token.trim()}`;
-    return h;
-  }, [token]);
+  // General GET/POST headers (no auth)
+  const getHeaders = useMemo(() => ({} as Record<string,string>), []);
+  const postHeaders = useMemo(() => ({"Content-Type":"application/json"} as Record<string,string>), []);
 
-  // Apply headers: MUST include X-Confirm-Apply
-  const applyHeaders = useMemo(() => {
-    const h: Record<string,string> = {
-      "Content-Type": "application/json",
-      "X-Confirm-Apply": "yes",
-    };
-    if (token.trim()) h.Authorization = `Bearer ${token.trim()}`;
-    return h;
-  }, [token]);
+  // Apply headers: MUST include X-Confirm-Apply (no auth)
+  const applyHeaders = useMemo(() => ({
+    "Content-Type": "application/json",
+    "X-Confirm-Apply": "yes",
+  } as Record<string,string>), []);
 
   const [health, setHealth] = useState<string>("-");
   const [ver, setVer] = useState<string>("-");
@@ -393,7 +375,6 @@ export default function PlantAgentDashboard() {
     try {
       const body = {
         constraints: { o2_percent: { min: Number(o2Min)||undefined, max: Number(o2Max)||undefined } },
-        // UI toggles (explicit): default auto-apply OFF unless user enables it
         apply_top: autoApplyRoutine === "1" || applyTop,
         log_suggestions: logSugg,
         nudge_if_neutral: nudgeFlag === "1",
@@ -404,7 +385,7 @@ export default function PlantAgentDashboard() {
       const j: RoutineResp = await r.json();
       setRoutineRaw(j);
       const created = pickLatestTimestamp(j);
-      pickProposal(j); // just to compute once
+      pickProposal(j);
       setRoutineOut(j);
       if (created) setLatestSeenAt(created);
       fetchLastRuns().catch(()=>{});
@@ -418,7 +399,6 @@ export default function PlantAgentDashboard() {
   const applyRoutineProposal = useCallback(async () => {
     const proposed = pickProposal(routineOut);
     if (!proposed) return;
-    if (!token.trim()) { setErrorMsg("Apply blocked: set an Apply Bearer (Authorization) at the top."); return; }
     try {
       const r = await fetch(`${base}/actuate/apply_stage`, {
         method: "POST",
@@ -431,7 +411,7 @@ export default function PlantAgentDashboard() {
       if (after) { setSnap(after); setRoutineAfter({ ...after }); await fetchTrends(); }
       fetchLastRuns().catch(()=>{});
     } catch (e:any) { setErrorMsg(e?.message || "Apply failed"); }
-  }, [base, applyHeaders, routineOut, fetchSnapshotFast, fetchTrends, fetchLastRuns, token]);
+  }, [base, applyHeaders, routineOut, fetchSnapshotFast, fetchTrends, fetchLastRuns]);
 
   const rejectRoutine = useCallback(() => {
     setRoutineOut(null); setRoutineBefore(null); setRoutineAfter(null);
@@ -465,7 +445,6 @@ export default function PlantAgentDashboard() {
 
   const applyStage = useCallback(async (i: number) => {
     if (!loadOut) return;
-    if (!token.trim()) { setErrorMsg("Apply blocked: set an Apply Bearer (Authorization) at the top."); return; }
     try {
       const r = await fetch(`${base}/actuate/apply_stage`, {
         method: "POST",
@@ -482,7 +461,7 @@ export default function PlantAgentDashboard() {
       }
       fetchLastRuns().catch(()=>{});
     } catch (e:any) { setErrorMsg(e?.message || `Apply stage ${i+1} failed`); }
-  }, [base, applyHeaders, loadOut, fetchSnapshotFast, fetchTrends, fetchLastRuns, token]);
+  }, [base, applyHeaders, loadOut, fetchSnapshotFast, fetchTrends, fetchLastRuns]);
 
   const sleep = (ms:number)=>new Promise(res=>setTimeout(res,ms));
   const applyAllStages = useCallback( async () => {
@@ -584,10 +563,6 @@ export default function PlantAgentDashboard() {
               <input value={baseRaw} onChange={(e)=>setBaseRaw(e.target.value)} placeholder="https://<cloud-run-url>" className="w-full mt-1 px-3 py-2 border rounded-xl" />
               <div className="mt-1 text-[11px] text-slate-500">Using: <span className="font-mono">{base || "—"}</span></div>
             </div>
-            <div className="flex-1">
-              <label className="text-xs text-slate-500">Apply Bearer (required for Apply)</label>
-              <input value={token} onChange={(e)=>setToken(e.target.value)} placeholder="paste AUTH_BEARER for Authorization" className="w-full mt-1 px-3 py-2 border rounded-xl" />
-            </div>
             <button onClick={()=>setBaseRaw(RECOMMENDED_HOST)} className="btn-outline">Use recommended host</button>
             <button onClick={fetchHealth} className="btn-outline" disabled={!base}>Check</button>
           </div>
@@ -606,11 +581,6 @@ export default function PlantAgentDashboard() {
             <button onClick={()=>{ fetchSnapshot(); fetchTrends(); fetchLastRuns(); fetchRoutineLatest(); getMetrics(); }} className="btn-outline">Refresh now</button>
             {errorMsg ? <span className="text-rose-600">• {errorMsg}</span> : null}
           </div>
-          {!token.trim() && (
-            <div className="banner-info mt-3">
-              Applying changes requires a bearer token. Ask your admin for AUTH_BEARER and paste it above.
-            </div>
-          )}
           {countdown == null && (
             <div className="banner-info mt-3">
               {countdownCause || "Countdown unavailable."} We try both GET and POST for last-run info.
