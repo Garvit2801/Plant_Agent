@@ -1,0 +1,49 @@
+INFO:     Started server process [1]
+INFO:     Waiting for application startup.
+INFO:root:ROUTE path=/openapi.json methods={'GET', 'HEAD'} name=openapi
+INFO:root:ROUTE path=/docs methods={'GET', 'HEAD'} name=swagger_ui_html
+INFO:root:ROUTE path=/docs/oauth2-redirect methods={'GET', 'HEAD'} name=swagger_ui_redirect
+INFO:root:ROUTE path=/redoc methods={'GET', 'HEAD'} name=redoc_html
+INFO:root:ROUTE path=/{path:path} methods={'OPTIONS'} name=options_any
+INFO:root:ROUTE path=/cron/routine methods={'OPTIONS'} name=options_cron_routine
+INFO:root:ROUTE path=/optimize/routine methods={'OPTIONS'} name=options_optimize_routine
+INFO:root:ROUTE path=/ methods={'GET'} name=root
+INFO:root:ROUTE path=/version methods={'GET'} name=version
+INFO:root:ROUTE path=/healthz methods={'GET'} name=healthz
+INFO:root:ROUTE path=/health methods={'GET'} name=health
+INFO:root:ROUTE path=/_ah/health methods={'GET'} name=gfe_health
+INFO:root:ROUTE path=/healthz methods={'HEAD'} name=healthz_head
+INFO:root:ROUTE path=/config methods={'GET'} name=config_get
+INFO:root:ROUTE path=/debug/config methods={'GET'} name=debug_config
+INFO:root:ROUTE path=/debug/tables methods={'GET'} name=debug_tables
+INFO:root:ROUTE path=/debug/bq_recent methods={'GET'} name=debug_bq_recent
+INFO:root:ROUTE path=/debug/schedule methods={'GET', 'POST', 'OPTIONS'} name=debug_last_runs
+INFO:root:ROUTE path=/snapshot/last_runs methods={'GET', 'POST', 'OPTIONS'} name=debug_last_runs
+INFO:root:ROUTE path=/last_runs methods={'GET', 'POST', 'OPTIONS'} name=debug_last_runs
+INFO:root:ROUTE path=/debug/last_runs methods={'GET', 'POST', 'OPTIONS'} name=debug_last_runs
+INFO:root:ROUTE path=/debug/schedule/ methods={'GET', 'POST', 'OPTIONS'} name=debug_last_runs_slash
+INFO:root:ROUTE path=/snapshot/last_runs/ methods={'GET', 'POST', 'OPTIONS'} name=debug_last_runs_slash
+INFO:root:ROUTE path=/last_runs/ methods={'GET', 'POST', 'OPTIONS'} name=debug_last_runs_slash
+INFO:root:ROUTE path=/debug/last_runs/ methods={'GET', 'POST', 'OPTIONS'} name=debug_last_runs_slash
+INFO:root:ROUTE path=/snapshot methods={'GET'} name=snapshot
+INFO:root:ROUTE path=/snapshot/set methods={'POST'} name=snapshot_set
+INFO:root:ROUTE path=/trends methods={'GET'} name=trends
+INFO:root:ROUTE path=/optimize/routine methods={'POST'} name=optimize_routine
+INFO:root:ROUTE path=/cron/routine methods={'POST'} name=cron_routine
+INFO:root:ROUTE path=/routine/latest methods={'GET'} name=routine_latest
+INFO:root:ROUTE path=/optimize/load methods={'POST'} name=optimize_load
+INFO:root:ROUTE path=/actuate/apply_stage methods={'POST'} name=actuate_apply_stage
+INFO:root:ROUTE path=/actuate/rollback methods={'POST'} name=actuate_rollback
+INFO:root:ROUTE path=/actuations/latest methods={'GET'} name=actuations_latest
+INFO:root:ROUTE path=/compare/latest methods={'GET'} name=compare_latest
+INFO:root:ROUTE path=/ingest methods={'POST'} name=ingest
+INFO:root:ROUTE path=/predict/spower methods={'POST'} name=predict_spower_route
+INFO:root:ROUTE path=/metrics methods={'GET'} name=metrics
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8080 (Press CTRL+C to quit)
+INFO:root:Found plant.yaml at: /app/config/plant.yaml
+INFO:root:Loaded plant config keys: ['goal', 'match_tags', 'window_minutes', 'min_stability_minutes', 'levers', 'constraints', 'cadence']
+INFO:root:Found plant.yaml at: /app/config/plant.yaml
+INFO:root:Found plant.yaml at: /app/config/plant.yaml
+INFO:root:Found plant.yaml at: /app/config/plant.yaml
+INFO:root:Found plant.yaml at: /app/config/plant.yaml

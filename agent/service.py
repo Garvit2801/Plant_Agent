@@ -104,9 +104,7 @@ PORT = int(os.getenv("PORT", "8080"))
 USE_MOCK = int(os.getenv("USE_MOCK", "1"))
 MOCK_TICK_SEC = float(os.getenv("MOCK_TICK_SEC", "5"))
 APPLY_ENABLED = int(os.getenv("APPLY_ENABLED", "1"))
-# Auto-write the "after" snapshot to BQ snapshots base table so UI updates
 AUTO_INGEST_ON_APPLY = int(os.getenv("AUTO_INGEST_ON_APPLY", "1"))
-# Scheduler cadence hint for UI countdowns
 SCHED_PERIOD_SEC = int(os.getenv("SCHED_PERIOD_SEC", "300"))  # default 5 min
 
 # --- routine min-change thresholds (envs) ---
@@ -118,6 +116,9 @@ MIN_ABS_COOLER = float(os.getenv("MIN_ABS_COOLER", "0.0"))         # Nm3/h
 CRON_APPLY_TOP = os.getenv("CRON_APPLY_TOP", "false").lower() in ("1","true","yes")
 CRON_NUDGE_IF_NEUTRAL = os.getenv("CRON_NUDGE_IF_NEUTRAL", "true").lower() in ("1","true","yes")
 CRON_LOG_SUGGESTIONS = os.getenv("CRON_LOG_SUGGESTIONS", "true").lower() in ("1","true","yes")
+
+# Allow default constraints for cron via env (JSON)
+CRON_DEFAULT_CONSTRAINTS_ENV = os.getenv("CRON_DEFAULT_CONSTRAINTS", "")
 
 # Project (prefer explicit env)
 PROJECT_ID = (
@@ -137,6 +138,11 @@ BQ_PLANS_TABLE_ENV       = os.getenv("BQ_PLANS_TABLE")
 BQ_ACTS_TABLE_ENV        = os.getenv("BQ_ACTUATIONS_TABLE")
 BQ_ROUTINE_TABLE_ENV     = os.getenv("BQ_ROUTINE_TABLE")
 BQ_SUGGESTIONS_TABLE_ENV = os.getenv("BQ_SUGGESTIONS_TABLE")
+
+# >>> SPOWER controls
+SPOWER_MODE = os.getenv("SPOWER_MODE", "static").lower()  # "static" or "dynamic"
+SPOWER_TOL = float(os.getenv("SPOWER_TOL", "0.005"))       # 0.5% relative tolerance
+LOG_PHYSICS = os.getenv("LOG_PHYSICS", "0") in ("1","true","yes")
 
 # -------------------------
 # App & CORS
@@ -340,6 +346,12 @@ _STATE.setdefault("sp", {
     "cooler_airflow_Nm3_h": _STATE["cooler_airflow_Nm3_h"],
     "kiln_speed_rpm": _STATE["kiln_speed_rpm"],
 })
+# Track last drivers that affect specific power so we can gate updates
+_STATE["_spower_drivers"] = {
+    "production_tph": _STATE["production_tph"],
+    "separator_dp_pa_sp": _STATE["sp"]["separator_dp_pa"],
+    "o2_percent": _STATE["o2_percent"],
+}
 
 _HIST = deque(maxlen=int(os.getenv("MOCK_HISTORY_MAX", "2000")))
 
@@ -350,6 +362,34 @@ def _append_history(snapshot: Dict[str, Any]):
         "o2_percent": snapshot.get("o2_percent"),
         "specific_power_kwh_per_ton": snapshot.get("specific_power_kwh_per_ton"),
     })
+
+# >>> PHYSICS LOGGING helper
+def _log_phys(tag: str, **kw):
+    if LOG_PHYSICS:
+        try:
+            logging.info("PHYS %-8s %s", tag, " ".join(f"{k}={kw[k]}" for k in sorted(kw.keys())))
+        except Exception:
+            pass
+
+def _drivers_changed_enough(state: Dict[str, float], sp: Dict[str, float]) -> Tuple[bool, Dict[str, float]]:
+    """Check if any driver for specific power changed beyond tolerance."""
+    last = state.get("_spower_drivers") or {}
+    cur = {
+        "production_tph": float(state.get("production_tph", 0.0)),
+        "separator_dp_pa_sp": float(sp.get("separator_dp_pa", state.get("separator_dp_pa", 0.0))),
+        "o2_percent": float(state.get("o2_percent", 0.0)),
+    }
+    def rel_changed(a: float, b: float) -> bool:
+        if a == 0 and b == 0:
+            return False
+        denom = max(1e-6, abs(a))
+        return abs(b - a) / denom >= SPOWER_TOL
+    changed = (
+        rel_changed(last.get("production_tph", cur["production_tph"]), cur["production_tph"]) or
+        rel_changed(last.get("separator_dp_pa_sp", cur["separator_dp_pa_sp"]), cur["separator_dp_pa_sp"]) or
+        rel_changed(last.get("o2_percent", cur["o2_percent"]), cur["o2_percent"])
+    )
+    return changed, cur
 
 def _physics_tick(state: Dict[str, float], dt_sec: float) -> None:
     sp = state.get("sp", {})
@@ -366,7 +406,8 @@ def _physics_tick(state: Dict[str, float], dt_sec: float) -> None:
             lo = levers.get(k, {}).get("min", -1e12)
             hi = levers.get(k, {}).get("max", 1e12)
             target = clamp(float(sp[k]), lo, hi)
-            state[k] += follow_alpha * (target - state[k])
+            prev = state[k]
+            state[k] = prev + follow_alpha * (target - prev)
 
     # 2) production tracks kiln_feed SP
     tau_prod = 20.0
@@ -377,24 +418,43 @@ def _physics_tick(state: Dict[str, float], dt_sec: float) -> None:
     prod_lo = levers.get("production_tph", {}).get("min", 0.0) or 0.0
     prod_hi = levers.get("production_tph", {}).get("max", 1e12)
     desired_prod = clamp(desired_prod, prod_lo, prod_hi)
-    state["production_tph"] += prod_alpha * (desired_prod - state["production_tph"])
+    prev_prod = state["production_tph"]
+    state["production_tph"] = prev_prod + prod_alpha * (desired_prod - prev_prod)
 
     # 3) O2 vs ID fan flow
     o2_nom = 2.6 + 0.000003 * (sp.get("id_fan_flow_Nm3_h", state["id_fan_flow_Nm3_h"]) - 150_000.0)
     o2_alpha = min(1.0, dt_sec / 5.0)
-    state["o2_percent"] += o2_alpha * (o2_nom - state["o2_percent"])
-    state["o2_percent"] = clamp(state["o2_percent"], 2.0, 5.0)
+    prev_o2 = state["o2_percent"]
+    state["o2_percent"] = clamp(prev_o2 + o2_alpha * (o2_nom - prev_o2), 2.0, 5.0)
 
-    # 4) Specific power
-    k_base = (
-        12.2
-        - 0.25 * (state["production_tph"] - 10.0)
-        + 0.001 * (sp.get("separator_dp_pa", state["separator_dp_pa"]) - 620.0)
-        + 0.15  * (state["o2_percent"] - 2.6)
-    )
-    k_alpha = min(1.0, dt_sec / 10.0)
-    state["specific_power_kwh_per_ton"] += k_alpha * (k_base - state["specific_power_kwh_per_ton"])
-    state["specific_power_kwh_per_ton"] = round(state["specific_power_kwh_per_ton"], 3)
+    # Decide if we should update specific power this tick
+    do_spower = True
+    if SPOWER_MODE == "static":
+        changed, cur_drivers = _drivers_changed_enough(state, sp)
+        if not changed:
+            do_spower = False
+            _log_phys("SKIP_SP", mode=SPOWER_MODE, tol=SPOWER_TOL,
+                      prod=f"{prev_prod:.3f}->{state['production_tph']:.3f}",
+                      o2=f"{prev_o2:.3f}->{state['o2_percent']:.3f}",
+                      sep_sp=f"{float(sp.get('separator_dp_pa', state['separator_dp_pa'])):.3f}")
+        else:
+            state["_spower_drivers"] = cur_drivers
+
+    # 4) Specific power (only when allowed)
+    if do_spower:
+        k_base = (
+            12.2
+            - 0.25 * (state["production_tph"] - 10.0)
+            + 0.001 * (sp.get("separator_dp_pa", state["separator_dp_pa"]) - 620.0)
+            + 0.15  * (state["o2_percent"] - 2.6)
+        )
+        k_alpha = min(1.0, dt_sec / 10.0)
+        prev_sp = state["specific_power_kwh_per_ton"]
+        state["specific_power_kwh_per_ton"] = round(prev_sp + k_alpha * (k_base - prev_sp), 3)
+        _log_phys("APPLY_SP", mode=SPOWER_MODE,
+                  prev=f"{prev_sp:.3f}", kbase=f"{k_base:.3f}", new=f"{state['specific_power_kwh_per_ton']:.3f}",
+                  prod=f"{state['production_tph']:.3f}", o2=f"{state['o2_percent']:.3f}",
+                  sep_sp=f"{float(sp.get('separator_dp_pa', state['separator_dp_pa'])):.3f}")
 
 def _physics_step(state: Dict[str, float]) -> None:
     _physics_tick(state, dt_sec=MOCK_TICK_SEC)
@@ -421,7 +481,6 @@ class RoutineOptimizeReq(BaseModel):
     snapshot: Optional[Dict[str, Any]] = None
     targets: Optional[Dict[str, Any]] = None
     constraints: Optional[Dict[str, Any]] = None
-    # Set to Optional[bool] and resolve via _normalize_routine_flags so manual == cron
     apply_top: Optional[bool] = None
     log_suggestions: Optional[bool] = None
     nudge_if_neutral: Optional[bool] = None
@@ -621,7 +680,6 @@ def _remember_bq_attempt(op: str, table: Optional[str], payload_keys: List[str],
     if len(_BQ_RECENT) > 50:
         del _BQ_RECENT[:-50]
 
-# NEW: write a snapshot row into the base snapshots table
 def _bq_ingest_snapshot(snapshot: Dict[str, Any], source: str = "apply") -> Optional[str]:
     if not _BQ_ENABLED or _bq_client is None:
         return None
@@ -781,6 +839,33 @@ def _maybe_parse_json(v: Any) -> Any:
         return v
 
 # -------------------------
+# Explicitness helper: only auto-apply if request explicitly set apply_top
+# -------------------------
+def _is_explicit_apply_top(req: RoutineOptimizeReq) -> bool:
+    # Pydantic BaseModel exposes __fields_set__ in v1; if missing, be conservative (False)
+    try:
+        return "apply_top" in getattr(req, "__fields_set__", set())
+    except Exception:
+        return False
+
+# -------------------------
+# Cron default constraints (parity with UI, configurable via env)
+# -------------------------
+def _cron_default_constraints() -> Dict[str, Any]:
+    raw = (CRON_DEFAULT_CONSTRAINTS_ENV or "").strip()
+    if not raw:
+        return {"o2_percent": {"min": 2.3, "max": 4.5}}
+    try:
+        cfg = json.loads(raw)
+        if isinstance(cfg, dict):
+            return cfg
+        logging.warning("CRON_DEFAULT_CONSTRAINTS is not a JSON object; using fallback")
+        return {"o2_percent": {"min": 2.3, "max": 4.5}}
+    except Exception:
+        logging.warning("Invalid CRON_DEFAULT_CONSTRAINTS JSON; using fallback")
+        return {"o2_percent": {"min": 2.3, "max": 4.5}}
+
+# -------------------------
 # Routes
 # -------------------------
 @app.get("/")
@@ -805,6 +890,7 @@ def root():
             "/actuations/latest", "/compare/latest",
             "/ingest", "/metrics",
             "/predict/spower",
+            "/debug/physics_flags",
         ],
         "bq_enabled": _BQ_ENABLED,
         "sched_period_sec": SCHED_PERIOD_SEC,
@@ -866,6 +952,9 @@ def debug_config():
         "project_id_env": os.getenv("PROJECT_ID"),
         "project_id_effective": proj_eff,
         "sched_period_sec": SCHED_PERIOD_SEC,
+        "spower_mode": SPOWER_MODE,
+        "spower_tol": SPOWER_TOL,
+        "log_physics": LOG_PHYSICS,
     }
 
 @app.get("/debug/tables")
@@ -915,10 +1004,6 @@ def debug_bq_recent():
 @app.api_route("/snapshot/last_runs", methods=["GET","POST","OPTIONS"])
 @app.api_route("/debug/schedule", methods=["GET","POST","OPTIONS"])
 def debug_last_runs(request: Request):
-    """
-    Return last run info for the UI countdown. Uses in-memory timestamps first
-    and falls back to BigQuery when this instance hasn't seen a run yet.
-    """
     now = _now_ts()
 
     # In-memory times set by /optimize/routine, /cron/routine, and /ingest
@@ -1242,14 +1327,7 @@ def _maybe_neutral_nudge(s: Dict[str, Any],
     reason_extra = ("Applied neutral nudge — " + ", ".join(detail_bits)) if detail_bits else None
     return out, per, reason_extra
 
-# -------------------------
-# Routine flag normalization (manual == cron)
-# -------------------------
 def _normalize_routine_flags(req: RoutineOptimizeReq) -> Dict[str, bool]:
-    """
-    Ensure /optimize/routine (manual) and /cron/routine (auto) resolve to the
-    SAME effective flags when fields are omitted. Defaults use CRON_* envs.
-    """
     apply_top = CRON_APPLY_TOP if req.apply_top is None else bool(req.apply_top)
     log_suggestions = CRON_LOG_SUGGESTIONS if req.log_suggestions is None else bool(req.log_suggestions)
     nudge_if_neutral = CRON_NUDGE_IF_NEUTRAL if req.nudge_if_neutral is None else bool(req.nudge_if_neutral)
@@ -1259,9 +1337,6 @@ def _normalize_routine_flags(req: RoutineOptimizeReq) -> Dict[str, bool]:
         "nudge_if_neutral": nudge_if_neutral,
     }
 
-# -------------------------
-# Optimize (Routine)
-# -------------------------
 def _insert_suggestions_rows(suggestion_id: str,
                              created_at: datetime.datetime,
                              current: Dict[str, Any],
@@ -1322,7 +1397,6 @@ def _insert_suggestions_rows(suggestion_id: str,
 
 @app.post("/optimize/routine")
 def optimize_routine(req: RoutineOptimizeReq):
-    # Treat routine runs (manual or via cron) as a "cron run" for dashboard freshness
     global _LAST_CRON_RUN
     _LAST_CRON_RUN = _now_ts()
 
@@ -1423,7 +1497,6 @@ def optimize_routine(req: RoutineOptimizeReq):
         "used_snapshot_source": used_source,
         "used_snapshot_ts": used_ts,
         "used_snapshot_hash": used_hash,
-        # expose effective flags for parity debugging
         "flags_effective": flags,
         "constraints": req.constraints,
         "targets": req.targets,
@@ -1471,10 +1544,10 @@ def optimize_routine(req: RoutineOptimizeReq):
             logging.warning("suggestions_v1 insert exception: %s", e)
             sugg_log = {"table": _suggestions_table(), "insert_error": str(e), "rows_inserted": 0}
 
-    # Optional auto-apply (based on normalized flag)
+    # Optional auto-apply (ONLY if request explicitly set apply_top)
     actuation = None
     applied = False
-    if flags["apply_top"] and isinstance(proposed_final, dict) and proposed_final:
+    if flags["apply_top"] and _is_explicit_apply_top(req) and isinstance(proposed_final, dict) and proposed_final:
         try:
             actuation = _apply_setpoints_internal(proposed_final, mode="routine", plan_id=None,
                                                   stage_index=None, stage_name="routine_auto_apply")
@@ -1495,7 +1568,6 @@ def optimize_routine(req: RoutineOptimizeReq):
     payload["suggestion_id"] = suggestion_id
     payload["created_at"] = created_at.isoformat()
 
-    # remember latest suggestion for quick UI retrieval
     try:
         _ROUTINE_RECENT.append({
             "suggestion_id": suggestion_id,
@@ -1524,20 +1596,36 @@ def optimize_routine(req: RoutineOptimizeReq):
 @app.post("/cron/routine")
 def cron_routine(body: dict = Body(default={})):
     """
-    Cron entry point. We simply map incoming fields onto RoutineOptimizeReq without
-    embedding defaults here; optimize_routine() will normalize flags the same way,
-    so auto == manual for identical plant state.
+    Cron wrapper:
+    - Injects default constraints if none provided (parity with UI)
+    - Defaults nudge_if_neutral to env (true) if absent
+    - NEVER auto-apply unless explicitly set in body
     """
     global _LAST_CRON_RUN
     _LAST_CRON_RUN = _now_ts()
 
+    b = dict(body or {})
+
+    # 1) Constraints parity with UI
+    if "constraints" not in b or not isinstance(b.get("constraints"), dict):
+        b["constraints"] = _cron_default_constraints()
+
+    # 2) Nudge parity with env (UI default ON)
+    if "nudge_if_neutral" not in b:
+        b["nudge_if_neutral"] = CRON_NUDGE_IF_NEUTRAL
+
+    # 3) NEVER auto-apply for cron unless explicitly requested in this body
+    #    (and optimize_routine will further require explicitness to pass)
+    if "apply_top" not in b:
+        b["apply_top"] = False
+
     req = RoutineOptimizeReq(
-        snapshot=body.get("snapshot"),
-        targets=body.get("targets"),
-        constraints=body.get("constraints"),
-        apply_top=body.get("apply_top"),                  # may be None → normalized inside
-        log_suggestions=body.get("log_suggestions"),      # may be None → normalized inside
-        nudge_if_neutral=body.get("nudge_if_neutral"),    # may be None → normalized inside
+        snapshot=b.get("snapshot"),
+        targets=b.get("targets"),
+        constraints=b.get("constraints"),
+        apply_top=b.get("apply_top"),
+        log_suggestions=b.get("log_suggestions"),
+        nudge_if_neutral=b.get("nudge_if_neutral"),
     )
     return optimize_routine(req)
 
@@ -1699,8 +1787,8 @@ def optimize_load(req: LoadOptimizeReq):
     if _BQ_ENABLED and tbl:
         stages_bq: List[Dict[str, Any]] = []
         for stg in stages:
-            sp = stg.get("setpoints")
-            sp_out = _as_json_string(sp) if isinstance(sp, (dict, list)) else sp
+            spv = stg.get("setpoints")
+            sp_out = _as_json_string(spv) if isinstance(spv, (dict, list)) else spv
             stages_bq.append({
                 "name": stg.get("name"),
                 "setpoints": sp_out,
@@ -1763,11 +1851,6 @@ def actuations_latest():
 
 @app.get("/compare/latest")
 def compare_latest():
-    """
-    Returns a minimal structure the UI can use to render the comparison table.
-    If the latest routine suggestion was auto-applied, return before→after.
-    Else, return current→proposed_setpoints for preview.
-    """
     if not _ROUTINE_RECENT:
         raise HTTPException(status_code=404, detail="No routine suggestions yet")
 
@@ -1944,7 +2027,7 @@ def predict_spower_route(doc: dict = Body(default={})):
           @separator_dp_pa       AS separator_dp_pa,
           @id_fan_flow_Nm3_h     AS id_fan_flow_Nm3_h,
           @cooler_airflow_Nm3_h  AS cooler_airflow_Nm3_h,
-          @kiln_speed_rpm        AS kiln_speed_rpm,
+          @kilnr_speed_rpm       AS kilnr_speed_rpm,
           @o2_percent            AS o2_percent
         )
       )
@@ -1959,7 +2042,7 @@ def predict_spower_route(doc: dict = Body(default={})):
                 bigquery.ScalarQueryParameter("separator_dp_pa", "FLOAT64", params["separator_dp_pa"]),
                 bigquery.ScalarQueryParameter("id_fan_flow_Nm3_h", "FLOAT64", params["id_fan_flow_Nm3_h"]),
                 bigquery.ScalarQueryParameter("cooler_airflow_Nm3_h", "FLOAT64", params["cooler_airflow_Nm3_h"]),
-                bigquery.ScalarQueryParameter("kiln_speed_rpm", "FLOAT64", params["kiln_speed_rpm"]),
+                bigquery.ScalarQueryParameter("kilnr_speed_rpm", "FLOAT64", params["kiln_speed_rpm"]),
                 bigquery.ScalarQueryParameter("o2_percent", "FLOAT64", params["o2_percent"]),
             ]
         ),
@@ -1997,7 +2080,28 @@ def metrics():
             "CRON_APPLY_TOP": CRON_APPLY_TOP,
             "CRON_NUDGE_IF_NEUTRAL": CRON_NUDGE_IF_NEUTRAL,
             "CRON_LOG_SUGGESTIONS": CRON_LOG_SUGGESTIONS,
+        },
+        "spower": {
+            "mode": SPOWER_MODE,
+            "tol": SPOWER_TOL,
+            "logging": bool(LOG_PHYSICS),
         }
+    }
+
+@app.get("/debug/physics_flags")
+def physics_flags():
+    sp = _STATE.get("sp", {})
+    drv = _STATE.get("_spower_drivers", {})
+    return {
+        "spower_mode": SPOWER_MODE,
+        "spower_tol": SPOWER_TOL,
+        "log_physics": LOG_PHYSICS,
+        "current_drivers": {
+            "production_tph": _STATE.get("production_tph"),
+            "separator_dp_pa_sp": sp.get("separator_dp_pa"),
+            "o2_percent": _STATE.get("o2_percent"),
+        },
+        "last_drivers_seen": drv,
     }
 
 # -------------------------

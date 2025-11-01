@@ -5,10 +5,10 @@ import { LineChart, Line, XAxis, YAxis, Tooltip, Legend, CartesianGrid } from "r
  * Plant Agent – Operations Dashboard UI (SYNCED)
  * Objective: manual routine == cron routine (same flags & behavior)
  *
- * Changes:
- *  - Added "Nudge if neutral" toggle (default: ON) to mirror cron behavior
- *  - POST /optimize/routine now sends { nudge_if_neutral } alongside other flags
- *  - Minor copy updates to make parity explicit
+ * Parity Notes:
+ *  - "Nudge if neutral" toggle (default: ON) mirrors cron behavior
+ *  - POST /optimize/routine sends { nudge_if_neutral } and O2 constraints
+ *  - Manual never auto-applies unless you check "Apply top" OR click Accept
  */
 
 const RECOMMENDED_HOST = "https://plant-agent-i32khy5nrq-el.a.run.app";
@@ -369,7 +369,7 @@ export default function PlantAgentDashboard() {
         constraints: { o2_percent: { min: Number(o2Min)||undefined, max: Number(o2Max)||undefined } },
         apply_top: applyTop,
         log_suggestions: logSugg,
-        // NEW: ensure parity with cron defaults
+        // parity with cron defaults
         nudge_if_neutral: nudgeFlag === "1",
       };
       const s0 = snap ?? (await fetchSnapshotFast()); if (s0) setRoutineBefore({ ...s0 });
@@ -677,7 +677,7 @@ export default function PlantAgentDashboard() {
         <section className="card">
           <div className="flex items-center justify-between">
             <div className="font-semibold">Routine Optimization</div>
-            <div className="text-xs text-slate-500">Manual run mirrors cron defaults (parity ON)</div>
+            <div className="text-xs text-slate-500">Manual run mirrors cron defaults</div>
           </div>
           <div className="mt-3 grid md:grid-cols-8 gap-3 items-end">
             <div>
@@ -694,9 +694,9 @@ export default function PlantAgentDashboard() {
             <label className="inline-flex items-center gap-2 text-sm">
               <input type="checkbox" checked={logSugg} onChange={(e)=>setLogSugg(e.target.checked)} /> Log suggestions
             </label>
-            {/* NEW: nudge parity toggle */}
+            {/* parity toggle */}
             <label className="inline-flex items-center gap-2 text-sm">
-              <input type="checkbox" checked={nudgeFlag==="1"} onChange={(e)=>setNudgeFlag(e.target.checked ? "1" : "0")} /> Nudge if neutral (cron parity)
+              <input type="checkbox" checked={nudgeFlag==="1"} onChange={(e)=>setNudgeFlag(e.target.checked ? "1" : "0")} /> Nudge if neutral
             </label>
             <button onClick={runRoutine} className="btn-secondary" disabled={!base}>Run routine</button>
             <div className="text-xs text-slate-500 col-span-2">
