@@ -112,10 +112,13 @@ MIN_PCT_DELTA = float(os.getenv("MIN_PCT_DELTA", "0.0"))           # fraction, e
 MIN_ABS_ID_FAN = float(os.getenv("MIN_ABS_ID_FAN", "0.0"))         # Nm3/h
 MIN_ABS_COOLER = float(os.getenv("MIN_ABS_COOLER", "0.0"))         # Nm3/h
 
-# Cron defaults (symmetric config)
+# Cron defaults (used only as *inputs* for manual runs; cron enforces apply_top=False)
 CRON_APPLY_TOP = os.getenv("CRON_APPLY_TOP", "false").lower() in ("1","true","yes")
 CRON_NUDGE_IF_NEUTRAL = os.getenv("CRON_NUDGE_IF_NEUTRAL", "true").lower() in ("1","true","yes")
 CRON_LOG_SUGGESTIONS = os.getenv("CRON_LOG_SUGGESTIONS", "true").lower() in ("1","true","yes")
+
+# Auth
+AUTH_BEARER = os.getenv("AUTH_BEARER", "superlongrandomsecret")
 
 # Project (prefer explicit env)
 PROJECT_ID = (
@@ -173,7 +176,7 @@ app.add_middleware(
     allow_origins=UI_ORIGINS,
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type"],
+    allow_headers=["Authorization", "Content-Type", "X-Confirm-Apply"],
 )
 
 def _origin_allowed(origin: Optional[str]) -> bool:
@@ -184,7 +187,7 @@ def _cors_hdrs_for(origin: Optional[str]) -> Dict[str, str]:
         return {
             "Access-Control-Allow-Origin": origin,
             "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-            "Access-Control-Allow-Headers": "authorization, content-type",
+            "Access-Control-Allow-Headers": "authorization, content-type, x-confirm-apply",
             "Access-Control-Max-Age": "86400",
             "Vary": "Origin",
         }
@@ -481,6 +484,8 @@ class RoutineOptimizeReq(BaseModel):
     apply_top: Optional[bool] = None
     log_suggestions: Optional[bool] = None
     nudge_if_neutral: Optional[bool] = None
+    # new: distinguish cron vs manual for last-run stamping
+    trigger: Optional[str] = Field(default=None, description="'cron'|'manual'")
 
 class LoadOptimizeReq(BaseModel):
     snapshot: Optional[Dict[str, Any]] = None
@@ -766,6 +771,24 @@ def _insert_suggestions_rows(suggestion_id: str,
 # -------------------------
 _ACTS_RECENT: deque = deque(maxlen=50)
 
+def _strip_debug_keys(m: Dict[str, Any]) -> Dict[str, Any]:
+    """Remove nested debug keys that are not part of BQ schema."""
+    if isinstance(m, dict):
+        m.pop("_spower_drivers", None)
+    return m
+
+def _check_bearer_ok(request: Request) -> bool:
+    auth = request.headers.get("authorization") or request.headers.get("Authorization")
+    if not auth or not auth.lower().startswith("bearer "):
+        return False
+    token = auth.split(" ", 1)[1].strip()
+    return token == AUTH_BEARER
+
+def _is_manual_actuation_request(request: Request) -> bool:
+    confirmed = (request.headers.get("X-Confirm-Apply", "") or request.headers.get("x-confirm-apply", "")).lower() == "yes"
+    authorized = _check_bearer_ok(request)
+    return confirmed and authorized
+
 def _apply_setpoints_internal(setpts: Dict[str, float],
                               mode: Optional[str] = None,
                               plan_id: Optional[str] = None,
@@ -814,11 +837,15 @@ def _apply_setpoints_internal(setpts: Dict[str, float],
     else:
         after = {}
 
+    # strip debug keys before any logging/response
+    before_clean = _strip_debug_keys(dict(before)) if isinstance(before, dict) else None
+    after_clean  = _strip_debug_keys(dict(after)) if isinstance(after, dict) else None
+
     applied_at = _now_ts()
 
-    if AUTO_INGEST_ON_APPLY and after:
+    if AUTO_INGEST_ON_APPLY and after_clean:
         try:
-            _bq_ingest_snapshot(after, source=f"apply:{mode or 'manual'}")
+            _bq_ingest_snapshot(after_clean, source=f"apply:{mode or 'manual'}")
             global _LAST_INGEST_RUN
             _LAST_INGEST_RUN = applied_at
         except Exception as e:
@@ -835,9 +862,9 @@ def _apply_setpoints_internal(setpts: Dict[str, float],
                 return _as_json_string(val)
             return val
 
-        deltas_obj = _diff_kpis(before, after) if before and after else None
-        before_for_bq = _maybe_stringify(before,  "before")
-        after_for_bq  = _maybe_stringify(after,   "after")
+        deltas_obj = _diff_kpis(before_clean, after_clean) if before_clean and after_clean else None
+        before_for_bq = _maybe_stringify(before_clean,  "before")
+        after_for_bq  = _maybe_stringify(after_clean,   "after")
         deltas_for_bq = _maybe_stringify(deltas_obj, "deltas")
 
         act_row = {
@@ -870,8 +897,8 @@ def _apply_setpoints_internal(setpts: Dict[str, float],
     res = {
         "ok": True,
         "applied_at": applied_at.isoformat(),
-        "before": _round_map(before) if isinstance(before, dict) else None,
-        "after": _round_map(after) if isinstance(after, dict) else None,
+        "before": _round_map(before_clean) if isinstance(before_clean, dict) else None,
+        "after": _round_map(after_clean) if isinstance(after_clean, dict) else None,
         "bq_log": {"table": tbl, "insert_error": err},
     }
     _ACTS_RECENT.append(res)
@@ -1037,7 +1064,7 @@ def debug_bq_recent():
 def debug_last_runs(request: Request):
     now = _now_ts()
 
-    # In-memory times set by /optimize/routine, /cron/routine, and /ingest
+    # In-memory times set by /cron/routine and /ingest
     last_cron = _LAST_CRON_RUN
     last_ing  = _LAST_INGEST_RUN
 
@@ -1370,9 +1397,8 @@ def _normalize_routine_flags(req: RoutineOptimizeReq) -> Dict[str, bool]:
 
 @app.post("/optimize/routine")
 def optimize_routine(req: RoutineOptimizeReq):
-    global _LAST_CRON_RUN
-    _LAST_CRON_RUN = _now_ts()
-
+    # Only cron sets last cron time; manual runs shouldn't update the cron clock
+    # (cron route below sets trigger='cron' explicitly)
     flags = _normalize_routine_flags(req)
 
     # snapshot
@@ -1469,7 +1495,7 @@ def optimize_routine(req: RoutineOptimizeReq):
         "match_info": {"candidates_used": 2008},
         "used_snapshot_source": used_source,
         "used_snapshot_ts": used_ts,
-        "used_snapshot_hash": used_hash,
+        "used_snapshot_hash": _md5_short(s),
         "flags_effective": flags,
         "constraints": req.constraints,
         "targets": req.targets,
@@ -1499,7 +1525,7 @@ def optimize_routine(req: RoutineOptimizeReq):
             "reason_detail": reason_detail,
             "used_snapshot_source": used_source,
             "used_snapshot_ts": used_ts,
-            "used_snapshot_hash": used_hash,
+            "used_snapshot_hash": _md5_short(s),
         }
         err = _bq_insert_flexible(tbl, suggestion_row)
         _remember_bq_attempt("routine_insert", tbl, list(suggestion_row.keys()), err)
@@ -1517,20 +1543,21 @@ def optimize_routine(req: RoutineOptimizeReq):
             logging.warning("suggestions_v1 insert exception: %s", e)
             sugg_log = {"table": _suggestions_table(), "insert_error": str(e), "rows_inserted": 0}
 
-    # Optional auto-apply (based on normalized flag)
+    # Optional auto-apply (manual flows only)
     actuation = None
     applied = False
-    if flags["apply_top"] and isinstance(proposed_final, dict) and proposed_final:
-        try:
-            actuation = _apply_setpoints_internal(proposed_final, mode="routine", plan_id=None,
-                                                  stage_index=None, stage_name="routine_auto_apply")
-            applied = True and (actuation.get("bq_log", {}).get("insert_error") is None)
-        except HTTPException as e:
-            logging.warning("Auto-apply failed: %s", e.detail)
-            actuation = {"ok": False, "error": e.detail}
-        except Exception as e:
-            logging.warning("Auto-apply exception: %s", e)
-            actuation = {"ok": False, "error": str(e)}
+    if (req.trigger or "").lower() != "cron":
+        if flags["apply_top"] and isinstance(proposed_final, dict) and proposed_final:
+            try:
+                actuation = _apply_setpoints_internal(proposed_final, mode="routine", plan_id=None,
+                                                      stage_index=None, stage_name="routine_auto_apply")
+                applied = True and (actuation.get("bq_log", {}).get("insert_error") is None)
+            except HTTPException as e:
+                logging.warning("Auto-apply failed: %s", e.detail)
+                actuation = {"ok": False, "error": e.detail}
+            except Exception as e:
+                logging.warning("Auto-apply exception: %s", e)
+                actuation = {"ok": False, "error": str(e)}
 
     payload["bq_log"] = {"table": tbl, "insert_error": err}
     if sugg_log:
@@ -1558,7 +1585,7 @@ def optimize_routine(req: RoutineOptimizeReq):
             "reason_detail": reason_detail,
             "used_snapshot_source": used_source,
             "used_snapshot_ts": used_ts,
-            "used_snapshot_hash": used_hash,
+            "used_snapshot_hash": _md5_short(s),
             "flags_effective": flags,
         })
     except Exception:
@@ -1568,16 +1595,19 @@ def optimize_routine(req: RoutineOptimizeReq):
 
 @app.post("/cron/routine")
 def cron_routine(body: dict = Body(default={})):
+    """Strictly read-only cron: never applies, stamps last_cron."""
     global _LAST_CRON_RUN
     _LAST_CRON_RUN = _now_ts()
 
+    # Force apply_top False regardless of env/body (cron must be preview-only)
     req = RoutineOptimizeReq(
         snapshot=body.get("snapshot"),
         targets=body.get("targets"),
         constraints=body.get("constraints"),
-        apply_top=body.get("apply_top"),
-        log_suggestions=body.get("log_suggestions"),
-        nudge_if_neutral=body.get("nudge_if_neutral"),
+        apply_top=False,
+        log_suggestions=body.get("log_suggestions", CRON_LOG_SUGGESTIONS),
+        nudge_if_neutral=body.get("nudge_if_neutral", CRON_NUDGE_IF_NEUTRAL),
+        trigger="cron",
     )
     return optimize_routine(req)
 
@@ -1775,7 +1805,10 @@ def optimize_load(req: LoadOptimizeReq):
 # Actuation (apply stage) + Actuation Logging
 # -------------------------
 @app.post("/actuate/apply_stage")
-def actuate_apply_stage(req: ApplyStageReq = Body(default={})):
+def actuate_apply_stage(request: Request, req: ApplyStageReq = Body(default={})):
+    # Require explicit manual confirmation + bearer for safety
+    if not _is_manual_actuation_request(request):
+        raise HTTPException(status_code=403, detail="Manual actuation requires X-Confirm-Apply: yes and a valid Bearer token.")
     setpts = req.extract_setpoints()
     res = _apply_setpoints_internal(
         setpts=setpts,
@@ -1979,7 +2012,7 @@ def predict_spower_route(doc: dict = Body(default={})):
           @separator_dp_pa       AS separator_dp_pa,
           @id_fan_flow_Nm3_h     AS id_fan_flow_Nm3_h,
           @cooler_airflow_Nm3_h  AS cooler_airflow_Nm3_h,
-          @kiln_speed_rpm        AS kilnr_speed_rpm,
+          @kiln_speed_rpm        AS kiln_speed_rpm,
           @o2_percent            AS o2_percent
         )
       )
@@ -1992,7 +2025,7 @@ def predict_spower_route(doc: dict = Body(default={})):
                 bigquery.ScalarQueryParameter("production_tph", "FLOAT64", params["production_tph"]),
                 bigquery.ScalarQueryParameter("kiln_feed_tph", "FLOAT64", params["kiln_feed_tph"]),
                 bigquery.ScalarQueryParameter("separator_dp_pa", "FLOAT64", params["separator_dp_pa"]),
-                bigquery.ScalarQueryParameter("kilnr_speed_rpm", "FLOAT64", params["kiln_speed_rpm"]),
+                bigquery.ScalarQueryParameter("kiln_speed_rpm", "FLOAT64", params["kiln_speed_rpm"]),
                 bigquery.ScalarQueryParameter("id_fan_flow_Nm3_h", "FLOAT64", params["id_fan_flow_Nm3_h"]),
                 bigquery.ScalarQueryParameter("cooler_airflow_Nm3_h", "FLOAT64", params["cooler_airflow_Nm3_h"]),
                 bigquery.ScalarQueryParameter("o2_percent", "FLOAT64", params["o2_percent"]),
