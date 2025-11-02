@@ -131,8 +131,8 @@ MODEL_NAME = os.getenv("BQ_MODEL_NAME", "spower_reg")
 
 # NEW: dataset/envs used for views
 VIEW_DATASET = os.getenv("VIEW_DATASET", "plant_ops")
-RAW_DATASET = os.getenv("RAW_DATASET", "plant_ops")  # kept for consistency if needed
-RAW_TABLE = os.getenv("RAW_TABLE", "raw_signals")     # not used by the PM view readers but retained
+RAW_DATASET = os.getenv("RAW_DATASET", "plant_ops")
+RAW_TABLE = os.getenv("RAW_TABLE", "raw_signals")
 
 # Table envs
 BQ_SNAPSHOTS_TABLE_ENV = os.getenv("BQ_SNAPSHOTS_TABLE")
@@ -142,21 +142,20 @@ BQ_ACTS_TABLE_ENV        = os.getenv("BQ_ACTUATIONS_TABLE")
 BQ_ROUTINE_TABLE_ENV     = os.getenv("BQ_ROUTINE_TABLE")
 BQ_SUGGESTIONS_TABLE_ENV = os.getenv("BQ_SUGGESTIONS_TABLE")
 
-# >>> KPI predictions tables (NEW)
+# KPI predictions tables
 BQ_KPI_PRED_LATEST_ENV = os.getenv("BQ_KPI_PRED_LATEST_TABLE")
 BQ_KPI_PRED_FUTURE_ENV = os.getenv("BQ_KPI_PRED_FUTURE_TABLE")
 
-# >>> SPOWER controls
+# SPOWER controls
 SPOWER_MODE = os.getenv("SPOWER_MODE", "static").lower()  # "static" or "dynamic"
 SPOWER_TOL = float(os.getenv("SPOWER_TOL", "0.005"))       # 0.5% relative tolerance
 LOG_PHYSICS = os.getenv("LOG_PHYSICS", "0") in ("1","true","yes")
 
-# --- Condition Monitoring KPIs (new) ---
-# schema suggestion:
-#   ts TIMESTAMP, kpi STRING, value FLOAT64, aux JSON, source STRING
+# Condition Monitoring KPIs
+# schema: ts TIMESTAMP, kpi STRING, value FLOAT64, aux JSON, source STRING
 BQ_CM_KPI_TABLE_ENV = os.getenv("BQ_CM_KPI_TABLE")  # e.g. myproj.plant_ops.cm_kpis
 
-# ---- Forecasting toggles (NEW) ----
+# Forecasting toggles
 FORECAST_PM_ENABLE = os.getenv("FORECAST_PM_ENABLE", "1") in ("1", "true", "yes")
 FORECAST_PM_INTERVAL_SEC = int(os.getenv("FORECAST_PM_INTERVAL_SEC", "60"))
 FORECAST_PM_HORIZON_MIN = int(os.getenv("FORECAST_PM_HORIZON_MIN", "60"))
@@ -205,7 +204,7 @@ app.add_middleware(
     allow_origins=UI_ORIGINS,
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"],  # <— allow any request header (fixes custom header preflights)
+    allow_headers=["*"],
     expose_headers=["X-Service-Version", "X-Sched-Period-Sec"],
     max_age=86400,
 )
@@ -218,7 +217,7 @@ def _cors_hdrs_for(origin: Optional[str]) -> Dict[str, str]:
         return {
             "Access-Control-Allow-Origin": origin,
             "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-            "Access-Control-Allow-Headers": "*",  # <— mirror the middleware
+            "Access-Control-Allow-Headers": "*",
             "Access-Control-Max-Age": "86400",
             "Vary": "Origin",
         }
@@ -382,7 +381,7 @@ _STATE["_spower_drivers"] = {
     "separator_dp_pa_sp": _STATE["sp"]["separator_dp_pa"],
     "o2_percent": _STATE["o2_percent"],
 }
-# NEW: PM variables
+# PM variables
 _STATE.update({
     "vibration_axial_mm_s": 2.0,
     "vibration_radial_mm_s": 1.8,
@@ -803,6 +802,26 @@ def _bq_ingest_snapshot(snapshot: Dict[str, Any], source: str = "apply") -> Opti
     _remember_bq_attempt("snapshot_insert", table, list(row.keys()), err)
     return err
 
+def _cm_table_fq(backticked: bool = False) -> str:
+    """
+    Return the fully-qualified cm_kpis table as 'project.dataset.table'.
+    If backticked=True, wrap it in BigQuery backticks.
+    Uses _cm_table() if present, else env CM_KPIS_TABLE.
+    """
+    tbl = None
+    try:
+        tbl = _cm_table()
+    except Exception:
+        pass
+    if not tbl:
+        tbl = os.getenv("CM_KPIS_TABLE")
+    if not tbl:
+        raise RuntimeError("CM KPIs table not configured; set CM_KPIS_TABLE or implement _cm_table()")
+
+    tbl = tbl.strip().strip("`")
+    return f"`{tbl}`" if backticked else tbl
+
+
 # -------------------------
 # NEW: insert per-lever suggestions helper
 # -------------------------
@@ -1062,7 +1081,7 @@ def root():
             "/ingest", "/metrics",
             "/predict/spower",
             "/debug/physics_flags",
-            # NEW condition monitoring endpoints
+            # Condition monitoring endpoints
             "/cm/vhi", "/cm/vhi/log", "/cm/mci", "/cm/mci/log",
             # alias explicitly exposed
             "/segments/pm",
@@ -1151,10 +1170,10 @@ def debug_tables():
         "actuations_table": _acts_table(),
         "routine_table": _routine_table(),
         "suggestions_table": _suggestions_table(),
-        # NEW: prediction tables
+        # prediction tables
         "kpi_predictions_latest": _kpi_pred_latest_table(),
         "kpi_predictions_future": _kpi_pred_future_table(),
-        # NEW: condition monitoring table
+        # condition monitoring table
         "cm_kpis": _cm_table(),
         "pm_views": {
             "trends": _pm_trends_view(),
@@ -1165,6 +1184,34 @@ def debug_tables():
         "bq_location": BQ_LOCATION,
         "view_dataset": _view_dataset(),
     }
+
+@app.get("/pm/health/latest")
+def pm_health_latest():
+    if not (_BQ_ENABLED and _bq_client):
+        raise HTTPException(status_code=503, detail="BigQuery disabled")
+
+    # Resolve CM table (backticked)
+    tbl_name = _cm_table() or os.getenv("CM_KPIS_TABLE")
+    if not tbl_name:
+        raise HTTPException(status_code=500, detail="CM KPIs table not configured")
+    tbl = f"`{tbl_name.strip().strip('`')}`"
+
+    q = f"""
+    WITH latest AS (
+      SELECT
+        kpi,
+        ts,
+        value,
+        JSON_VALUE(aux, '$.status') AS status,
+        ROW_NUMBER() OVER (PARTITION BY kpi ORDER BY ts DESC) AS rn
+      FROM {tbl}
+    )
+    SELECT kpi, ts, value, status
+    FROM latest
+    WHERE rn = 1
+    """
+    rows = _bq_query(q)
+    return {r["kpi"]: {"ts": r["ts"], "value": r["value"], "status": r["status"]} for r in rows}
 
 @app.get("/debug/bq_recent")
 def debug_bq_recent():
@@ -1394,7 +1441,9 @@ def trends(
 # -------------------------
 # NEW: PM View Readers (BigQuery views you created)
 # -------------------------
-@app.get("/pm/trends")
+from fastapi import status as _status
+
+@app.api_route("/pm/trends", methods=["GET", "HEAD"])
 def pm_trends_view():
     """
     Read from view: {project}.{VIEW_DATASET}.pm_trends_last2h
@@ -1416,9 +1465,22 @@ def pm_trends_view():
         out.append(d)
     return out
 
-# >>>>>>>>>>>> HARDENED: GET+HEAD + alias + OPTIONS (fixes 405s) + minutes filter
-from fastapi import status as _status
+# Trailing-slash alias and explicit OPTIONS for /pm/trends
+@app.api_route("/pm/trends/", methods=["GET", "HEAD"])
+def pm_trends_view_slash():
+    return pm_trends_view()
 
+@app.options("/pm/trends")
+def options_pm_trends(request: Request):
+    origin = request.headers.get("origin")
+    return Response(status_code=_status.HTTP_204_NO_CONTENT, headers=_cors_hdrs_for(origin) | {"Allow": "GET, HEAD, OPTIONS"})
+
+@app.options("/pm/trends/")
+def options_pm_trends_slash(request: Request):
+    origin = request.headers.get("origin")
+    return Response(status_code=_status.HTTP_204_NO_CONTENT, headers=_cors_hdrs_for(origin) | {"Allow": "GET, HEAD, OPTIONS"})
+
+# >>>>>>>>>>>> HARDENED: GET+HEAD + alias + OPTIONS + minutes filter
 @app.api_route("/pm/segments", methods=["GET", "HEAD"])
 def pm_segments_view(minutes: Optional[int] = Query(default=None, ge=1, le=24*60)):
     """
@@ -1471,9 +1533,8 @@ def options_pm_segments(request: Request):
 def options_segments_pm(request: Request):
     origin = request.headers.get("origin")
     return Response(status_code=_status.HTTP_204_NO_CONTENT, headers=_cors_hdrs_for(origin) | {"Allow": "GET, HEAD, OPTIONS"})
-# <<<<<<<<<<< HARDENED BLOCK END
 
-@app.get("/pm/forecast")
+@app.api_route("/pm/forecast", methods=["GET", "HEAD"])
 def pm_forecast_view():
     """
     Optional: reads {project}.{VIEW_DATASET}.pm_forecast_next60m if present.
@@ -1494,6 +1555,11 @@ def pm_forecast_view():
         d["ts"] = ts.isoformat() if isinstance(ts, datetime.datetime) else str(ts)
         out.append(d)
     return out
+
+@app.options("/pm/forecast")
+def options_pm_forecast(request: Request):
+    origin = request.headers.get("origin")
+    return Response(status_code=_status.HTTP_204_NO_CONTENT, headers=_cors_hdrs_for(origin) | {"Allow": "GET, HEAD, OPTIONS"})
 
 # -------------------------
 # Internal: threshold filter & optional neutral nudge
@@ -2045,7 +2111,7 @@ def actuate_rollback():
     return {"ok": True, "note": "Live plant rollback not implemented"}
 
 # -------------------------
-# NEW: support endpoints for UI comparison & latest actuation
+# Support endpoints for UI comparison & latest actuation
 # -------------------------
 @app.get("/actuations/latest")
 def actuations_latest():
@@ -2382,10 +2448,6 @@ def kpi_predictions_latest(
     horizon_min: int = Query(..., ge=1, le=24*60),
     limit: int = Query(2880, ge=1, le=100000),
 ):
-    """
-    Returns the latest-run line for the given KPI & horizon,
-    ordered by target_ts (what the chart needs). Falls back to in-memory when BQ is disabled.
-    """
     # Memory fallback
     mem = _PRED_LATEST_MEM.get((kpi_name, horizon_min))
     if mem and (not _BQ_ENABLED or _bq_client is None):
@@ -2427,10 +2489,6 @@ def kpi_predictions_future(
     kpi_name: str = Query(..., description="KPI name, e.g. 'production_tph'"),
     limit: int = Query(500, ge=1, le=100000),
 ):
-    """
-    Returns all future points across runs (pred_ts DESC, target_ts ASC)
-    capped by limit — good for multi-run ribbon plots. Falls back to in-memory when BQ is disabled.
-    """
     # Memory fallback
     mem = _PRED_FUTURE_MEM.get(kpi_name)
     if mem and (not _BQ_ENABLED or _bq_client is None):
@@ -2478,6 +2536,29 @@ class MCIPoint(BaseModel):
     value: float
     kpi: str  # "MCI_percent" or "BearingTempRise_C"
 
+# ---- Robust column matching (improved) ----
+def _pick_col(df: pd.DataFrame, names: List[str]) -> Optional[str]:
+    """
+    Find a column by exact/loose name match (case-insensitive):
+    - exact
+    - underscore-insensitive exact
+    - startswith
+    - contains
+    """
+    cols = list(df.columns)
+    low = [c.lower() for c in cols]
+    for n in names:
+        nlow = n.lower()
+        if nlow in low:
+            return cols[low.index(nlow)]
+        for i, cl in enumerate(low):
+            if cl.replace("_", "") == nlow.replace("_", ""):
+                return cols[i]
+        for i, cl in enumerate(low):
+            if cl.startswith(nlow) or (nlow in cl):
+                return cols[i]
+    return None
+
 def _select_vibration_cols(df: pd.DataFrame) -> List[str]:
     keys = ["vibration", "vibe", "accel", "acceleration", "bearing", "brg"]
     num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
@@ -2508,45 +2589,34 @@ def _status_from_hi(hi_val: float, thresh: float) -> str:
         return "watch"
     return "alert"
 
-def _pick_col(df: pd.DataFrame, names: List[str]) -> Optional[str]:
-    lower = {c.lower(): c for c in df.columns}
-    for n in names:
-        if n in lower:
-            return lower[n]
-    return None
-
 def _compute_mci_series(df: pd.DataFrame) -> pd.Series:
-    cand_a = [ "ia", "i_a", "phase_a", "phase a", "current_a", "current a" ]
-    cand_b = [ "ib", "i_b", "phase_b", "phase b", "current_b", "current b" ]
-    cand_c = [ "ic", "i_c", "phase_c", "phase c", "current_c", "current c" ]
-    ca = _pick_col(df, cand_a) or _pick_col(df, [s.upper() for s in cand_a])
-    cb = _pick_col(df, cand_b) or _pick_col(df, [s.upper() for s in cand_b])
-    cc = _pick_col(df, cand_c) or _pick_col(df, [s.upper() for s in cand_c])
-
+    # broadened to catch motor_current_a/b/c too
+    cand_a = ["ia","i_a","phase_a","phase a","current_a","current a","motor_current_a","motor current a"]
+    cand_b = ["ib","i_b","phase_b","phase b","current_b","current b","motor_current_b","motor current b"]
+    cand_c = ["ic","i_c","phase_c","phase c","current_c","current c","motor_current_c","motor current c"]
+    ca = _pick_col(df, cand_a + [s.upper() for s in cand_a])
+    cb = _pick_col(df, cand_b + [s.upper() for s in cand_b])
+    cc = _pick_col(df, cand_c + [s.upper() for s in cand_c])
     if not ca or not cb or not cc:
         return pd.Series(index=df.index, dtype=float)
-
     sA = pd.to_numeric(df[ca], errors="coerce")
     sB = pd.to_numeric(df[cb], errors="coerce")
     sC = pd.to_numeric(df[cc], errors="coerce")
-
     avg = (sA + sB + sC) / 3.0
     mci = (pd.concat([sA,sB,sC], axis=1).max(axis=1) - pd.concat([sA,sB,sC], axis=1).min(axis=1)) / (avg + 1e-9) * 100.0
     mci[(avg <= 0) | (~np.isfinite(mci))] = np.nan
     return mci
 
 def _compute_bearing_temp_rise_series(df: pd.DataFrame) -> pd.Series:
-    cand_brg = ["bearing_temp","brg_temp","bearing temperature","bearing"]
-    cand_inl = ["inlet_temp","suction_temp","inlet temperature","suction temperature"]
-    cand_amb = ["ambient_temp","ambient temperature","room_temp","room temperature"]
-
+    # accept _C suffixed and common variants
+    cand_brg = ["bearing_temp","bearing_temp_c","brg_temp","brg_temp_c","bearing temperature","bearing"]
+    cand_inl = ["suction_temp","suction_temp_c","inlet_temp","inlet_temp_c","inlet temperature","suction temperature"]
+    cand_amb = ["ambient_temp","ambient_temp_c","ambient temperature","room_temp","room temperature"]
     cb = _pick_col(df, cand_brg + [s.upper() for s in cand_brg])
     ci = _pick_col(df, cand_inl + [s.upper() for s in cand_inl])
     ca = _pick_col(df, cand_amb + [s.upper() for s in cand_amb])
-
     if not cb:
         return pd.Series(index=df.index, dtype=float)
-
     b = pd.to_numeric(df[cb], errors="coerce")
     base = None
     if ci:
@@ -2555,11 +2625,49 @@ def _compute_bearing_temp_rise_series(df: pd.DataFrame) -> pd.Series:
         base = pd.to_numeric(df[ca], errors="coerce")
     else:
         return pd.Series(index=df.index, dtype=float)
-
     return b - base
 
 # -------------------------
-# NEW: VHI + MCI endpoints
+# >>> VHI SHIMS so Pylance is happy (only used if your project didn't define them)
+# -------------------------
+if "_compute_vhi_series" not in globals():
+    def _compute_vhi_series(df: pd.DataFrame) -> pd.Series:
+        """
+        Fallback: compute a Vibration Health Index time series from vibration-ish numeric columns.
+        Robust rolling z-scores averaged across selected columns.
+        """
+        cols = _select_vibration_cols(df)
+        if not cols:
+            # Consider generic numeric cols as a very last resort
+            num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+            cols = num_cols
+        if not cols:
+            return pd.Series(index=getattr(df, "index", []), dtype=float)
+
+        sel = df[cols].copy()
+        win = max(10, min(500, int(len(sel) * 0.05))) or 10
+        roll_mean = sel.rolling(win, min_periods=max(5, win // 3)).mean()
+        roll_std  = sel.rolling(win, min_periods=max(5, win // 3)).std()
+        z = (sel - roll_mean) / (roll_std + 1e-9)
+        hi = z.abs().mean(axis=1)
+        return hi
+
+if "_vhi_threshold" not in globals():
+    def _vhi_threshold(vhi: pd.Series) -> float:
+        """
+        Fallback: robust threshold as median + 3*MAD, with a floor at P95 to avoid being too low.
+        """
+        v = pd.to_numeric(vhi, errors="coerce").dropna()
+        if v.empty:
+            return float("nan")
+        med = float(np.median(v.values))
+        mad = float(np.median(np.abs(v.values - med)))
+        robust_thr = med + 3.0 * (1.4826 * mad)
+        p95 = float(np.percentile(v.values, 95))
+        return max(robust_thr, p95)
+
+# -------------------------
+# VHI + MCI endpoints
 # -------------------------
 @app.get("/cm/vhi", response_model=List[VHIPoint])
 def cm_vhi(minutes: int = Query(default=240, ge=10, le=24*60)):
@@ -2585,33 +2693,76 @@ def cm_vhi(minutes: int = Query(default=240, ge=10, le=24*60)):
 @app.post("/cm/vhi/log")
 def cm_vhi_log(source: str = Body(default="scheduler")):
     """
-    Compute latest VHI point and append to cm_kpis table (if BQ enabled).
+    Compute latest VHI point and append to cm_kpis (if BQ enabled).
+    Adds aux.status and aux.threshold so segments & UI can classify it.
     """
     df = _df_recent(minutes=240)
     if df.empty:
         raise HTTPException(status_code=404, detail="No data for VHI")
-    hi, thresh, _ = _compute_vhi(df)
-    if hi.empty or hi.dropna().empty:
+
+    # Compute series
+    vhi = _compute_vhi_series(df)  # shim ensures this exists
+    vhi = vhi.dropna()
+    if vhi.empty:
         raise HTTPException(status_code=404, detail="VHI not computable")
-    ts = hi.dropna().index[-1]
-    val = float(hi.loc[ts])
-    status = _status_from_hi(val, float(thresh))
-    tbl = _cm_table()
+
+    # Threshold (prefer existing helper if present; else robust fallback)
+    try:
+        thr = float(_vhi_threshold(vhi))  # shim ensures this exists
+    except Exception:
+        med = float(np.median(vhi.values))
+        mad = float(np.median(np.abs(vhi.values - med)))
+        thr = med + 3.0 * (1.4826 * mad) if np.isfinite(med) and np.isfinite(mad) else float("nan")
+
+    val_ts = vhi.index[-1]
+    val = float(vhi.iloc[-1])
+
+    # Status bands
+    def _vhi_status(v: float, t: float) -> str:
+        if not np.isfinite(v):
+            return "ok"
+        if np.isfinite(t):
+            if v < 0.7 * t:
+                return "ok"
+            if v < 1.0 * t:
+                return "watch"
+            return "alert"
+        if v < 0.8:
+            return "ok"
+        if v < 1.2:
+            return "watch"
+        return "alert"
+
+    status = _vhi_status(val, thr)
+
+    # ---- BigQuery insert ----
+    tbl_name = _cm_table() or os.getenv("CM_KPIS_TABLE")
+    if not tbl_name:
+        raise HTTPException(status_code=500, detail="CM KPIs table not configured")
+    tbl = f"`{tbl_name.strip().strip('`')}`"
+
     err = None
     if _BQ_ENABLED and _bq_client is not None and tbl:
         payload = {
-            "ts": ts.isoformat(),
+            "ts": val_ts.isoformat(),
             "kpi": "VHI",
             "value": val,
-            "aux": {"threshold": float(thresh), "status": status},
+            "aux": {"status": status, "threshold": thr if np.isfinite(thr) else None},
             "source": source,
         }
         err = _bq_insert_flexible(tbl, payload)
-        _remember_bq_attempt("cm_kpi_insert", tbl, ["ts","kpi","value","aux","source"], err)
+        _remember_bq_attempt("cm_kpi_insert", tbl, ["ts", "kpi", "value", "aux", "source"], err)
+
     return {
         "ok": err is None if _BQ_ENABLED else True,
-        "table": tbl,
-        "point": {"ts": ts.isoformat(), "kpi": "VHI", "value": val, "threshold": float(thresh), "status": status},
+        "table": tbl_name,
+        "point": {
+            "ts": val_ts.isoformat(),
+            "kpi": "VHI",
+            "value": val,
+            "threshold": thr if np.isfinite(thr) else None,
+            "status": status,
+        },
         "bq_error": err,
     }
 
@@ -2642,19 +2793,45 @@ def cm_mci(minutes: int = Query(default=240, ge=10, le=24*60)):
 def cm_mci_log(source: str = Body(default="scheduler")):
     """
     Compute latest MCI (or Bearing Temp Rise) point and append to cm_kpis table (if BQ enabled).
+    Adds aux.status so segments can classify it.
     """
     df = _df_recent(minutes=240)
     if df.empty:
         raise HTTPException(status_code=404, detail="No data for MCI")
+
     mci = _compute_mci_series(df)
-    if mci.notna().sum() >= max(3, int(0.05 * len(df))):
+    use_mci = mci.notna().sum() >= max(3, int(0.05 * len(df)))
+
+    if use_mci:
         kpi_name = "MCI_percent"
         series = mci
-        aux = {}
+
+        def _mci_status(val: float) -> str:
+            if not np.isfinite(val):
+                return "ok"
+            if val < 30.0:
+                return "ok"
+            if val < 50.0:
+                return "watch"
+            return "alert"
+
+        status_fn = _mci_status
+        aux_extra = {}
     else:
         kpi_name = "BearingTempRise_C"
         series = _compute_bearing_temp_rise_series(df)
-        aux = {"note": "fallback_no_three_phase_currents"}
+
+        def _btr_status(val: float) -> str:
+            if not np.isfinite(val):
+                return "ok"
+            if val < 10.0:
+                return "ok"
+            if val < 20.0:
+                return "watch"
+            return "alert"
+
+        status_fn = _btr_status
+        aux_extra = {"note": "fallback_no_three_phase_currents"}
 
     series = series.dropna()
     if series.empty:
@@ -2662,13 +2839,27 @@ def cm_mci_log(source: str = Body(default="scheduler")):
 
     ts = series.index[-1]
     val = float(series.iloc[-1])
+    status = status_fn(val)
+
     tbl = _cm_table()
     err = None
     if _BQ_ENABLED and _bq_client is not None and tbl:
-        payload = {"ts": ts.isoformat(), "kpi": kpi_name, "value": val, "aux": aux, "source": source}
+        payload = {
+            "ts": ts.isoformat(),
+            "kpi": kpi_name,
+            "value": val,
+            "aux": {"status": status, **aux_extra},
+            "source": source,
+        }
         err = _bq_insert_flexible(tbl, payload)
-        _remember_bq_attempt("cm_kpi_insert", tbl, ["ts","kpi","value","aux","source"], err)
-    return {"ok": err is None if _BQ_ENABLED else True, "table": tbl, "point": {"ts": ts.isoformat(), "kpi": kpi_name, "value": val}, "bq_error": err}
+        _remember_bq_attempt("cm_kpi_insert", tbl, ["ts", "kpi", "value", "aux", "source"], err)
+
+    return {
+        "ok": err is None if _BQ_ENABLED else True,
+        "table": tbl,
+        "point": {"ts": ts.isoformat(), "kpi": kpi_name, "value": val, "status": status},
+        "bq_error": err,
+    }
 
 # -------------------------
 # /metrics & debug
