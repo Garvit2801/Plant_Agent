@@ -8,7 +8,6 @@ import {
  * - Important Trends + PM Trends (own source selector)
  * - PM segments (ok/watch/alert) as shaded bands in the PM chart
  * - Alias-tolerant trend cleaning so PM data renders even if keys differ
- * - UI-side PM placeholders to keep tiles/charts populated if backend has no PM feed
  * - Only /debug/last_runs uses GET→POST fallback (others are GET-only)
  */
 
@@ -25,7 +24,6 @@ const LS_KEYS = {
   NUDGE: "plant_ui.nudge_if_neutral",
   AUTO_APPLY: "plant_ui.routine_auto_apply",
   PM_TREND_SOURCE: "plant_ui.pm_trend_source",
-  PM_PLACEHOLDERS: "plant_ui.pm_placeholders", // NEW
 };
 
 function useLocalStorage(key: string, initial: string) {
@@ -199,35 +197,6 @@ function cleanTrends(rows: any[]): TrendPoint[] {
   return out;
 }
 
-/* ===== UI PM placeholders ===== */
-function genPmPlaceholders(n = 72): TrendPoint[] {
-  const now = Date.now();
-  const spanMs = 2 * 60 * 60 * 1000; // 2h
-  const step = Math.floor(spanMs / n);
-  const pts: TrendPoint[] = [];
-  for (let i = n - 1; i >= 0; i--) {
-    const tMs = now - i * step;
-    const tStr = new Date(tMs).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-
-    // Smooth-ish waves, bounded
-    const phi = i / n;
-    const vhi = 65 + 2.5 * Math.sin(phi * Math.PI * 2);
-    const mci = 5.2 + 1.2 * Math.cos(phi * Math.PI * 2 + Math.PI / 4);
-    const btr = 7 + 2.5 * Math.sin(phi * Math.PI * 4);
-
-    pts.push({
-      t: tStr,
-      production_tph: null,
-      o2_percent: null,
-      specific_power_kwh_per_ton: null,
-      vhi_health_index: Number(vhi.toFixed(2)),
-      mci_percent: Number(mci.toFixed(2)),
-      bearing_temp_rise_C: Number(btr.toFixed(2)),
-    });
-  }
-  return pts;
-}
-
 /* =========================
    Main Component
    ========================= */
@@ -241,7 +210,6 @@ export default function PlantAgentDashboard() {
   const [nudgeFlag, setNudgeFlag] = useLocalStorage(LS_KEYS.NUDGE, "1");
   const [autoApplyRoutine, setAutoApplyRoutine] = useLocalStorage(LS_KEYS.AUTO_APPLY, "0");
   const [pmTrendSource, setPmTrendSource] = useLocalStorage(LS_KEYS.PM_TREND_SOURCE, "auto");
-  const [usePmPlaceholders, setUsePmPlaceholders] = useLocalStorage(LS_KEYS.PM_PLACEHOLDERS, "1"); // NEW
 
   // Headers (no auth)
   const getHeaders = useMemo(() => ({} as Record<string,string>), []);
@@ -724,7 +692,7 @@ export default function PlantAgentDashboard() {
 
   /* responsive chart */
   const chartBoxRef = useRef<HTMLDivElement | null>(null);
-  const [chartBoxSize, setChartBoxSize] = useState({ w: 0, h: 224 });
+  const [chartBoxSize, setChartBoxSize] = useState({ w: 0, h: 0 });
   useEffect(() => {
     if (!chartBoxRef.current) return;
     const ro = new ResizeObserver((entries) => {
@@ -732,26 +700,6 @@ export default function PlantAgentDashboard() {
     });
     ro.observe(chartBoxRef.current); return () => ro.disconnect();
   }, []);
-
-  /* ====== PM tile placeholders (values if snapshot lacks them) ====== */
-  const vhiTileVal = snap?.vhi_health_index ?? (usePmPlaceholders === "1" ? 65.0 : null);
-  const vhiTileThreshold = snap?.vhi_threshold ?? (usePmPlaceholders === "1" ? 70.0 : null);
-  const vhiTileStatus: Snapshot["vhi_status"] =
-    snap?.vhi_status ??
-    (usePmPlaceholders === "1"
-      ? ((typeof vhiTileVal === "number" && typeof vhiTileThreshold === "number" && vhiTileVal >= vhiTileThreshold) ? "alert" : "watch")
-      : null);
-
-  const mciTileVal = snap?.mci_percent ?? (usePmPlaceholders === "1" ? 5.2 : null);
-
-  // Effective PM trends (real or placeholders)
-  const pmTrendsEffective: TrendPoint[] = useMemo(() => {
-    if (pmTrends.length) return pmTrends;
-    if (usePmPlaceholders === "1") return genPmPlaceholders(72);
-    return [];
-  }, [pmTrends, usePmPlaceholders]);
-
-  const usingPmPlaceholders = pmTrends.length === 0 && usePmPlaceholders === "1";
 
   const kpi = snap;
   const chartData: TrendPoint[] = trends.length ? trends : history;
@@ -830,13 +778,6 @@ export default function PlantAgentDashboard() {
               </select>
               <span className="text-xs text-slate-500">from <span className="font-mono">{pmTrendEndpoint}</span></span>
             </div>
-            <label className="inline-flex items-center gap-2">
-              <input
-                type="checkbox"
-                checked={usePmPlaceholders==="1"}
-                onChange={(e)=>setUsePmPlaceholders(e.target.checked ? "1" : "0")}
-              /> UI PM placeholders
-            </label>
             <button
               onClick={()=>{ fetchSnapshot(); fetchTrends(); fetchPmTrends(); fetchPmSegments(); fetchLastRuns(); fetchRoutineLatest(); getMetrics(); }}
               className="btn-outline"
@@ -866,22 +807,18 @@ export default function PlantAgentDashboard() {
               <div className="text-2xl font-semibold mt-1">{fmt(t.val, 3)}</div>
             </div>
           ))}
-          {/* MCI tile (with UI placeholder) */}
           <div className="tile">
             <div className="text-xs text-slate-500">Motor Current Imbalance (%)</div>
-            <div className="text-2xl font-semibold mt-1">{fmt(mciTileVal, 2)}</div>
-            {snap?.mci_percent == null && usePmPlaceholders==="1" && <div className="text-[10px] text-slate-400 mt-1">placeholder</div>}
+            <div className="text-2xl font-semibold mt-1">{fmt(kpi?.mci_percent ?? null, 2)}</div>
           </div>
-          {/* VHI tile (with UI placeholder) */}
           <div className="tile">
             <div className="flex items-center justify-between">
               <div className="text-xs text-slate-500">Vibration Health Index</div>
-              <Chip tone={statusTone(vhiTileStatus)}>{vhiTileStatus ?? "—"}</Chip>
+              <Chip tone={statusTone(kpi?.vhi_status)}>{kpi?.vhi_status ?? "—"}</Chip>
             </div>
             <div className="mt-1">
-              <div className="text-2xl font-semibold">{fmt(vhiTileVal, 2)}</div>
-              <div className="text-[11px] text-slate-500 mt-1">threshold: {fmt(vhiTileThreshold, 2)}</div>
-              {snap?.vhi_health_index == null && usePmPlaceholders==="1" && <div className="text-[10px] text-slate-400 mt-1">placeholder</div>}
+              <div className="text-2xl font-semibold">{fmt(kpi?.vhi_health_index ?? null, 2)}</div>
+              <div className="text-[11px] text-slate-500 mt-1">threshold: {fmt(kpi?.vhi_threshold ?? null, 2)}</div>
             </div>
           </div>
         </section>
@@ -1020,24 +957,23 @@ export default function PlantAgentDashboard() {
               </select>
               <span className="text-[11px]">from <span className="font-mono">{pmTrendEndpoint}</span></span>
               {pmSegsNote && <span className="ml-2 text-[11px] text-slate-500">• {pmSegsNote}</span>}
-              {usingPmPlaceholders && <Chip tone="amber">placeholder</Chip>}
             </div>
           </div>
 
           <div className="text-xs text-slate-500 mb-2">
-            {pmTrendsEffective.length ? `Loaded ${pmTrendsEffective.length} PM points${usingPmPlaceholders ? " (UI placeholders)" : ""}` : "Waiting for PM data…"}
+            {pmTrends.length ? `Loaded ${pmTrends.length} PM points` : "Waiting for PM data…"}
           </div>
 
           <div className="h-56 w-full">
-            {(pmTrendsEffective.length && chartBoxSize.w>0) ? (
-              <LineChart width={chartBoxSize.w} height={chartBoxSize.h} data={pmTrendsEffective} margin={{ top: 8, right: 32, left: 8, bottom: 8 }}>
+            {(pmTrends.length && chartBoxSize.w>0) ? (
+              <LineChart width={chartBoxSize.w} height={chartBoxSize.h} data={pmTrends} margin={{ top: 8, right: 32, left: 8, bottom: 8 }}>
                 <CartesianGrid stroke="#e2e8f0" strokeDasharray="3 3" />
                 <XAxis dataKey="t" tick={{ fill: "#334155", fontSize: 12 }} axisLine={{ stroke: "#94a3b8" }} tickLine={{ stroke: "#94a3b8" }} />
                 <YAxis yAxisId="left" domain={["auto","auto"]} tick={{ fill: "#334155", fontSize: 12 }} axisLine={{ stroke: "#94a3b8" }} tickLine={{ stroke: "#94a3b8" }} />
                 <YAxis yAxisId="right" orientation="right" domain={["auto","auto"]} tick={{ fill: "#334155", fontSize: 12 }} axisLine={{ stroke: "#94a3b8" }} tickLine={{ stroke: "#94a3b8" }} />
                 <Tooltip /><Legend wrapperStyle={{ paddingTop: 8 }} />
 
-                {/* PM shaded segments (only from backend) */}
+                {/* PM shaded segments */}
                 {pmSegs.map((s, i) => {
                   const x1 = tsToLabel(s.start_ts);
                   const x2 = tsToLabel(s.end_ts ?? new Date().toISOString());
