@@ -4,13 +4,15 @@ import {
 } from "recharts";
 
 /**
- * Plant Agent – Operations Dashboard (No-Auth Variant) — HARDENED
- * - Same feature set as your latest version
- * - Safer polling (visibility-aware), AbortController, stronger fetch helpers
- * - Stricter typing & null guards, fewer memory leaks, clearer errors
+ * Plant Agent – Operations Dashboard (No-Auth Variant) — CLEANED
+ * - Routine/load “Important Trends”
+ * - Separate PM trends card with its own source selector
+ * - PM segments (ok/watch/alert) shaded in the PM chart
+ * - VHI (index), MCI (%), BearingTempRise (°C) supported
+ * - PM segments fetch tries GET, then POST {minutes}, backs off on 405/404
  */
 
-const RECOMMENDED_HOST = import.meta.env.VITE_PLANT_AGENT_BASE?.trim() || "https://plant-agent-i32khy5nrq-el.a.run.app";
+const RECOMMENDED_HOST = "https://plant-agent-i32khy5nrq-el.a.run.app";
 const DEBUG_KEY = "plant_ui.debug";
 const getDebug = () => (localStorage.getItem(DEBUG_KEY) ?? "0") === "1";
 const setDebug = (b: boolean) => localStorage.setItem(DEBUG_KEY, b ? "1" : "0");
@@ -23,7 +25,7 @@ const LS_KEYS = {
   NUDGE: "plant_ui.nudge_if_neutral",
   AUTO_APPLY: "plant_ui.routine_auto_apply",
   PM_TREND_SOURCE: "plant_ui.pm_trend_source",
-} as const;
+};
 
 function useLocalStorage(key: string, initial: string) {
   const [v, setV] = useState<string>(() => localStorage.getItem(key) ?? initial);
@@ -32,18 +34,8 @@ function useLocalStorage(key: string, initial: string) {
 }
 
 function cls(...xs: (string | false | undefined | null)[]) { return xs.filter(Boolean).join(" "); }
-function fmt(n: number | undefined | null, d = 3) {
-  if (n == null || Number.isNaN(n)) return "-";
-  return Number(n).toFixed(d);
-}
-function normalizeBase(u: string) {
-  if (!u) return "";
-  let s = u.trim();
-  // Basic guard against accidental path parts or trailing slashes
-  s = s.replace(/\/+$/, "");
-  s = s.replace(/\/snapshot$/i, "");
-  return s;
-}
+function fmt(n: number | undefined | null, d = 3) { if (n == null || Number.isNaN(n)) return "-"; return Number(n).toFixed(d); }
+function normalizeBase(u: string) { if (!u) return ""; let s = u.trim(); s = s.replace(/\/+$/, ""); s = s.replace(/\/snapshot$/i, ""); return s; }
 function info(msg: string, extra?: any) { if (getDebug()) console.log(`[PlantUI] ${msg}`, extra ?? ""); }
 function parseNum(v: any): number {
   if (v == null) return NaN;
@@ -59,6 +51,7 @@ type Snapshot = {
   production_tph: number; kiln_feed_tph: number; separator_dp_pa: number;
   id_fan_flow_Nm3_h: number; cooler_airflow_Nm3_h: number; kiln_speed_rpm: number;
   o2_percent: number; specific_power_kwh_per_ton: number;
+
   // PM KPIs (optional)
   vhi_health_index?: number | null;
   vhi_threshold?: number | null;
@@ -77,14 +70,7 @@ type TrendPoint = {
   bearing_temp_rise_C?: number | null;
 };
 
-type LastRuns = {
-  last_cron_routine: string | null;
-  last_ingest: string | null;
-  sched_period_sec: number;
-  now: string;
-  next_cron_eta: string | null;
-  seconds_to_next: number | null;
-};
+type LastRuns = { last_cron_routine: string | null; last_ingest: string | null; sched_period_sec: number; now: string; next_cron_eta: string | null; seconds_to_next: number | null; };
 
 type LeverAudit = {
   current: number | null;
@@ -97,14 +83,7 @@ type LeverAudit = {
   rule: string | null;
 };
 
-type ApplyResp = {
-  ok: boolean;
-  before?: Partial<Snapshot> | null;
-  after?: Partial<Snapshot> | null;
-  applied_at?: string;
-  bq_log?: { table?: string | null; insert_error?: string | null };
-  note?: string; error?: string;
-};
+type ApplyResp = { ok: boolean; before?: Partial<Snapshot> | null; after?: Partial<Snapshot> | null; applied_at?: string; bq_log?: { table?: string | null; insert_error?: string | null }; note?: string; error?: string };
 
 type RoutineResp = {
   mode: "routine";
@@ -143,63 +122,50 @@ type LoadResp = {
 
 /* PM segments */
 type PMSegment = {
-  start_ts: string;
-  end_ts?: string | null;
+  start_ts: string;            // ISO timestamp
+  end_ts?: string | null;      // optional (ongoing)
   status: "ok" | "watch" | "alert";
   kpi?: "VHI" | "MCI_percent" | "BearingTempRise_C" | string;
   note?: string;
 };
 
 /* =========================
-   Fetch helpers (with AbortController)
+   Helpers used by UI
    ========================= */
-function safeJson<T = any>(r: Response): Promise<T> {
-  const ct = r.headers.get("content-type") || "";
-  if (!ct.includes("application/json")) return Promise.resolve({} as T);
-  return r.json() as Promise<T>;
-}
-async function getJsonCandidates(
-  base: string,
-  headers: Record<string, string>,
-  paths: string[],
-  signal?: AbortSignal
-): Promise<{ json: any; path: string; status: number; method: "GET" }> {
-  let last: unknown;
+function pickLatestTimestamp(j: any): string | null { return j?.created_at || j?.createdAt || j?.ts || j?.timestamp || null; }
+function pickProposal(j: any): Record<string, number> | undefined { return j?.proposed_setpoints || j?.proposal?.setpoints || j?.top?.proposed_setpoints; }
+
+async function getJsonCandidates(base: string, headers: Record<string, string>, paths: string[]) {
+  let last: any;
   for (const p of paths) {
     const url = `${base}${p}`;
     try {
-      const r = await fetch(url, { headers, signal });
-      if (r.ok) return { json: await safeJson(r), path: p, status: r.status, method: "GET" };
-      const txt = await r.text().catch(() => "");
-      last = new Error(`GET ${p} ${r.status}${txt ? ` – ${txt.slice(0, 140)}` : ""}`);
+      const r = await fetch(url, { headers });
+      if (r.ok) return { json: await r.json(), path: p, status: r.status, method: "GET" as const };
+      const txt = await r.text().catch(()=> "");
+      last = new Error(`GET ${p} ${r.status}${txt ? ` – ${txt.slice(0,140)}` : ""}`);
     } catch (e) { last = e; }
   }
   throw last ?? new Error("No candidate path succeeded");
 }
 
-async function methodFallback(
-  base: string,
-  getHeaders: Record<string, string>,
-  postHeaders: Record<string, string>,
-  paths: string[],
-  signal?: AbortSignal
-): Promise<{ json: any; path: string; method: "GET" | "POST"; status: number }> {
-  let last: unknown;
+async function methodFallback(base: string, getHeaders: Record<string,string>, postHeaders: Record<string,string>, paths: string[]) {
+  let last: any;
   for (const p of paths) {
     const url = `${base}${p}`;
     try {
-      const g = await fetch(url, { headers: getHeaders, signal });
-      if (g.ok) return { json: await safeJson(g), path: p, method: "GET", status: g.status };
+      const g = await fetch(url, { headers: getHeaders });
+      if (g.ok) return { json: await g.json(), path: p, method: "GET" as const, status: g.status };
       if (g.status === 405) {
         try {
-          const pr = await fetch(url, { method: "POST", headers: postHeaders, body: "{}", signal });
-          if (pr.ok) return { json: await safeJson(pr), path: p, method: "POST", status: pr.status };
-          const txt = await pr.text().catch(() => "");
-          last = new Error(`POST ${p} ${pr.status}${txt ? ` – ${txt.slice(0, 140)}` : ""}`);
+          const pr = await fetch(url, { method: "POST", headers: postHeaders, body: "{}" });
+          if (pr.ok) return { json: await pr.json(), path: p, method: "POST" as const, status: pr.status };
+          const txt = await pr.text().catch(()=> "");
+          last = new Error(`POST ${p} ${pr.status}${txt ? ` – ${txt.slice(0,140)}` : ""}`);
         } catch (e) { last = e; }
       } else {
-        const txt = await g.text().catch(() => "");
-        last = new Error(`GET ${p} ${g.status}${txt ? ` – ${txt.slice(0, 140)}` : ""}`);
+        const txt = await g.text().catch(()=> "");
+        last = new Error(`GET ${p} ${g.status}${txt ? ` – ${txt.slice(0,140)}` : ""}`);
       }
     } catch (e) { last = e; }
   }
@@ -208,10 +174,7 @@ async function methodFallback(
 
 /* trend cleaning — includes VHI/MCI/BTR if present */
 function cleanTrends(rows: any[]): TrendPoint[] {
-  const sorted = rows
-    .slice()
-    .sort((a, b) => new Date(a.ts ?? 0).getTime() - new Date(b.ts ?? 0).getTime());
-
+  const sorted = rows.slice().sort((a,b)=>new Date(a.ts??0).getTime()-new Date(b.ts??0).getTime());
   const out: TrendPoint[] = [];
   let lastProd: number | undefined;
 
@@ -231,7 +194,7 @@ function cleanTrends(rows: any[]): TrendPoint[] {
     const mciGood  = Number.isFinite(mci) && mci >= 0 && mci < 100;
     const btrGood  = Number.isFinite(btr) && Math.abs(btr) < 200;
 
-    const spike = lastProd && prodGood ? Math.abs(prod - lastProd) / Math.max(1e-9, lastProd) > 0.30 : false;
+    const spike = lastProd && prodGood ? Math.abs(prod-lastProd)/Math.max(1e-9,lastProd) > 0.30 : false;
     const keepProd = prodGood && !spike ? prod : null;
     if (keepProd !== null) lastProd = keepProd;
 
@@ -264,7 +227,7 @@ function statusTone(s?: string | null) {
 function segTone(s: PMSegment["status"]) {
   if (s === "alert") return { stroke: "#ef4444", fill: "#ef4444" };
   if (s === "watch") return { stroke: "#f59e0b", fill: "#f59e0b" };
-  return { stroke: "#22c55e", fill: "#22c55e" };
+  return { stroke: "#22c55e", fill: "#22c55e" }; // ok
 }
 function tsToLabel(ts: string) {
   try { return new Date(ts).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" }); } catch { return ""; }
@@ -287,7 +250,7 @@ export default function PlantAgentDashboard() {
   // Headers (no auth)
   const getHeaders = useMemo(() => ({} as Record<string,string>), []);
   const postHeaders = useMemo(() => ({"Content-Type":"application/json"} as Record<string,string>), []);
-  const applyHeaders = useMemo(() => ({"Content-Type":"application/json","X-Confirm-Apply":"yes"} as Record<string,string>), []);
+  const applyHeaders = useMemo(() => ({ "Content-Type":"application/json", "X-Confirm-Apply":"yes" } as Record<string,string>), []);
 
   const [health, setHealth] = useState<string>("-");
   const [ver, setVer] = useState<string>("-");
@@ -302,6 +265,8 @@ export default function PlantAgentDashboard() {
   const [pmTrends, setPmTrends] = useState<TrendPoint[]>([]);
   const [pmTrendEndpoint, setPmTrendEndpoint] = useState("(none)");
   const [pmSegs, setPmSegs] = useState<PMSegment[]>([]);
+  const pmSegsDisabledRef = useRef(false);
+  const [pmSegsNote, setPmSegsNote] = useState<string>("");
 
   const [lastRuns, setLastRuns] = useState<LastRuns | null>(null);
   const [countdown, setCountdown] = useState<number | null>(null);
@@ -322,64 +287,37 @@ export default function PlantAgentDashboard() {
   const [routineBefore, setRoutineBefore] = useState<Snapshot | null>(null);
   const [routineAfter, setRoutineAfter] = useState<Snapshot | null>(null);
 
-  const [metrics, setMetrics] = useState<any>(null);
+  const [metrics, setMetrics] = useState<any>(null); // diagnostics
   const [metricsErr, setMetricsErr] = useState<string>("");
 
-  // timers/refs
   const pollRef = useRef<number | null>(null);
   const countTimerRef = useRef<number | null>(null);
   const disableLastRunsRef = useRef(false);
   const cronProbeRef = useRef<number | null>(null);
   const lastCronRef = useRef<string | null>(null);
+
+  // present if hooked in styles elsewhere
   const thelpRef = useRef<HTMLDivElement | null>(null);
-  const abortRef = useRef<AbortController | null>(null);
-
-  /* Visibility-aware polling */
-  const isVisible = () => typeof document !== "undefined" ? !document.hidden : true;
-
-  useEffect(() => {
-    const onVis = () => {
-      if (!isVisible()) {
-        if (pollRef.current) { window.clearInterval(pollRef.current); pollRef.current = null; }
-      } else {
-        // will restart on next effect pass
-      }
-    };
-    document.addEventListener("visibilitychange", onVis);
-    return () => document.removeEventListener("visibilitychange", onVis);
-  }, []);
-
-  const withAbort = useCallback((fn: (signal?: AbortSignal)=>Promise<void>) => {
-    abortRef.current?.abort();
-    const ctl = new AbortController();
-    abortRef.current = ctl;
-    return fn(ctl.signal).catch((e) => {
-      if ((e as any)?.name === "AbortError") return;
-      throw e;
-    });
-  }, []);
 
   /* Health/version */
   const fetchHealth = useCallback(async () => {
     if (!base) return;
     try {
-      await withAbort(async (signal) => {
-        const candidates = ["/health", "/snapshot/health", "/healthz"];
-        let r: Response | null = null;
-        for (const p of candidates) {
-          try { const t = await fetch(`${base}${p}`, { headers: getHeaders, signal }); r = t; if (t.ok || t.status !== 404) break; } catch {}
-        }
-        if (!r) throw new Error("health unreachable");
-        setHealth(String(r.status));
-        const { json: vj } = await getJsonCandidates(base, getHeaders, ["/version","/snapshot/version"], signal);
-        setVer(vj?.version ?? "-");
-      });
+      const candidates = ["/health", "/snapshot/health", "/healthz"];
+      let r: Response | null = null;
+      for (const p of candidates) {
+        try { const t = await fetch(`${base}${p}`, { headers: getHeaders }); r = t; if (t.ok || t.status !== 404) break; } catch {}
+      }
+      if (!r) throw new Error("health unreachable");
+      setHealth(String(r.status));
+      const { json: vj } = await getJsonCandidates(base, getHeaders, ["/version","/snapshot/version"]);
+      setVer(vj?.version ?? "-");
     } catch (e:any) {
       setHealth("error"); setVer("-"); setErrorMsg(e?.message || "health failed");
     }
-  }, [base, getHeaders, withAbort]);
+  }, [base, getHeaders]);
 
-  /* Snapshot & trend helpers */
+  /* Snapshot & trends */
   const pushHistory = useCallback((s: Snapshot, tLabel?: string) => {
     setHistory(prev => [...prev.slice(-240), {
       t: tLabel ?? new Date().toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" }),
@@ -396,11 +334,9 @@ export default function PlantAgentDashboard() {
     if (!base) return null;
     for (const p of ["/snapshot","/snapshot?source=bq"]) {
       try {
-        const r = await fetch(`${base}${p}`, { headers: getHeaders, signal: abortRef.current?.signal });
+        const r = await fetch(`${base}${p}`, { headers: getHeaders });
         if (!r.ok) continue;
-        const j = (await safeJson<Snapshot>(r)) as Snapshot;
-        if (!j) continue;
-        setSnap(j); pushHistory(j); return j;
+        const j = await r.json(); setSnap(j); pushHistory(j); return j;
       } catch {}
     }
     return null;
@@ -414,121 +350,172 @@ export default function PlantAgentDashboard() {
   const fetchTrends = useCallback(async () => {
     if (!base) return;
     try {
-      await withAbort(async (signal) => {
-        const pathAuto = "/trends?minutes=120&limit=240&source=auto";
-        const pathBQ   = "/trends?minutes=120&limit=240&source=bq";
-        const { json, path } = await getJsonCandidates(base, getHeaders, trendSource === "bq" ? [pathBQ,pathAuto] : [pathAuto,pathBQ], signal);
-        setTrendEndpoint(path);
-        if (Array.isArray(json)) setTrends(cleanTrends(json).slice(-240));
-      });
+      const pathAuto = "/trends?minutes=120&limit=240&source=auto";
+      const pathBQ   = "/trends?minutes=120&limit=240&source=bq";
+      const { json, path } = await getJsonCandidates(base, getHeaders, trendSource === "bq" ? [pathBQ,pathAuto] : [pathAuto,pathBQ]);
+      setTrendEndpoint(path);
+      if (Array.isArray(json)) setTrends(cleanTrends(json).slice(-240));
     } catch (e:any) {
       setErrorMsg(prev => prev || e?.message || "Failed to fetch trends");
     }
-  }, [base, getHeaders, trendSource, withAbort]);
+  }, [base, getHeaders, trendSource]);
 
   /* PM-only trends */
   const fetchPmTrends = useCallback(async () => {
     if (!base) return;
     try {
-      await withAbort(async (signal) => {
-        const pathPMOnly = "/pm/trends?minutes=120&limit=240";
-        const pathPMBQ   = "/pm/trends?minutes=120&limit=240&source=bq";
-        const pathAuto   = "/trends?minutes=120&limit=240&source=pm";
-        const pathBq     = "/trends?minutes=120&limit=240&source=pm_bq";
+      const pathPMOnly = "/pm/trends?minutes=120&limit=240";
+      const pathPMBQ   = "/pm/trends?minutes=120&limit=240&source=bq";
+      const pathAuto   = "/trends?minutes=120&limit=240&source=pm";
+      const pathBq     = "/trends?minutes=120&limit=240&source=pm_bq";
 
-        const order =
-          pmTrendSource === "bq"
-            ? [pathPMBQ, pathPMOnly, pathBq, pathAuto]
-            : pmTrendSource === "pm_only"
-              ? [pathPMOnly, pathPMBQ, pathAuto, pathBq]
-              : [pathAuto, pathPMOnly, pathPMBQ, pathBq];
+      const order =
+        pmTrendSource === "bq"
+          ? [pathPMBQ, pathPMOnly, pathBq, pathAuto]
+          : pmTrendSource === "pm_only"
+            ? [pathPMOnly, pathPMBQ, pathAuto, pathBq]
+            : [pathAuto, pathPMOnly, pathPMBQ, pathBq];
 
-        const { json, path } = await getJsonCandidates(base, getHeaders, order, signal);
-        setPmTrendEndpoint(path);
-        if (Array.isArray(json)) setPmTrends(cleanTrends(json).slice(-240));
-      });
+      const { json, path } = await getJsonCandidates(base, getHeaders, order);
+      setPmTrendEndpoint(path);
+      if (Array.isArray(json)) setPmTrends(cleanTrends(json).slice(-240));
     } catch (e:any) {
       info("PM trends fetch failed", e?.message ?? e);
     }
-  }, [base, getHeaders, pmTrendSource, withAbort]);
+  }, [base, getHeaders, pmTrendSource]);
 
-  /* PM segments (status windows) */
+  /* PM segments — single, type-safe implementation */
+  type PMFetchResult = {
+    ok: boolean;
+    json: any;
+    status: number;
+    via: "GET" | "POST";
+    path?: string;
+  };
+
   const fetchPmSegments = useCallback(async () => {
-    if (!base) return;
-    try {
-      await withAbort(async (signal) => {
-        const { json } = await getJsonCandidates(base, getHeaders, [
-          "/pm/segments?minutes=180",
-          "/pm/segments?minutes=120",
-          "/segments/pm?minutes=180",
-        ], signal);
+    if (!base || pmSegsDisabledRef.current) return;
 
-        if (Array.isArray(json)) {
-          const cleaned: PMSegment[] = (json as any[])
-            .map((raw: any) => {
-              const start_ts: string | undefined =
-                raw.start_ts || raw.start || raw.begin || raw.ts || raw.from;
-              if (!start_ts) return null;
-
-              const rawStatus = String(raw.status ?? raw.state ?? "ok").toLowerCase();
-              const status: PMSegment["status"] =
-                rawStatus === "ok" || rawStatus === "watch" || rawStatus === "alert"
-                  ? (rawStatus as PMSegment["status"])
-                  : "ok";
-
-              const end_ts: string | null =
-                (raw.end_ts ?? raw.end ?? raw.until ?? null) || null;
-
-              const seg: PMSegment = {
-                start_ts,
-                end_ts,
-                status,
-                kpi: raw.kpi || raw.signal || undefined,
-                note: raw.note || raw.msg || undefined,
-              };
-              return seg;
-            })
-            .filter(Boolean)
-            .slice(-60) as PMSegment[];
-
-          setPmSegs(cleaned);
+    const tryGet = async (minutes: number): Promise<PMFetchResult> => {
+      const paths = [
+        `/pm/segments?minutes=${minutes}`,
+        `/segments/pm?minutes=${minutes}`,
+      ];
+      for (const p of paths) {
+        try {
+          const r = await fetch(`${base}${p}`, { headers: getHeaders });
+          if (r.ok) {
+            const j = await r.json();
+            return { ok: true, json: j, status: r.status, via: "GET", path: p };
+          }
+          if (r.status !== 404 && r.status !== 405) {
+            return { ok: false, json: await r.text().catch(() => ""), status: r.status, via: "GET", path: p };
+          }
+        } catch {
+          /* keep trying next path */
         }
-      });
-    } catch (e:any) {
+      }
+      return { ok: false, json: null, status: 405, via: "GET" };
+    };
+
+    const tryPost = async (minutes: number): Promise<PMFetchResult> => {
+      const paths = ["/pm/segments", "/segments/pm"];
+      for (const p of paths) {
+        try {
+          const r = await fetch(`${base}${p}`, {
+            method: "POST",
+            headers: { ...postHeaders },
+            body: JSON.stringify({ minutes }),
+          });
+          if (r.ok) {
+            const j = await r.json();
+            return { ok: true, json: j, status: r.status, via: "POST", path: p };
+          }
+          if (r.status !== 404 && r.status !== 405) {
+            return { ok: false, json: await r.text().catch(() => ""), status: r.status, via: "POST", path: p };
+          }
+        } catch {
+          /* continue */
+        }
+      }
+      return { ok: false, json: null, status: 405, via: "POST" };
+    };
+
+    try {
+      // 1) Try GET first (180, then 120)
+      let res: PMFetchResult = await tryGet(180);
+      if (!res.ok) res = await tryGet(120);
+
+      // 2) If not available, try POST with JSON body
+      if (!res.ok) {
+        res = await tryPost(180);
+        if (!res.ok) res = await tryPost(120);
+      }
+
+      if (!res.ok) {
+        pmSegsDisabledRef.current = true;
+        setPmSegs([]);
+        setPmSegsNote("PM segments disabled (405/404). Endpoint likely POST-only or not exposed on this deploy.");
+        return;
+      }
+
+      if (Array.isArray(res.json)) {
+        const cleaned: PMSegment[] = (res.json as any[])
+          .map((raw: any) => {
+            const start_ts: string | undefined =
+              raw.start_ts || raw.start || raw.begin || raw.ts || raw.from;
+            if (!start_ts) return null;
+
+            const rawStatus = String(raw.status ?? raw.state ?? "ok").toLowerCase();
+            const status: PMSegment["status"] =
+              rawStatus === "ok" || rawStatus === "watch" || rawStatus === "alert"
+                ? rawStatus
+                : "ok";
+
+            const end_ts: string | null =
+              (raw.end_ts ?? raw.end ?? raw.until ?? null) || null;
+
+            const seg: PMSegment = {
+              start_ts,
+              end_ts,
+              status,
+              kpi: raw.kpi || raw.signal || undefined,
+              note: raw.note || raw.msg || undefined,
+            };
+            return seg;
+          })
+          .filter((s: PMSegment | null): s is PMSegment => s !== null)
+          .slice(-60);
+
+        setPmSegs(cleaned);
+        setPmSegsNote(`${res.via}${res.path ? ` ${res.path}` : ""}`); // e.g., "GET /pm/segments?minutes=180"
+      }
+    } catch (e: any) {
       info("PM segments fetch failed", e?.message ?? e);
     }
-  }, [base, getHeaders, withAbort]);
+  }, [base, getHeaders, postHeaders]);
 
   /* last_runs + countdown */
   const fetchLastRuns = useCallback(async () => {
     if (!base || disableLastRunsRef.current) return;
     try {
-      await withAbort(async (signal) => {
-        const { json } = await methodFallback(base, getHeaders, postHeaders, [
-          "/debug/last_runs", "/debug/last_runs/", "/snapshot/last_runs", "/snapshot/last_runs/",
-          "/last_runs", "/last_runs/", "/debug/schedule", "/debug/schedule/"
-        ], signal);
-        const j = json as LastRuns;
-        setLastRuns(j);
-        setCountdown(j?.seconds_to_next ?? null);
-        setCountdownCause("");
-      });
+      const { json } = await methodFallback(base, getHeaders, postHeaders, [
+        "/debug/last_runs", "/debug/last_runs/", "/snapshot/last_runs", "/snapshot/last_runs/",
+        "/last_runs", "/last_runs/", "/debug/schedule", "/debug/schedule/"
+      ]);
+      const j = json as LastRuns;
+      setLastRuns(j); setCountdown(j?.seconds_to_next ?? null); setCountdownCause("");
     } catch (e:any) {
       const msg = String(e?.message || e);
       if (/405|Method Not Allowed/i.test(msg)) disableLastRunsRef.current = true;
       setCountdown(null); setLastRuns(null); setCountdownCause(`Countdown unavailable: ${msg}`);
     }
-  }, [base, getHeaders, postHeaders, withAbort]);
-
-  const pickLatestTimestamp = (j: any): string | null =>
-    j?.created_at || j?.createdAt || j?.ts || j?.timestamp || null;
-  const pickProposal = (j: any): Record<string, number> | undefined =>
-    j?.proposed_setpoints || j?.proposal?.setpoints || j?.top?.proposed_setpoints;
+  }, [base, getHeaders, postHeaders]);
 
   const fetchRoutineLatest = useCallback(async () => {
     if (!base) return false;
     try {
-      const { json } = await getJsonCandidates(base, getHeaders, ["/routine/latest", "/routine/latest/"], abortRef.current?.signal);
+      const { json } = await getJsonCandidates(base, getHeaders, ["/routine/latest", "/routine/latest/"]);
       setRoutineRaw(json);
       const created = pickLatestTimestamp(json);
       const proposed = pickProposal(json);
@@ -570,55 +557,32 @@ export default function PlantAgentDashboard() {
 
   /* polling */
   useEffect(() => {
-    const enabled = autoPoll === "1" && !!base && isVisible();
-    if (!enabled) {
-      if (pollRef.current) window.clearInterval(pollRef.current);
-      pollRef.current = null;
-      return;
-    }
+    const enabled = autoPoll === "1" && !!base;
+    if (!enabled) { if (pollRef.current) window.clearInterval(pollRef.current); pollRef.current = null; return; }
     disableLastRunsRef.current = false;
 
-    // initial fetch burst
-    (async () => {
-      await Promise.allSettled([
-        fetchSnapshot(),
-        fetchTrends(),
-        fetchPmTrends(),
-        fetchPmSegments(),
-        fetchLastRuns(),
-        fetchRoutineLatest(),
-      ]);
-    })();
+    fetchSnapshot().catch(()=>{});
+    fetchTrends().catch(()=>{});
+    fetchPmTrends().catch(()=>{});
+    fetchPmSegments().catch(()=>{});
+    fetchLastRuns().catch(()=>{});
+    fetchRoutineLatest().catch(()=>{});
 
     pollRef.current = window.setInterval(() => {
-      // cheaper tick
       fetchSnapshot().catch(()=>{});
       fetchLastRuns().catch(()=>{});
       fetchPmSegments().catch(()=>{});
       fetchPmTrends().catch(()=>{});
     }, 5000);
-
-    return () => {
-      if (pollRef.current) window.clearInterval(pollRef.current);
-      pollRef.current = null;
-      abortRef.current?.abort();
-    };
+    return () => { if (pollRef.current) window.clearInterval(pollRef.current); pollRef.current = null; };
   }, [autoPoll, base, fetchSnapshot, fetchTrends, fetchPmTrends, fetchPmSegments, fetchLastRuns, fetchRoutineLatest]);
 
   /* countdown tick */
   useEffect(() => {
-    if (countdown === null) {
-      if (countTimerRef.current) window.clearInterval(countTimerRef.current);
-      countTimerRef.current = null; return;
-    }
+    if (countdown === null) { if (countTimerRef.current) window.clearInterval(countTimerRef.current); countTimerRef.current = null; return; }
     if (countTimerRef.current) window.clearInterval(countTimerRef.current);
-    countTimerRef.current = window.setInterval(() => {
-      setCountdown(c => (c==null ? c : Math.max(0, c - 1)));
-    }, 1000);
-    return () => {
-      if (countTimerRef.current) window.clearInterval(countTimerRef.current);
-      countTimerRef.current = null;
-    };
+    countTimerRef.current = window.setInterval(() => { setCountdown(c => (c==null ? c : Math.max(0, c - 1))); }, 1000);
+    return () => { if (countTimerRef.current) window.clearInterval(countTimerRef.current); countTimerRef.current = null; };
   }, [countdown]);
 
   /* metrics (diagnostics) */
@@ -626,9 +590,9 @@ export default function PlantAgentDashboard() {
     if (!base) return;
     setMetricsErr("");
     try {
-      const r = await fetch(`${base}/metrics`, { headers: getHeaders, signal: abortRef.current?.signal });
+      const r = await fetch(`${base}/metrics`, { headers: getHeaders });
       if (!r.ok) throw new Error(`${r.status}`);
-      const j = await safeJson(r); setMetrics(j);
+      const j = await r.json(); setMetrics(j);
     } catch (e:any) { setMetricsErr(e?.message || "Failed to fetch metrics"); }
   }, [base, getHeaders]);
 
@@ -637,13 +601,8 @@ export default function PlantAgentDashboard() {
     if (!base) return;
     setErrorMsg("");
     try {
-      const o2min = Number(o2Min);
-      const o2max = Number(o2Max);
       const body = {
-        constraints: { o2_percent: {
-          min: Number.isFinite(o2min) ? o2min : undefined,
-          max: Number.isFinite(o2max) ? o2max : undefined
-        }},
+        constraints: { o2_percent: { min: Number(o2Min)||undefined, max: Number(o2Max)||undefined } },
         apply_top: autoApplyRoutine === "1" || applyTop,
         log_suggestions: logSugg,
         nudge_if_neutral: nudgeFlag === "1",
@@ -651,9 +610,10 @@ export default function PlantAgentDashboard() {
       const s0 = snap ?? (await fetchSnapshotFast()); if (s0) setRoutineBefore({ ...s0 });
       const r = await fetch(`${base}/optimize/routine`, { method: "POST", headers: postHeaders, body: JSON.stringify(body) });
       if (!r.ok) throw new Error(`/optimize/routine ${r.status}`);
-      const j: RoutineResp = await safeJson(r);
+      const j: RoutineResp = await r.json();
       setRoutineRaw(j);
       const created = pickLatestTimestamp(j);
+      pickProposal(j);
       setRoutineOut(j);
       if (created) setLatestSeenAt(created);
       fetchLastRuns().catch(()=>{});
@@ -666,7 +626,7 @@ export default function PlantAgentDashboard() {
 
   const applyRoutineProposal = useCallback(async () => {
     const proposed = pickProposal(routineOut);
-    if (!proposed || !base) return;
+    if (!proposed) return;
     try {
       const r = await fetch(`${base}/actuate/apply_stage`, {
         method: "POST",
@@ -674,7 +634,7 @@ export default function PlantAgentDashboard() {
         body: JSON.stringify({ proposed_setpoints: proposed, mode: "routine" })
       });
       if (!r.ok) throw new Error(`/actuate/apply_stage ${r.status}`);
-      const j: ApplyResp = await safeJson(r);
+      const j: ApplyResp = await r.json();
       const after: Snapshot | null = (j.after as Snapshot) || (await fetchSnapshotFast());
       if (after) { setSnap(after); setRoutineAfter({ ...after }); await fetchTrends(); }
       fetchLastRuns().catch(()=>{});
@@ -700,7 +660,7 @@ export default function PlantAgentDashboard() {
       if (loadMode==="target") body.target_tph = Number(val);
       const r = await fetch(`${base}/optimize/load`, { method: "POST", headers: postHeaders, body: JSON.stringify(body) });
       if (!r.ok) throw new Error(`/optimize/load ${r.status}`);
-      const j: LoadResp = await safeJson(r); setLoadOut(j);
+      const j: LoadResp = await r.json(); setLoadOut(j);
       const s0 = snap ?? (await fetchSnapshotFast()); if (s0) setLoadBefore({ ...s0 }); setLoadAfter(null);
     } catch (e:any) { setErrorMsg(e?.message || "Create plan failed"); }
   }, [base, postHeaders, steps, direction, val, loadMode, fetchSnapshotFast, snap]);
@@ -712,7 +672,7 @@ export default function PlantAgentDashboard() {
   }, [stepDwellCsv]);
 
   const applyStage = useCallback(async (i: number) => {
-    if (!loadOut || !base) return;
+    if (!loadOut) return;
     try {
       const r = await fetch(`${base}/actuate/apply_stage`, {
         method: "POST",
@@ -720,7 +680,7 @@ export default function PlantAgentDashboard() {
         body: JSON.stringify({ stage: loadOut.stages[i], mode: loadOut.mode, plan_id: loadOut.plan_id, stage_index: i })
       });
       if (!r.ok) throw new Error(`/actuate/apply_stage ${r.status}`);
-      const j: ApplyResp = await safeJson(r);
+      const j: ApplyResp = await r.json();
       const after: Snapshot | null = (j.after as Snapshot) || (await fetchSnapshotFast());
       if (after) {
         setSnap(after);
@@ -771,7 +731,7 @@ export default function PlantAgentDashboard() {
 
   /* responsive chart */
   const chartBoxRef = useRef<HTMLDivElement | null>(null);
-  const [chartBoxSize, setChartBoxSize] = useState({ w: 0, h: 224 });
+  const [chartBoxSize, setChartBoxSize] = useState({ w: 0, h: 0 });
   useEffect(() => {
     if (!chartBoxRef.current) return;
     const ro = new ResizeObserver((entries) => {
@@ -872,7 +832,7 @@ export default function PlantAgentDashboard() {
           )}
         </section>
 
-        {/* KPI Tiles */}
+        {/* KPI Tiles — includes VHI & MCI */}
         <section className="grid md:grid-cols-7 gap-4">
           {[
             { label: "Production (tph)", val: kpi?.production_tph },
@@ -886,10 +846,12 @@ export default function PlantAgentDashboard() {
               <div className="text-2xl font-semibold mt-1">{fmt(t.val, 3)}</div>
             </div>
           ))}
+          {/* MCI tile */}
           <div className="tile">
             <div className="text-xs text-slate-500">Motor Current Imbalance (%)</div>
             <div className="text-2xl font-semibold mt-1">{fmt(kpi?.mci_percent ?? null, 2)}</div>
           </div>
+          {/* VHI tile with status */}
           <div className="tile">
             <div className="flex items-center justify-between">
               <div className="text-xs text-slate-500">Vibration Health Index</div>
@@ -907,9 +869,7 @@ export default function PlantAgentDashboard() {
           <div className="flex items-center justify-between">
             <div className="font-semibold">Suggestions</div>
             <div className="text-xs text-slate-500">
-              latest routine run: {(() => {
-                const ts = pickLatestTimestamp(routineOut); return ts ? new Date(ts).toLocaleString() : "-";
-              })()}
+              latest routine run: {pickLatestTimestamp(routineOut) ? new Date(pickLatestTimestamp(routineOut) as string).toLocaleString() : "-"}
               {routineOut?.suggestion_id ? <span className="ml-2">• id: <span className="font-mono">{routineOut.suggestion_id}</span></span> : null}
               {routineOut?.reason ? <span className="ml-2">• {routineOut.reason}</span> : null}
               {routineOut?.flags_effective && (
@@ -932,6 +892,7 @@ export default function PlantAgentDashboard() {
             </div>
           )}
 
+          {/* per-lever audit table */}
           {routineOut?.per_lever && (
             <div className="mt-4 overflow-x-auto">
               <div className="text-sm font-medium mb-1">Per-lever audit</div>
@@ -979,7 +940,7 @@ export default function PlantAgentDashboard() {
           </div>
         </section>
 
-        {/* Important Trends */}
+        {/* Important (process) Trends */}
         <section className="grid md:grid-cols-2 gap-4">
           <div className="card">
             <div className="font-semibold mb-1">Important Trends (last 2 hours)</div>
@@ -1036,6 +997,9 @@ export default function PlantAgentDashboard() {
                 <option value="pm_only">pm_only</option>
               </select>
               <span className="text-[11px]">from <span className="font-mono">{pmTrendEndpoint}</span></span>
+              {pmSegsNote && (
+                <span className="ml-2 text-[11px] text-slate-500">• {pmSegsNote}</span>
+              )}
             </div>
           </div>
 
@@ -1071,7 +1035,7 @@ export default function PlantAgentDashboard() {
                         value: `${s.status.toUpperCase()}${s.kpi ? ` • ${s.kpi}` : ""}`,
                         position: "insideTopLeft",
                         offset: 6
-                      } as any}
+                      }}
                     />
                   );
                 })}
@@ -1129,7 +1093,6 @@ export default function PlantAgentDashboard() {
         <section className="card">
           <div className="flex items-center justify-between">
             <div className="font-semibold">Load Planning</div>
-            <div className="text-xs text-slate-500">latest plan: {loadOut?.created_at ? new Date(loadOut.created_at).toLocaleString() : "-" } • id: {loadOut?.plan_id || "-"}</div>
           </div>
           <div className="mt-3 grid md:grid-cols-7 gap-3 items-end">
             <div>
@@ -1164,7 +1127,7 @@ export default function PlantAgentDashboard() {
 
           {loadOut && (
             <div className="mt-4">
-              <div className="text-sm text-slate-600">mode: {loadOut.mode}</div>
+              <div className="text-sm text-slate-600">mode: {loadOut.mode} • latest plan: {new Date(loadOut.created_at).toLocaleString()} • id: {loadOut.plan_id}</div>
               <div className="mt-2 grid md:grid-cols-2 gap-4">
                 <div>
                   <div className="text-sm font-medium mb-1">Stages</div>
@@ -1321,7 +1284,7 @@ function MetricsBlock({ base, getHeaders, metrics, metricsErr, onRefresh }: { ba
     <section className="card">
       <div className="flex items-center justify-between">
         <div className="font-semibold">Metrics</div>
-        <button onClick={onRefresh} className="btn-outline" disabled={!base}>Refresh</button>
+        <button onClick={onRefresh} className="btn-outline">Refresh</button>
       </div>
       {metricsErr && <div className="text-rose-600 text-sm mt-2">{metricsErr}</div>}
       <pre className="text-xs bg-slate-50 border rounded-2xl p-3 overflow-auto mt-2">{JSON.stringify(metrics, null, 2)}</pre>
@@ -1329,7 +1292,7 @@ function MetricsBlock({ base, getHeaders, metrics, metricsErr, onRefresh }: { ba
   );
 }
 
-/* ======= minimal styles (Tailwind-friendly)
+/* ======= minimal styles (Tailwind-friendly) =======
 .card { @apply bg-white border border-slate-200 rounded-2xl p-4; }
 .tile { @apply bg-white border border-slate-200 rounded-2xl p-3; }
 .btn-outline { @apply px-3 py-2 border rounded-xl text-sm hover:bg-slate-50; }
@@ -1346,4 +1309,4 @@ function MetricsBlock({ base, getHeaders, metrics, metricsErr, onRefresh }: { ba
 .chip-rose { @apply bg-rose-50 text-rose-700 border-rose-200; }
 .chip-amber { @apply bg-amber-50 text-amber-700 border-amber-200; }
 .chip-indigo { @apply bg-indigo-50 text-indigo-700 border-indigo-200; }
-*/
+==================================================== */
