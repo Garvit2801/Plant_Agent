@@ -1,14 +1,14 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { LineChart, Line, XAxis, YAxis, Tooltip, Legend, CartesianGrid, ReferenceArea } from "recharts";
+import {
+  LineChart, Line, XAxis, YAxis, Tooltip, Legend, CartesianGrid, ReferenceArea
+} from "recharts";
 
 /**
  * Plant Agent – Operations Dashboard (No-Auth Variant) — UPDATED
- * Adds KPI surfaces for:
- *  - Vibration Health Index (VHI): index, threshold, status badge (ok/watch/alert)
- *  - Motor Current Imbalance (MCI_percent): % and trend
- * Adds Predictive Maintenance Segments:
- *  - Shaded watch/alert bands on the trend chart
- *  - "Active PM Segments" list (last 120 min)
+ * - Keeps your routine/load “Important Trends”
+ * - Adds a separate Predictive Maintenance (PM) trends card with its own source selector
+ * - Shows PM segments (ok/watch/alert) as shaded bands in the PM chart only
+ * - Supports VHI (index), MCI (%), BearingTempRise (°C) in both snapshot and PM trends
  */
 
 const RECOMMENDED_HOST = "https://plant-agent-i32khy5nrq-el.a.run.app";
@@ -23,6 +23,7 @@ const LS_KEYS = {
   TREND_SOURCE: "plant_ui.trend_source",
   NUDGE: "plant_ui.nudge_if_neutral",
   AUTO_APPLY: "plant_ui.routine_auto_apply",
+  PM_TREND_SOURCE: "plant_ui.pm_trend_source", // NEW: PM-only trends selector
 };
 
 function useLocalStorage(key: string, initial: string) {
@@ -35,6 +36,12 @@ function cls(...xs: (string | false | undefined | null)[]) { return xs.filter(Bo
 function fmt(n: number | undefined | null, d = 3) { if (n == null || Number.isNaN(n)) return "-"; return Number(n).toFixed(d); }
 function normalizeBase(u: string) { if (!u) return ""; let s = u.trim(); s = s.replace(/\/+$/, ""); s = s.replace(/\/snapshot$/i, ""); return s; }
 function info(msg: string, extra?: any) { if (getDebug()) console.log(`[PlantUI] ${msg}`, extra ?? ""); }
+function parseNum(v: any): number {
+  if (v == null) return NaN;
+  const s = typeof v === "string" ? v.replace(/,/g, "") : String(v);
+  const n = Number(s);
+  return Number.isFinite(n) ? n : NaN;
+}
 
 /* =========================
    Types (align to backend)
@@ -44,13 +51,12 @@ type Snapshot = {
   id_fan_flow_Nm3_h: number; cooler_airflow_Nm3_h: number; kiln_speed_rpm: number;
   o2_percent: number; specific_power_kwh_per_ton: number;
 
-  // NEW — vibration and electrical KPIs (optional fields)
+  // PM KPIs (optional)
   vhi_health_index?: number | null;           // higher = worse
-  vhi_threshold?: number | null;              // threshold at/over which status flips
+  vhi_threshold?: number | null;
   vhi_status?: "ok" | "watch" | "alert" | null;
-
-  mci_percent?: number | null;                // Motor Current Imbalance %
-  bearing_temp_rise_C?: number | null;        // optional swap-in KPI
+  mci_percent?: number | null;                // %
+  bearing_temp_rise_C?: number | null;        // °C
 };
 
 type TrendPoint = {
@@ -113,16 +119,13 @@ type LoadResp = {
   match_info?: any; targets?: any; steps_cfg?: any;
 };
 
-/* Predictive Maintenance segments */
+/* PM segments */
 type PMSegment = {
-  start_ts: string;                       // ISO
-  end_ts?: string | null;                 // ISO or null (ongoing)
-  status: "watch" | "alert";
+  start_ts: string;            // ISO timestamp
+  end_ts?: string | null;      // optional (ongoing)
+  status: "ok" | "watch" | "alert";
   kpi?: "VHI" | "MCI_percent" | "BearingTempRise_C" | string;
-  asset?: string;
-  value?: number | null;
-  threshold?: number | null;
-  note?: string | null;
+  note?: string;
 };
 
 /* =========================
@@ -168,33 +171,27 @@ async function methodFallback(base: string, getHeaders: Record<string,string>, p
   throw last ?? new Error("No candidate path via GET/POST");
 }
 
-/* trend cleaning — now also pulls VHI/MCI if present */
+/* trend cleaning — includes VHI/MCI/BTR if present */
 function cleanTrends(rows: any[]): TrendPoint[] {
   const sorted = rows.slice().sort((a,b)=>new Date(a.ts??0).getTime()-new Date(b.ts??0).getTime());
   const out: TrendPoint[] = [];
   let lastProd: number | undefined;
 
-  const parse = (v:any) => {
-    if (v==null) return NaN;
-    const s = typeof v === "string" ? v.replace(/,/g,"") : String(v);
-    const n = Number(s); return Number.isFinite(n)?n:NaN;
-  };
-
   for (const row of sorted) {
-    const prod = parse(row.production_tph);
-    const o2 = parse(row.o2_percent);
-    const sp = parse(row.specific_power_kwh_per_ton);
-    const vhi = parse(row.vhi_health_index);
-    const mci = parse(row.mci_percent);
-    const btr = parse(row.bearing_temp_rise_C);
+    const prod = parseNum(row.production_tph);
+    const o2 = parseNum(row.o2_percent);
+    const sp = parseNum(row.specific_power_kwh_per_ton);
+    const vhi = parseNum(row.vhi_health_index);
+    const mci = parseNum(row.mci_percent);
+    const btr = parseNum(row.bearing_temp_rise_C);
 
     const prodGood = Number.isFinite(prod) && prod >= 0.5 && prod < 1000;
     const o2Good   = Number.isFinite(o2) && o2 >= 0 && o2 < 30;
     const spGood   = Number.isFinite(sp) && sp > 0 && sp < 200;
 
-    const vhiGood  = Number.isFinite(vhi) && vhi >= 0 && vhi < 50;          // typical z-index band
-    const mciGood  = Number.isFinite(mci) && mci >= 0 && mci < 100;         // %
-    const btrGood  = Number.isFinite(btr) && Math.abs(btr) < 200;
+    const vhiGood  = Number.isFinite(vhi) && vhi >= 0 && vhi < 50;      // typical rolling z score band
+    const mciGood  = Number.isFinite(mci) && mci >= 0 && mci < 100;     // %
+    const btrGood  = Number.isFinite(btr) && Math.abs(btr) < 200;       // °C sanity
 
     const spike = lastProd && prodGood ? Math.abs(prod-lastProd)/Math.max(1e-9,lastProd) > 0.30 : false;
     const keepProd = prodGood && !spike ? prod : null;
@@ -222,15 +219,15 @@ function statusTone(s?: string | null) {
   }
 }
 
-/* PM segment helpers */
-const tsToLabel = (ts?: string | null) =>
-  ts ? new Date(ts).toLocaleTimeString() : "";
-
-const segTone = (s: PMSegment["status"]) =>
-  s === "alert" ? { fill:"#f43f5e", stroke:"#be123c" } : { fill:"#f59e0b", stroke:"#b45309" };
-
-const minutesBetween = (a: string, b: string) =>
-  Math.max(0, Math.round((new Date(b).getTime() - new Date(a).getTime()) / 60000));
+/* PM segment visuals */
+function segTone(s: PMSegment["status"]) {
+  if (s === "alert") return { stroke: "#ef4444", fill: "#ef4444" };
+  if (s === "watch") return { stroke: "#f59e0b", fill: "#f59e0b" };
+  return { stroke: "#22c55e", fill: "#22c55e" }; // ok
+}
+function tsToLabel(ts: string) {
+  try { return new Date(ts).toLocaleTimeString(); } catch { return ""; }
+}
 
 /* =========================
    Main Component
@@ -244,8 +241,9 @@ export default function PlantAgentDashboard() {
   const [stepDwellCsv, setStepDwellCsv] = useLocalStorage(LS_KEYS.STEP_DWELL, "20");
   const [nudgeFlag, setNudgeFlag] = useLocalStorage(LS_KEYS.NUDGE, "1");
   const [autoApplyRoutine, setAutoApplyRoutine] = useLocalStorage(LS_KEYS.AUTO_APPLY, "0"); // default OFF
+  const [pmTrendSource, setPmTrendSource] = useLocalStorage(LS_KEYS.PM_TREND_SOURCE, "auto"); // NEW
 
-  // General headers (no auth)
+  // Headers (no auth)
   const getHeaders = useMemo(() => ({} as Record<string,string>), []);
   const postHeaders = useMemo(() => ({"Content-Type":"application/json"} as Record<string,string>), []);
   const applyHeaders = useMemo(() => ({ "Content-Type":"application/json", "X-Confirm-Apply":"yes" } as Record<string,string>), []);
@@ -258,6 +256,11 @@ export default function PlantAgentDashboard() {
   const [history, setHistory] = useState<TrendPoint[]>([]);
   const [trends, setTrends] = useState<TrendPoint[]>([]);
   const [trendEndpoint, setTrendEndpoint] = useState("(none)");
+
+  // PM-only trends + segments
+  const [pmTrends, setPmTrends] = useState<TrendPoint[]>([]);
+  const [pmTrendEndpoint, setPmTrendEndpoint] = useState("(none)");
+  const [pmSegs, setPmSegs] = useState<PMSegment[]>([]);
 
   const [lastRuns, setLastRuns] = useState<LastRuns | null>(null);
   const [countdown, setCountdown] = useState<number | null>(null);
@@ -286,9 +289,6 @@ export default function PlantAgentDashboard() {
   const disableLastRunsRef = useRef(false);
   const cronProbeRef = useRef<number | null>(null);
   const lastCronRef = useRef<string | null>(null);
-
-  /* PM segments */
-  const [pmSegs, setPmSegs] = useState<PMSegment[]>([]);
 
   /* Health/version */
   const fetchHealth = useCallback(async () => {
@@ -351,19 +351,53 @@ export default function PlantAgentDashboard() {
     }
   }, [base, getHeaders, trendSource]);
 
-  /* PM segments fetcher */
+  /* PM-only trends */
+  const fetchPmTrends = useCallback(async () => {
+    if (!base) return;
+    try {
+      const pathPMOnly = "/pm/trends?minutes=120&limit=240";
+      const pathPMBQ   = "/pm/trends?minutes=120&limit=240&source=bq";
+      const pathAuto   = "/trends?minutes=120&limit=240&source=pm";     // backend may route to PM set
+      const pathBq     = "/trends?minutes=120&limit=240&source=pm_bq";  // optional
+
+      const order =
+        pmTrendSource === "bq"
+          ? [pathPMBQ, pathPMOnly, pathBq, pathAuto]
+          : pmTrendSource === "pm_only"
+            ? [pathPMOnly, pathPMBQ, pathAuto, pathBq]
+            : [pathAuto, pathPMOnly, pathPMBQ, pathBq];
+
+      const { json, path } = await getJsonCandidates(base, getHeaders, order);
+      setPmTrendEndpoint(path);
+      if (Array.isArray(json)) setPmTrends(cleanTrends(json).slice(-240));
+    } catch (e:any) {
+      info("PM trends fetch failed", e?.message ?? e);
+    }
+  }, [base, getHeaders, pmTrendSource]);
+
+  /* PM segments (status windows) */
   const fetchPmSegments = useCallback(async () => {
     if (!base) return;
     try {
       const { json } = await getJsonCandidates(base, getHeaders, [
-        "/pm/segments?window_minutes=120",
-        "/segments/pm?minutes=120",
-        "/pm/segments",
-        "/segments/pm",
+        "/pm/segments?minutes=180",
+        "/pm/segments?minutes=120",
+        "/segments/pm?minutes=180",
       ]);
-      if (Array.isArray(json)) setPmSegs(json as PMSegment[]);
-    } catch {
-      // silent; UI still works
+      if (Array.isArray(json)) {
+        const cleaned: PMSegment[] = json
+          .map((s: any) => ({
+            start_ts: s.start_ts || s.start || s.begin || s.ts || s.from,
+            end_ts: s.end_ts ?? s.end ?? s.until ?? null,
+            status: (s.status || s.state || "ok").toLowerCase(),
+            kpi: s.kpi || s.signal || undefined,
+            note: s.note || s.msg || undefined,
+          }))
+          .filter((s: PMSegment) => !!s.start_ts && (s.status === "ok" || s.status === "watch" || s.status === "alert"));
+        setPmSegs(cleaned.slice(-60));
+      }
+    } catch (e:any) {
+      info("PM segments fetch failed", e?.message ?? e);
     }
   }, [base, getHeaders]);
 
@@ -387,7 +421,7 @@ export default function PlantAgentDashboard() {
   const fetchRoutineLatest = useCallback(async () => {
     if (!base) return false;
     try {
-      const { json, path } = await getJsonCandidates(base, getHeaders, ["/routine/latest", "/routine/latest/"]);
+      const { json } = await getJsonCandidates(base, getHeaders, ["/routine/latest", "/routine/latest/"]);
       setRoutineRaw(json);
       const created = pickLatestTimestamp(json);
       const proposed = pickProposal(json);
@@ -397,7 +431,6 @@ export default function PlantAgentDashboard() {
       }
       if (proposed && Object.keys(proposed).length > 0) {
         setRoutineOut(json);
-        info(`Fetched routine latest via ${path}`, json);
         return true;
       }
       return false;
@@ -436,7 +469,8 @@ export default function PlantAgentDashboard() {
 
     fetchSnapshot().catch(()=>{});
     fetchTrends().catch(()=>{});
-    fetchPmSegments().catch(()=>{});
+    fetchPmTrends().catch(()=>{});         // NEW: PM trends
+    fetchPmSegments().catch(()=>{});       // NEW: PM segments
     fetchLastRuns().catch(()=>{});
     fetchRoutineLatest().catch(()=>{});
 
@@ -444,9 +478,10 @@ export default function PlantAgentDashboard() {
       fetchSnapshot().catch(()=>{});
       fetchLastRuns().catch(()=>{});
       fetchPmSegments().catch(()=>{});
+      fetchPmTrends().catch(()=>{});       // NEW
     }, 5000);
     return () => { if (pollRef.current) window.clearInterval(pollRef.current); pollRef.current = null; };
-  }, [autoPoll, base, fetchSnapshot, fetchTrends, fetchPmSegments, fetchLastRuns, fetchRoutineLatest]);
+  }, [autoPoll, base, fetchSnapshot, fetchTrends, fetchPmTrends, fetchPmSegments, fetchLastRuns, fetchRoutineLatest]);
 
   /* countdown tick */
   useEffect(() => {
@@ -679,8 +714,17 @@ export default function PlantAgentDashboard() {
               </select>
               <span className="text-xs text-slate-500">from <span className="font-mono">{trendEndpoint}</span></span>
             </div>
+            <div className="inline-flex items-center gap-2">
+              <span className="text-xs text-slate-500">PM source</span>
+              <select value={pmTrendSource} onChange={(e)=>setPmTrendSource(e.target.value)} className="px-2 py-1 border rounded-xl text-xs">
+                <option value="auto">auto</option>
+                <option value="bq">bq</option>
+                <option value="pm_only">pm_only</option>
+              </select>
+              <span className="text-xs text-slate-500">from <span className="font-mono">{pmTrendEndpoint}</span></span>
+            </div>
             <button
-              onClick={()=>{ fetchSnapshot(); fetchTrends(); fetchPmSegments(); fetchLastRuns(); fetchRoutineLatest(); getMetrics(); }}
+              onClick={()=>{ fetchSnapshot(); fetchTrends(); fetchPmTrends(); fetchPmSegments(); fetchLastRuns(); fetchRoutineLatest(); getMetrics(); }}
               className="btn-outline"
             >
               Refresh now
@@ -694,7 +738,7 @@ export default function PlantAgentDashboard() {
           )}
         </section>
 
-        {/* KPI Tiles — now includes VHI & MCI */}
+        {/* KPI Tiles — includes VHI & MCI */}
         <section className="grid md:grid-cols-7 gap-4">
           {[
             { label: "Production (tph)", val: kpi?.production_tph },
@@ -802,7 +846,7 @@ export default function PlantAgentDashboard() {
           </div>
         </section>
 
-        {/* Trends + Snapshot */}
+        {/* Important (process) Trends — unchanged from your setup */}
         <section className="grid md:grid-cols-2 gap-4">
           <div className="card">
             <div className="font-semibold mb-1">Important Trends (last 2 hours)</div>
@@ -817,37 +861,9 @@ export default function PlantAgentDashboard() {
                   <YAxis yAxisId="left" domain={["auto","auto"]} tick={{ fill: "#334155", fontSize: 12 }} axisLine={{ stroke: "#94a3b8" }} tickLine={{ stroke: "#94a3b8" }} />
                   <YAxis yAxisId="right" orientation="right" domain={["auto","auto"]} tick={{ fill: "#334155", fontSize: 12 }} axisLine={{ stroke: "#94a3b8" }} tickLine={{ stroke: "#94a3b8" }} />
                   <Tooltip /><Legend wrapperStyle={{ paddingTop: 8 }} />
-
-                  {/* PM shaded segments */}
-                  {pmSegs.map((s, i) => {
-                    const x1 = tsToLabel(s.start_ts);
-                    const x2 = tsToLabel(s.end_ts ?? new Date().toISOString());
-                    const tone = segTone(s.status);
-                    return (
-                      <ReferenceArea
-                        key={`pmseg-${i}`}
-                        x1={x1}
-                        x2={x2}
-                        yAxisId="left"
-                        stroke={tone.stroke}
-                        fill={tone.fill}
-                        fillOpacity={0.12}
-                        ifOverflow="extendDomain"
-                        label={{
-                          value: `${s.status.toUpperCase()} ${s.kpi ?? ""}`.trim(),
-                          position: "insideTopLeft",
-                          offset: 6
-                        }}
-                      />
-                    );
-                  })}
-
-                  {/* Lines */}
                   <Line yAxisId="left"  type="monotone" dataKey="production_tph" name="Production (tph)" stroke="#0ea5e9" strokeWidth={2} dot={{ r: 2 }} isAnimationActive={false} connectNulls />
                   <Line yAxisId="right" type="monotone" dataKey="o2_percent" name="O₂ (%)" stroke="#22c55e" strokeWidth={2} dot={{ r: 2 }} isAnimationActive={false} connectNulls />
                   <Line yAxisId="right" type="monotone" dataKey="specific_power_kwh_per_ton" name="Specific Power (kWh/t)" stroke="#f59e0b" strokeWidth={2} dot={{ r: 2 }} isAnimationActive={false} connectNulls />
-                  <Line yAxisId="left"  type="monotone" dataKey="mci_percent" name="MCI (%)" stroke="#6366f1" strokeWidth={2} dot={{ r: 2 }} isAnimationActive={false} connectNulls />
-                  <Line yAxisId="left"  type="monotone" dataKey="vhi_health_index" name="VHI (index)" stroke="#ef4444" strokeWidth={2} dot={{ r: 2 }} isAnimationActive={false} connectNulls />
                 </LineChart>
               ) : (
                 <div className="h-full grid place-items-center text-slate-400 text-sm">No data to chart</div>
@@ -855,6 +871,7 @@ export default function PlantAgentDashboard() {
             </div>
           </div>
 
+          {/* Current Snapshot */}
           <div className="card">
             <div className="font-semibold mb-2">Current Snapshot</div>
             {snap ? (
@@ -870,55 +887,71 @@ export default function PlantAgentDashboard() {
           </div>
         </section>
 
-        {/* Active PM Segments */}
+        {/* PM-only Trends (separate from process trends) */}
         <section className="card">
           <div className="flex items-center justify-between">
-            <div className="font-semibold">Active PM Segments (last 120 min)</div>
-            <div className="text-xs text-slate-500">{pmSegs.length} segment(s)</div>
-          </div>
-          {pmSegs.length === 0 ? (
-            <div className="mt-2 text-sm text-slate-500">No watch/alert segments in the selected window.</div>
-          ) : (
-            <div className="mt-3 overflow-x-auto">
-              <table className="min-w-full text-xs">
-                <thead>
-                  <tr className="text-left text-slate-500 border-b">
-                    <th className="py-2 pr-4">Status</th>
-                    <th className="py-2 pr-4">Asset</th>
-                    <th className="py-2 pr-4">KPI</th>
-                    <th className="py-2 pr-4">Start</th>
-                    <th className="py-2 pr-4">End</th>
-                    <th className="py-2 pr-4">Duration</th>
-                    <th className="py-2 pr-4">Value / Thresh</th>
-                    <th className="py-2 pr-4">Note</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {pmSegs.map((s, i) => {
-                    const end = s.end_ts ?? new Date().toISOString();
-                    const durMin = minutesBetween(s.start_ts, end);
-                    return (
-                      <tr key={`segrow-${i}`} className="border-b last:border-0">
-                        <td className="py-2 pr-4">
-                          <Chip tone={statusTone(s.status)}>{s.status}</Chip>
-                        </td>
-                        <td className="py-2 pr-4">{s.asset ?? "—"}</td>
-                        <td className="py-2 pr-4">{s.kpi ?? "—"}</td>
-                        <td className="py-2 pr-4 font-mono">{new Date(s.start_ts).toLocaleTimeString()}</td>
-                        <td className="py-2 pr-4 font-mono">{s.end_ts ? new Date(s.end_ts).toLocaleTimeString() : "now"}</td>
-                        <td className="py-2 pr-4">{durMin} min</td>
-                        <td className="py-2 pr-4">
-                          {s.value != null ? <span className="font-mono">{Number(s.value).toFixed(2)}</span> : "—"}
-                          {s.threshold != null ? <span className="text-slate-500"> / {Number(s.threshold).toFixed(2)}</span> : null}
-                        </td>
-                        <td className="py-2 pr-4">{s.note ?? "—"}</td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
+            <div className="font-semibold">Predictive Maintenance Trends (last 2 hours)</div>
+            <div className="text-xs text-slate-500 flex items-center gap-2">
+              <span>source:</span>
+              <select
+                value={pmTrendSource}
+                onChange={(e)=>setPmTrendSource(e.target.value)}
+                className="px-2 py-1 border rounded-xl text-xs"
+              >
+                <option value="auto">auto</option>
+                <option value="bq">bq</option>
+                <option value="pm_only">pm_only</option>
+              </select>
+              <span className="text-[11px]">from <span className="font-mono">{pmTrendEndpoint}</span></span>
             </div>
-          )}
+          </div>
+
+          <div className="text-xs text-slate-500 mb-2">
+            {pmTrends.length ? `Loaded ${pmTrends.length} PM points` : "Waiting for PM data…"}
+          </div>
+
+          <div className="h-56 w-full" /* chartBoxRef reused only for height; width responsive */>
+            {(pmTrends.length && chartBoxSize.w>0) ? (
+              <LineChart width={chartBoxSize.w} height={chartBoxSize.h} data={pmTrends} margin={{ top: 8, right: 32, left: 8, bottom: 8 }}>
+                <CartesianGrid stroke="#e2e8f0" strokeDasharray="3 3" />
+                <XAxis dataKey="t" tick={{ fill: "#334155", fontSize: 12 }} axisLine={{ stroke: "#94a3b8" }} tickLine={{ stroke: "#94a3b8" }} />
+                <YAxis yAxisId="left" domain={["auto","auto"]} tick={{ fill: "#334155", fontSize: 12 }} axisLine={{ stroke: "#94a3b8" }} tickLine={{ stroke: "#94a3b8" }} />
+                <YAxis yAxisId="right" orientation="right" domain={["auto","auto"]} tick={{ fill: "#334155", fontSize: 12 }} axisLine={{ stroke: "#94a3b8" }} tickLine={{ stroke: "#94a3b8" }} />
+                <Tooltip /><Legend wrapperStyle={{ paddingTop: 8 }} />
+
+                {/* PM shaded segments */}
+                {pmSegs.map((s, i) => {
+                  const x1 = tsToLabel(s.start_ts);
+                  const x2 = tsToLabel(s.end_ts ?? new Date().toISOString());
+                  const tone = segTone(s.status);
+                  return (
+                    <ReferenceArea
+                      key={`pmseg-pmchart-${i}`}
+                      x1={x1}
+                      x2={x2}
+                      yAxisId="left"
+                      stroke={tone.stroke}
+                      fill={tone.fill}
+                      fillOpacity={0.12}
+                      ifOverflow="extendDomain"
+                      label={{
+                        value: `${s.status.toUpperCase()}${s.kpi ? ` • ${s.kpi}` : ""}`,
+                        position: "insideTopLeft",
+                        offset: 6
+                      }}
+                    />
+                  );
+                })}
+
+                {/* PM signals */}
+                <Line yAxisId="left"  type="monotone" dataKey="vhi_health_index" name="VHI (index)" stroke="#ef4444" strokeWidth={2} dot={{ r: 2 }} isAnimationActive={false} connectNulls />
+                <Line yAxisId="left"  type="monotone" dataKey="mci_percent" name="MCI (%)" stroke="#6366f1" strokeWidth={2} dot={{ r: 2 }} isAnimationActive={false} connectNulls />
+                <Line yAxisId="right" type="monotone" dataKey="bearing_temp_rise_C" name="Bearing ΔT (°C)" stroke="#0ea5e9" strokeWidth={2} dot={{ r: 2 }} isAnimationActive={false} connectNulls />
+              </LineChart>
+            ) : (
+              <div className="h-full grid place-items-center text-slate-400 text-sm">No PM data to chart</div>
+            )}
+          </div>
         </section>
 
         {/* Routine Controls */}
@@ -1116,6 +1149,8 @@ export default function PlantAgentDashboard() {
             </div>
             <div className="mt-3 flex gap-2">
               <button className="btn-outline" onClick={()=>fetchTrends()}>Re-fetch trends</button>
+              <button className="btn-outline" onClick={()=>fetchPmTrends()}>Re-fetch PM trends</button>
+              <button className="btn-outline" onClick={()=>fetchPmSegments()}>Re-fetch PM segments</button>
               <button className="btn-outline" onClick={()=>{ disableLastRunsRef.current=false; fetchLastRuns(); }}>Re-fetch last_runs</button>
               <button className="btn-outline" onClick={()=>fetchRoutineLatest()}>Fetch /routine/latest now</button>
               <button className="btn-outline" onClick={()=>getMetrics()}>Refresh metrics</button>
@@ -1132,6 +1167,7 @@ export default function PlantAgentDashboard() {
           <span>SPower: mode=<b>{metrics?.spower?.mode}</b>, tol=<b>{metrics?.spower?.tol}</b></span>
           <span>Thresholds: pct=<b>{metrics?.thresholds?.MIN_PCT_DELTA}</b>, idfan=<b>{metrics?.thresholds?.MIN_ABS_ID_FAN}</b>, cooler=<b>{metrics?.thresholds?.MIN_ABS_COOLER}</b></span>
           <span>Cron defaults: apply_top=<b>{String(metrics?.cron_defaults?.CRON_APPLY_TOP)}</b>, nudge=<b>{String(metrics?.cron_defaults?.CRON_NUDGE_IF_NEUTRAL)}</b>, log=<b>{String(metrics?.cron_defaults?.CRON_LOG_SUGGESTIONS)}</b></span>
+          <span>PM trend source: <b>{pmTrendSource}</b></span>
         </div>
       </footer>
     </div>
