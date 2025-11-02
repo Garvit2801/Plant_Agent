@@ -1,12 +1,14 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { LineChart, Line, XAxis, YAxis, Tooltip, Legend, CartesianGrid } from "recharts";
+import { LineChart, Line, XAxis, YAxis, Tooltip, Legend, CartesianGrid, ReferenceArea } from "recharts";
 
 /**
  * Plant Agent – Operations Dashboard (No-Auth Variant) — UPDATED
  * Adds KPI surfaces for:
- *  - Vibration Health Index (VHI): shows index, threshold, status badge (ok/watch/alert)
- *  - Motor Current Imbalance (MCI_percent): shows % and trend
- * Keeps: O2, Specific Power, Production, etc.
+ *  - Vibration Health Index (VHI): index, threshold, status badge (ok/watch/alert)
+ *  - Motor Current Imbalance (MCI_percent): % and trend
+ * Adds Predictive Maintenance Segments:
+ *  - Shaded watch/alert bands on the trend chart
+ *  - "Active PM Segments" list (last 120 min)
  */
 
 const RECOMMENDED_HOST = "https://plant-agent-i32khy5nrq-el.a.run.app";
@@ -111,6 +113,18 @@ type LoadResp = {
   match_info?: any; targets?: any; steps_cfg?: any;
 };
 
+/* Predictive Maintenance segments */
+type PMSegment = {
+  start_ts: string;                       // ISO
+  end_ts?: string | null;                 // ISO or null (ongoing)
+  status: "watch" | "alert";
+  kpi?: "VHI" | "MCI_percent" | "BearingTempRise_C" | string;
+  asset?: string;
+  value?: number | null;
+  threshold?: number | null;
+  note?: string | null;
+};
+
 /* =========================
    Helpers used by UI
    ========================= */
@@ -208,6 +222,16 @@ function statusTone(s?: string | null) {
   }
 }
 
+/* PM segment helpers */
+const tsToLabel = (ts?: string | null) =>
+  ts ? new Date(ts).toLocaleTimeString() : "";
+
+const segTone = (s: PMSegment["status"]) =>
+  s === "alert" ? { fill:"#f43f5e", stroke:"#be123c" } : { fill:"#f59e0b", stroke:"#b45309" };
+
+const minutesBetween = (a: string, b: string) =>
+  Math.max(0, Math.round((new Date(b).getTime() - new Date(a).getTime()) / 60000));
+
 /* =========================
    Main Component
    ========================= */
@@ -262,6 +286,9 @@ export default function PlantAgentDashboard() {
   const disableLastRunsRef = useRef(false);
   const cronProbeRef = useRef<number | null>(null);
   const lastCronRef = useRef<string | null>(null);
+
+  /* PM segments */
+  const [pmSegs, setPmSegs] = useState<PMSegment[]>([]);
 
   /* Health/version */
   const fetchHealth = useCallback(async () => {
@@ -323,6 +350,22 @@ export default function PlantAgentDashboard() {
       setErrorMsg(prev => prev || e?.message || "Failed to fetch trends");
     }
   }, [base, getHeaders, trendSource]);
+
+  /* PM segments fetcher */
+  const fetchPmSegments = useCallback(async () => {
+    if (!base) return;
+    try {
+      const { json } = await getJsonCandidates(base, getHeaders, [
+        "/pm/segments?window_minutes=120",
+        "/segments/pm?minutes=120",
+        "/pm/segments",
+        "/segments/pm",
+      ]);
+      if (Array.isArray(json)) setPmSegs(json as PMSegment[]);
+    } catch {
+      // silent; UI still works
+    }
+  }, [base, getHeaders]);
 
   /* last_runs + countdown */
   const fetchLastRuns = useCallback(async () => {
@@ -393,15 +436,17 @@ export default function PlantAgentDashboard() {
 
     fetchSnapshot().catch(()=>{});
     fetchTrends().catch(()=>{});
+    fetchPmSegments().catch(()=>{});
     fetchLastRuns().catch(()=>{});
     fetchRoutineLatest().catch(()=>{});
 
     pollRef.current = window.setInterval(() => {
       fetchSnapshot().catch(()=>{});
       fetchLastRuns().catch(()=>{});
+      fetchPmSegments().catch(()=>{});
     }, 5000);
     return () => { if (pollRef.current) window.clearInterval(pollRef.current); pollRef.current = null; };
-  }, [autoPoll, base, fetchSnapshot, fetchTrends, fetchLastRuns, fetchRoutineLatest]);
+  }, [autoPoll, base, fetchSnapshot, fetchTrends, fetchPmSegments, fetchLastRuns, fetchRoutineLatest]);
 
   /* countdown tick */
   useEffect(() => {
@@ -634,7 +679,12 @@ export default function PlantAgentDashboard() {
               </select>
               <span className="text-xs text-slate-500">from <span className="font-mono">{trendEndpoint}</span></span>
             </div>
-            <button onClick={()=>{ fetchSnapshot(); fetchTrends(); fetchLastRuns(); fetchRoutineLatest(); getMetrics(); }} className="btn-outline">Refresh now</button>
+            <button
+              onClick={()=>{ fetchSnapshot(); fetchTrends(); fetchPmSegments(); fetchLastRuns(); fetchRoutineLatest(); getMetrics(); }}
+              className="btn-outline"
+            >
+              Refresh now
+            </button>
             {errorMsg ? <span className="text-rose-600">• {errorMsg}</span> : null}
           </div>
           {countdown == null && (
@@ -767,10 +817,35 @@ export default function PlantAgentDashboard() {
                   <YAxis yAxisId="left" domain={["auto","auto"]} tick={{ fill: "#334155", fontSize: 12 }} axisLine={{ stroke: "#94a3b8" }} tickLine={{ stroke: "#94a3b8" }} />
                   <YAxis yAxisId="right" orientation="right" domain={["auto","auto"]} tick={{ fill: "#334155", fontSize: 12 }} axisLine={{ stroke: "#94a3b8" }} tickLine={{ stroke: "#94a3b8" }} />
                   <Tooltip /><Legend wrapperStyle={{ paddingTop: 8 }} />
+
+                  {/* PM shaded segments */}
+                  {pmSegs.map((s, i) => {
+                    const x1 = tsToLabel(s.start_ts);
+                    const x2 = tsToLabel(s.end_ts ?? new Date().toISOString());
+                    const tone = segTone(s.status);
+                    return (
+                      <ReferenceArea
+                        key={`pmseg-${i}`}
+                        x1={x1}
+                        x2={x2}
+                        yAxisId="left"
+                        stroke={tone.stroke}
+                        fill={tone.fill}
+                        fillOpacity={0.12}
+                        ifOverflow="extendDomain"
+                        label={{
+                          value: `${s.status.toUpperCase()} ${s.kpi ?? ""}`.trim(),
+                          position: "insideTopLeft",
+                          offset: 6
+                        }}
+                      />
+                    );
+                  })}
+
+                  {/* Lines */}
                   <Line yAxisId="left"  type="monotone" dataKey="production_tph" name="Production (tph)" stroke="#0ea5e9" strokeWidth={2} dot={{ r: 2 }} isAnimationActive={false} connectNulls />
                   <Line yAxisId="right" type="monotone" dataKey="o2_percent" name="O₂ (%)" stroke="#22c55e" strokeWidth={2} dot={{ r: 2 }} isAnimationActive={false} connectNulls />
                   <Line yAxisId="right" type="monotone" dataKey="specific_power_kwh_per_ton" name="Specific Power (kWh/t)" stroke="#f59e0b" strokeWidth={2} dot={{ r: 2 }} isAnimationActive={false} connectNulls />
-                  {/* NEW lines */}
                   <Line yAxisId="left"  type="monotone" dataKey="mci_percent" name="MCI (%)" stroke="#6366f1" strokeWidth={2} dot={{ r: 2 }} isAnimationActive={false} connectNulls />
                   <Line yAxisId="left"  type="monotone" dataKey="vhi_health_index" name="VHI (index)" stroke="#ef4444" strokeWidth={2} dot={{ r: 2 }} isAnimationActive={false} connectNulls />
                 </LineChart>
@@ -793,6 +868,57 @@ export default function PlantAgentDashboard() {
               </div>
             ) : <div className="text-slate-500 text-sm">No snapshot yet.</div>}
           </div>
+        </section>
+
+        {/* Active PM Segments */}
+        <section className="card">
+          <div className="flex items-center justify-between">
+            <div className="font-semibold">Active PM Segments (last 120 min)</div>
+            <div className="text-xs text-slate-500">{pmSegs.length} segment(s)</div>
+          </div>
+          {pmSegs.length === 0 ? (
+            <div className="mt-2 text-sm text-slate-500">No watch/alert segments in the selected window.</div>
+          ) : (
+            <div className="mt-3 overflow-x-auto">
+              <table className="min-w-full text-xs">
+                <thead>
+                  <tr className="text-left text-slate-500 border-b">
+                    <th className="py-2 pr-4">Status</th>
+                    <th className="py-2 pr-4">Asset</th>
+                    <th className="py-2 pr-4">KPI</th>
+                    <th className="py-2 pr-4">Start</th>
+                    <th className="py-2 pr-4">End</th>
+                    <th className="py-2 pr-4">Duration</th>
+                    <th className="py-2 pr-4">Value / Thresh</th>
+                    <th className="py-2 pr-4">Note</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {pmSegs.map((s, i) => {
+                    const end = s.end_ts ?? new Date().toISOString();
+                    const durMin = minutesBetween(s.start_ts, end);
+                    return (
+                      <tr key={`segrow-${i}`} className="border-b last:border-0">
+                        <td className="py-2 pr-4">
+                          <Chip tone={statusTone(s.status)}>{s.status}</Chip>
+                        </td>
+                        <td className="py-2 pr-4">{s.asset ?? "—"}</td>
+                        <td className="py-2 pr-4">{s.kpi ?? "—"}</td>
+                        <td className="py-2 pr-4 font-mono">{new Date(s.start_ts).toLocaleTimeString()}</td>
+                        <td className="py-2 pr-4 font-mono">{s.end_ts ? new Date(s.end_ts).toLocaleTimeString() : "now"}</td>
+                        <td className="py-2 pr-4">{durMin} min</td>
+                        <td className="py-2 pr-4">
+                          {s.value != null ? <span className="font-mono">{Number(s.value).toFixed(2)}</span> : "—"}
+                          {s.threshold != null ? <span className="text-slate-500"> / {Number(s.threshold).toFixed(2)}</span> : null}
+                        </td>
+                        <td className="py-2 pr-4">{s.note ?? "—"}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
         </section>
 
         {/* Routine Controls */}
