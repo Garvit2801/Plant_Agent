@@ -7,11 +7,11 @@ import {
  * Plant Agent – Operations Dashboard (No-Auth Variant)
  * - Important Trends + PM Trends (own source selector)
  * - PM segments (ok/watch/alert) as shaded bands in the PM chart
- * - GET→POST fallback for endpoints that return 405 to GET
  * - Alias-tolerant trend cleaning so PM data renders even if keys differ
+ * - Only /debug/last_runs uses GET→POST fallback (others are GET-only)
  */
 
-const RECOMMENDED_HOST = "https://plant-agent-i32khy5nrq-el.a.run.app";
+const RECOMMENDED_HOST = "https://plant-agent-i32khy5nrq-em.a.run.app"; // EM service (exposes GET /pm/segments)
 const DEBUG_KEY = "plant_ui.debug";
 const getDebug = () => (localStorage.getItem(DEBUG_KEY) ?? "0") === "1";
 const setDebug = (b: boolean) => localStorage.setItem(DEBUG_KEY, b ? "1" : "0");
@@ -372,7 +372,7 @@ export default function PlantAgentDashboard() {
 
       const order =
         pmTrendSource === "bq"
-          ? [pathPMBQ, pathPMOnly, pathBq, pathAuto]
+          ? [pathPMBQ, pathPMOnly, pathAuto, pathBq]
           : pmTrendSource === "pm_only"
             ? [pathPMOnly, pathPMBQ, pathAuto, pathBq]
             : [pathAuto, pathPMOnly, pathPMBQ, pathBq];
@@ -385,7 +385,7 @@ export default function PlantAgentDashboard() {
     }
   }, [base, getHeaders, pmTrendSource]);
 
-  /* PM segments — debounced; permanently disables on 404/405 to stop spam */
+  /* PM segments — GET-only; debounced; permanently disables on 404/405 to stop spam */
   const fetchPmSegments = useCallback(async () => {
     if (!base || pmSegsDisabledRef.current) return;
 
@@ -393,66 +393,41 @@ export default function PlantAgentDashboard() {
     const now = Date.now();
     if (now < pmSegsNextTryAtRef.current) return;
 
-    type PMFetchResult =
-      | { ok: true; json: any; status: number; via: "GET" | "POST"; path?: string }
-      | { ok: false; status: number; via: "GET" | "POST"; path?: string };
-
-    const tryGet = async (minutes: number): Promise<PMFetchResult> => {
+    const tryGet = async (minutes: number) => {
       const paths = [`/pm/segments?minutes=${minutes}`, `/segments/pm?minutes=${minutes}`];
       for (const p of paths) {
         try {
           const r = await fetch(`${base}${p}`, { headers: getHeaders });
-          if (r.ok) return { ok: true, json: await r.json(), status: r.status, via: "GET", path: p };
-          if (r.status === 404 || r.status === 405) return { ok: false, status: r.status, via: "GET", path: p };
-          return { ok: false, status: r.status, via: "GET", path: p };
+          if (r.ok) return { ok: true as const, json: await r.json(), status: r.status, path: p };
+          if (r.status === 404 || r.status === 405) return { ok: false as const, status: r.status, path: p }; // hard disable below
+          return { ok: false as const, status: r.status, path: p };
         } catch { /* continue */ }
       }
-      return { ok: false, status: 405, via: "GET" };
-    };
-
-    const tryPost = async (minutes: number): Promise<PMFetchResult> => {
-      const paths = ["/pm/segments", "/segments/pm"];
-      for (const p of paths) {
-        try {
-          const r = await fetch(`${base}${p}`, {
-            method: "POST",
-            headers: { ...postHeaders },
-            body: JSON.stringify({ minutes }),
-          });
-          if (r.ok) return { ok: true, json: await r.json(), status: r.status, via: "POST", path: p };
-          if (r.status === 404 || r.status === 405) return { ok: false, status: r.status, via: "POST", path: p };
-          return { ok: false, status: r.status, via: "POST", path: p };
-        } catch { /* continue */ }
-      }
-      return { ok: false, status: 405, via: "POST" };
+      return { ok: false as const, status: 0, path: undefined };
     };
 
     try {
-      let res: PMFetchResult = await tryGet(180);
+      let res = await tryGet(180);
       if (!res.ok) res = await tryGet(120);
-      if (!res.ok) {
-        res = await tryPost(180);
-        if (!res.ok) res = await tryPost(120);
-      }
 
-      // hard disable on explicit 404/405
+      // Hard-disable on explicit 404/405 (endpoint not exposed on this deploy)
       if (!res.ok && (res.status === 404 || res.status === 405)) {
         pmSegsDisabledRef.current = true;
         pmSegsNextTryAtRef.current = Number.POSITIVE_INFINITY;
         setPmSegs([]);
-        setPmSegsNote("PM segments disabled (404/405). Endpoint not exposed on this deploy.");
+        setPmSegsNote("PM segments disabled (GET 404/405) on this deploy.");
         return;
       }
 
-      // soft failure → back off for 60s
+      // Soft failure → back off for 60s
       if (!res.ok) {
         pmSegsNextTryAtRef.current = now + 60_000;
         return;
       }
 
-      // success → parse & set, and still rate limit to 60s
+      // Success → parse & set; still rate limit to 60s
       pmSegsNextTryAtRef.current = now + 60_000;
-      setPmSegsNote(`${res.via} ${res.path ?? ""}`.trim());
+      setPmSegsNote(`GET ${res.path ?? ""}`.trim());
 
       if (Array.isArray(res.json)) {
         const mapped = (res.json as any[]).map((raw: any): PMSegment | null => {
@@ -479,7 +454,7 @@ export default function PlantAgentDashboard() {
       pmSegsNextTryAtRef.current = Date.now() + 60_000;
       info("PM segments fetch failed", e?.message ?? e);
     }
-  }, [base, getHeaders, postHeaders]);
+  }, [base, getHeaders]);
 
   /* last_runs + countdown */
   const fetchLastRuns = useCallback(async () => {
