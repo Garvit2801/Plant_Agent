@@ -17,7 +17,7 @@ import yaml
 import pandas as pd
 import numpy as np
 import datetime
-from fastapi import FastAPI, HTTPException, Body, Query, Response, Request
+from fastapi import FastAPI, HTTPException, Body, Query, Response, Request, status as _status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -27,7 +27,7 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 # Optional planner import (fallbacks provided if not available)
 # ------------------------------------------------------------
 try:
-    from agent.planner import build_stage_plan, propose_actions, build_ui_payload
+    from agent.planner import build_stage_plan, propose_actions, build_ui_payload  # type: ignore
 except Exception:
     def _pct_step(current: float, target: float, step_pct: float) -> float:
         return current + (target - current) * (step_pct / 100.0)
@@ -176,18 +176,7 @@ PM_KPIS = [
 # -------------------------
 app = FastAPI(title="Plant Agent API", version=SERVICE_VERSION)
 
-@app.middleware("http")
-async def stamp_and_log(request: Request, call_next):
-    logging.info(
-        "REQ method=%s path=%s origin=%s",
-        request.method, request.url.path, request.headers.get("origin"),
-    )
-    resp = await call_next(request)
-    resp.headers["X-Service-Version"] = SERVICE_VERSION
-    resp.headers["X-Sched-Period-Sec"] = str(SCHED_PERIOD_SEC)
-    resp.headers["Vary"] = "Origin"
-    return resp
-
+# Allow-list of UI origins
 _default_ui_origins = [
     "http://localhost:5173",
     "http://localhost:3000",
@@ -199,16 +188,6 @@ _default_ui_origins = [
 _env_ui = [o.strip() for o in os.getenv("UI_ORIGINS", "").split(",") if o.strip()]
 UI_ORIGINS = _env_ui or _default_ui_origins
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=UI_ORIGINS,
-    allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"],
-    expose_headers=["X-Service-Version", "X-Sched-Period-Sec"],
-    max_age=86400,
-)
-
 def _origin_allowed(origin: Optional[str]) -> bool:
     return bool(origin and origin in UI_ORIGINS)
 
@@ -216,12 +195,39 @@ def _cors_hdrs_for(origin: Optional[str]) -> Dict[str, str]:
     if _origin_allowed(origin):
         return {
             "Access-Control-Allow-Origin": origin,
-            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+            "Access-Control-Allow-Methods": "GET, POST, HEAD, OPTIONS",
             "Access-Control-Allow-Headers": "*",
             "Access-Control-Max-Age": "86400",
             "Vary": "Origin",
         }
     return {}
+
+# CORS middleware (adds headers to normal responses & error responses)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=UI_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "HEAD", "OPTIONS"],  # include HEAD
+    allow_headers=["*"],
+    expose_headers=["X-Service-Version", "X-Sched-Period-Sec"],
+    max_age=86400,
+)
+
+# Global middleware to *always* stamp CORS for allowed origins (extra safety when other middleware short-circuits)
+@app.middleware("http")
+async def stamp_and_log(request: Request, call_next):
+    origin = request.headers.get("origin")
+    logging.info("REQ method=%s path=%s origin=%s", request.method, request.url.path, origin)
+    resp = await call_next(request)
+    # add service headers
+    resp.headers["X-Service-Version"] = SERVICE_VERSION
+    resp.headers["X-Sched-Period-Sec"] = str(SCHED_PERIOD_SEC)
+    resp.headers["Vary"] = "Origin"
+    # ensure CORS is present on every response for allowed origins
+    for k, v in _cors_hdrs_for(origin).items():
+        if k not in resp.headers:
+            resp.headers[k] = v
+    return resp
 
 @app.options("/{path:path}")
 async def options_any(path: str, request: Request):
@@ -694,6 +700,7 @@ def _bq_get_schema(table_fqn: str) -> Dict[str, str]:
         return {}
 
 def _coerce_for_field(value: Any, field_type: str):
+    """Robust coercion; JSON/RECORD must remain native dict/list, not strings."""
     if value is None:
         return None
     try:
@@ -709,20 +716,23 @@ def _coerce_for_field(value: Any, field_type: str):
             return bool(value)
         if field_type == "JSON":
             if isinstance(value, (dict, list)):
-                return json.dumps(value, separators=(",", ":"))
-            if isinstance(value, (int, float, bool)) or value is None:
-                return json.dumps(value)
-            return str(value)
+                return value
+            try:
+                return json.loads(value)
+            except Exception:
+                if isinstance(value, (int, float, bool)) or value is None:
+                    return value
+                return {"value": str(value)}
         if field_type == "RECORD":
             if isinstance(value, (dict, list)):
                 return value
             try:
                 parsed = json.loads(value)
-                return parsed
+                return parsed if isinstance(parsed, (dict, list)) else {"value": parsed}
             except Exception:
-                return {"value": value}
+                return {"value": str(value)}
         if field_type == "STRING":
-            return json.dumps(value, default=str) if isinstance(value, (dict, list)) else str(value)
+            return json.dumps(value, separators=(",", ":"), ensure_ascii=False) if isinstance(value, (dict, list)) else str(value)
         return value
     except Exception:
         return None
@@ -797,17 +807,12 @@ def _bq_ingest_snapshot(snapshot: Dict[str, Any], source: str = "apply") -> Opti
         "specific_power_kwh_per_ton": float(snapshot["specific_power_kwh_per_ton"]),
     }
     if "raw" in schema:
-        row["raw"] = _as_json_string(snapshot)
+        row["raw"] = _normalize_json_for_field(snapshot, schema.get("raw"))
     err = _bq_insert_flexible(table, row)
     _remember_bq_attempt("snapshot_insert", table, list(row.keys()), err)
     return err
 
 def _cm_table_fq(backticked: bool = False) -> str:
-    """
-    Return the fully-qualified cm_kpis table as 'project.dataset.table'.
-    If backticked=True, wrap it in BigQuery backticks.
-    Uses _cm_table() if present, else env CM_KPIS_TABLE.
-    """
     tbl = None
     try:
         tbl = _cm_table()
@@ -817,10 +822,8 @@ def _cm_table_fq(backticked: bool = False) -> str:
         tbl = os.getenv("CM_KPIS_TABLE")
     if not tbl:
         raise RuntimeError("CM KPIs table not configured; set CM_KPIS_TABLE or implement _cm_table()")
-
     tbl = tbl.strip().strip("`")
     return f"`{tbl}`" if backticked else tbl
-
 
 # -------------------------
 # NEW: insert per-lever suggestions helper
@@ -894,10 +897,6 @@ def _strip_debug_keys(m: Dict[str, Any]) -> Dict[str, Any]:
     return m
 
 def _is_manual_actuation_request(request: Request) -> bool:
-    """
-    DEV MODE: Only requires 'X-Confirm-Apply: yes' header.
-    (No Bearer token required.)
-    """
     return (request.headers.get("X-Confirm-Apply", "") or request.headers.get("x-confirm-apply", "")).lower() == "yes"
 
 def _apply_setpoints_internal(setpts: Dict[str, float],
@@ -927,12 +926,11 @@ def _apply_setpoints_internal(setpts: Dict[str, float],
         levers: Dict[str, Any] = cfg.get("levers", {})
         with _state_lock:
             sp = _STATE.setdefault("sp", {})
-            for k, v in setpts.items():
-                if k not in ("kiln_feed_tph","separator_dp_pa","id_fan_flow_Nm3_h","cooler_airflow_Nm3_h","kiln_speed_rpm"):
-                    continue
-                lo = levers.get(k, {}).get("min", -1e12)
-                hi = levers.get(k, {}).get("max", 1e12)
-                sp[k] = clamp(float(v), lo, hi)
+            for k in ("kiln_feed_tph","separator_dp_pa","id_fan_flow_Nm3_h","cooler_airflow_Nm3_h","kiln_speed_rpm"):
+                if k in setpts:
+                    lo = levers.get(k, {}).get("min", -1e12)
+                    hi = levers.get(k, {}).get("max", 1e12)
+                    sp[k] = clamp(float(setpts[k]), lo, hi)
 
             for k in ("kiln_feed_tph","separator_dp_pa","id_fan_flow_Nm3_h","cooler_airflow_Nm3_h","kiln_speed_rpm"):
                 if k in sp:
@@ -1068,11 +1066,11 @@ def root():
         "health": "/healthz",
         "endpoints": [
             "/healthz", "/health", "/_ah/health", "/version", "/config",
-            "/debug/config", "/debug/tables", "/debug/bq_recent", "/debug/last_runs",
+            "/debug/config", "/debug/tables", "/debug/bq_recent", "/debug/last_runs", "/debug/routes",
             "/snapshot", "/snapshot/set",
             "/trends",
             "/pm/trends", "/pm/segments", "/pm/forecast",
-            "/pm/health_index", "/pm/anomalies",
+            "/pm/health_index", "/pm/health/latest", "/pm/anomalies",
             "/optimize/routine", "/optimize/load", "/cron/routine",
             "/routine/latest",
             "/kpi/predictions/latest", "/kpi/predictions/future",
@@ -1081,9 +1079,7 @@ def root():
             "/ingest", "/metrics",
             "/predict/spower",
             "/debug/physics_flags",
-            # Condition monitoring endpoints
             "/cm/vhi", "/cm/vhi/log", "/cm/mci", "/cm/mci/log",
-            # alias explicitly exposed
             "/segments/pm",
         ],
         "bq_enabled": _BQ_ENABLED,
@@ -1190,7 +1186,6 @@ def pm_health_latest():
     if not (_BQ_ENABLED and _bq_client):
         raise HTTPException(status_code=503, detail="BigQuery disabled")
 
-    # Resolve CM table (backticked)
     tbl_name = _cm_table() or os.getenv("CM_KPIS_TABLE")
     if not tbl_name:
         raise HTTPException(status_code=500, detail="CM KPIs table not configured")
@@ -1439,36 +1434,321 @@ def trends(
     return out
 
 # -------------------------
-# NEW: PM View Readers (BigQuery views you created)
+# PM COMPUTATION HELPERS (VHI/MCI/BTR) & MOCK OUTPUTS
+# -------------------------
+from fastapi import status as _status
+
+def _df_recent(minutes:int=240, limit:int=5000) -> pd.DataFrame:
+    """
+    Returns a DataFrame indexed by ts with numeric columns.
+    Works on mock (_HIST) or BigQuery snapshots base table.
+    """
+    if USE_MOCK:
+        cutoff = _now_ts() - datetime.timedelta(minutes=minutes)
+        rows = [p for p in list(_HIST) if datetime.datetime.fromisoformat(p["ts"].replace("Z","")).astimezone(datetime.timezone.utc) >= cutoff]
+        df = pd.DataFrame(rows[-limit:])
+    else:
+        if not _BQ_ENABLED or _bq_client is None:
+            return pd.DataFrame()
+        table = _snapshots_table()
+        sql = f"""
+          SELECT ts,
+                 production_tph, kiln_feed_tph, separator_dp_pa,
+                 id_fan_flow_Nm3_h, cooler_airflow_Nm3_h,
+                 kiln_speed_rpm, o2_percent, specific_power_kwh_per_ton,
+                 vibration_axial_mm_s, vibration_radial_mm_s,
+                 motor_current_a, motor_current_b, motor_current_c,
+                 bearing_temp_C, suction_temp_C
+          FROM `{table}`
+          WHERE ts >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @m MINUTE)
+          ORDER BY ts ASC
+          LIMIT @lim
+        """
+        from google.cloud import bigquery  # type: ignore
+        job = _bq_client.query(
+            sql, location=BQ_LOCATION,
+            job_config=bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ScalarQueryParameter("m", "INT64", minutes),
+                    bigquery.ScalarQueryParameter("lim", "INT64", limit),
+                ]
+            )
+        )
+        rows = list(job.result())
+        df = pd.DataFrame([dict(r) for r in rows])
+    if df.empty:
+        return df
+    # normalize ts → datetime
+    if "ts" in df.columns:
+        df["ts"] = pd.to_datetime(df["ts"])
+        df = df.sort_values("ts")
+        df = df.set_index("ts")
+    # keep numeric
+    for c in df.columns:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
+def _pick_col(df: pd.DataFrame, names: List[str]) -> Optional[str]:
+    cols = list(df.columns)
+    low = [c.lower() for c in cols]
+    for n in names:
+        nlow = n.lower()
+        if nlow in low:
+            return cols[low.index(nlow)]
+        for i, cl in enumerate(low):
+            if cl.replace("_", "") == nlow.replace("_", ""):
+                return cols[i]
+        for i, cl in enumerate(low):
+            if cl.startswith(nlow) or (nlow in cl):
+                return cols[i]
+    return None
+
+def _select_vibration_cols(df: pd.DataFrame) -> List[str]:
+    keys = ["vibration", "vibe", "accel", "acceleration", "bearing", "brg"]
+    num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+    vib_cols = [c for c in num_cols if any(k in str(c).lower() for k in keys)]
+    return vib_cols
+
+def _compute_vhi(df: pd.DataFrame):
+    vib_cols = _select_vibration_cols(df)
+    if not vib_cols:
+        return pd.Series(dtype=float), 0.0, pd.DataFrame()
+    sel = df[vib_cols].copy()
+    win = max(10, min(500, int(len(sel) * 0.05)))
+    roll_mean = sel.rolling(win, min_periods=max(5, win // 3)).mean()
+    roll_std  = sel.rolling(win, min_periods=max(5, win // 3)).std()
+    z = (sel - roll_mean) / (roll_std + 1e-9)
+    hi = z.abs().mean(axis=1)  # VHI
+    mad = (hi - hi.median()).abs().median()
+    thresh = hi.median() + 3.5 * (mad if mad > 0 else (hi.std() if np.isfinite(hi.std()) else 0.0))
+    anomalies = sel[hi > thresh]
+    return hi, float(thresh if np.isfinite(thresh) else 0.0), anomalies
+
+# Fallback shims (names used elsewhere)
+if "_compute_vhi_series" not in globals():
+    def _compute_vhi_series(df: pd.DataFrame) -> pd.Series:
+        cols = _select_vibration_cols(df)
+        if not cols:
+            num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+            cols = num_cols
+        if not cols:
+            return pd.Series(index=getattr(df, "index", []), dtype=float)
+        sel = df[cols].copy()
+        win = max(10, min(500, int(len(sel) * 0.05))) or 10
+        roll_mean = sel.rolling(win, min_periods=max(5, win // 3)).mean()
+        roll_std  = sel.rolling(win, min_periods=max(5, win // 3)).std()
+        z = (sel - roll_mean) / (roll_std + 1e-9)
+        hi = z.abs().mean(axis=1)
+        return hi
+
+if "_vhi_threshold" not in globals():
+    def _vhi_threshold(vhi: pd.Series) -> float:
+        v = pd.to_numeric(vhi, errors="coerce").dropna()
+        if v.empty:
+            return float("nan")
+        med = float(np.median(v.values))
+        mad = float(np.median(np.abs(v.values - med)))
+        robust_thr = med + 3.0 * (1.4826 * mad)
+        p95 = float(np.percentile(v.values, 95))
+        return max(robust_thr, p95)
+
+def _compute_mci_series(df: pd.DataFrame) -> pd.Series:
+    cand_a = ["ia","i_a","phase_a","phase a","current_a","current a","motor_current_a","motor current a"]
+    cand_b = ["ib","i_b","phase_b","phase b","current_b","current b","motor_current_b","motor current b"]
+    cand_c = ["ic","i_c","phase_c","phase c","current_c","current c","motor_current_c","motor current c"]
+    ca = _pick_col(df, cand_a + [s.upper() for s in cand_a])
+    cb = _pick_col(df, cand_b + [s.upper() for s in cand_b])
+    cc = _pick_col(df, cand_c + [s.upper() for s in cand_c])
+    if not ca or not cb or not cc:
+        return pd.Series(index=df.index, dtype=float)
+    sA = pd.to_numeric(df[ca], errors="coerce")
+    sB = pd.to_numeric(df[cb], errors="coerce")
+    sC = pd.to_numeric(df[cc], errors="coerce")
+    avg = (sA + sB + sC) / 3.0
+    mci = (pd.concat([sA,sB,sC], axis=1).max(axis=1) - pd.concat([sA,sB,sC], axis=1).min(axis=1)) / (avg + 1e-9) * 100.0
+    mci[(avg <= 0) | (~np.isfinite(mci))] = np.nan
+    return mci
+
+def _compute_bearing_temp_rise_series(df: pd.DataFrame) -> pd.Series:
+    cand_brg = ["bearing_temp","bearing_temp_c","brg_temp","brg_temp_c","bearing temperature","bearing"]
+    cand_inl = ["suction_temp","suction_temp_c","inlet_temp","inlet_temp_c","inlet temperature","suction temperature"]
+    cand_amb = ["ambient_temp","ambient_temp_c","ambient temperature","room_temp","room temperature"]
+    cb = _pick_col(df, cand_brg + [s.upper() for s in cand_brg])
+    ci = _pick_col(df, cand_inl + [s.upper() for s in cand_inl])
+    ca = _pick_col(df, cand_amb + [s.upper() for s in cand_amb])
+    if not cb:
+        return pd.Series(index=df.index, dtype=float)
+    b = pd.to_numeric(df[cb], errors="coerce")
+    base = None
+    if ci:
+        base = pd.to_numeric(df[ci], errors="coerce")
+    elif ca:
+        base = pd.to_numeric(df[ca], errors="coerce")
+    else:
+        return pd.Series(index=df.index, dtype=float)
+    return b - base
+
+# ---------- PM MOCK HELPERS (array outputs even when BQ is disabled) ----------
+def _pm_mock_trends(minutes: int = 120) -> List[Dict[str, Any]]:
+    """Mock PM trends from in-memory history (_HIST). Always returns a list."""
+    df = _df_recent(minutes=minutes)
+    if df.empty:
+        return []
+    # Compute VHI
+    vhi, vhi_thr, _ = _compute_vhi(df)
+    # Compute MCI (or fallback to bearing temp rise)
+    mci = _compute_mci_series(df)
+    if mci.notna().sum() < max(3, int(0.05 * len(df))):
+        btr = _compute_bearing_temp_rise_series(df)
+    else:
+        btr = pd.Series(index=df.index, dtype=float)
+
+    # Build a unified time index (left join on original df index)
+    out: List[Dict[str, Any]] = []
+    idx = df.index
+    for ts in idx:
+        d: Dict[str, Any] = {"ts": ts.to_pydatetime().isoformat()}
+        # vhi
+        v = float(vhi.get(ts)) if ts in vhi.index and pd.notna(vhi.get(ts)) else None
+        d["vhi_health_index"] = v
+        # mci%
+        mv = float(mci.get(ts)) if ts in mci.index and pd.notna(mci.get(ts)) else None
+        d["mci_percent"] = mv
+        # bearing temp rise (only if mci insufficient)
+        bv = float(btr.get(ts)) if ts in btr.index and pd.notna(btr.get(ts)) else None
+        d["bearing_temp_rise_C"] = bv
+        out.append(d)
+    return out
+
+def _pm_mock_segments(minutes: int = 180, step_min: int = 10) -> List[Dict[str, Any]]:
+    """
+    Derive simple segments (‘ok’/‘watch’/‘alert’) from VHI and MCI/BTR on mock data.
+    Always returns a list.
+    """
+    df = _df_recent(minutes=minutes)
+    if df.empty:
+        return []
+
+    # VHI → status bands
+    vhi, vthr, _ = _compute_vhi(df)
+
+    def _hi_status(v: float, t: float) -> str:
+        if t is None or not np.isfinite(t) or t <= 0:
+            return "ok"
+        if v < 0.5 * t: return "ok"
+        if v < 1.0 * t: return "watch"
+        return "alert"
+
+    # MCI vs Bearing temp rise fallback
+    mci = _compute_mci_series(df)
+    use_mci = mci.notna().sum() >= max(3, int(0.05 * len(df)))
+    if use_mci:
+        series = mci
+        kpi_name = "MCI_percent"
+        def _mci_status(val: float) -> str:
+            if not np.isfinite(val): return "ok"
+            if val < 30.0: return "ok"
+            if val < 50.0: return "watch"
+            return "alert"
+        status_fn = _mci_status
+    else:
+        series = _compute_bearing_temp_rise_series(df)
+        kpi_name = "BearingTempRise_C"
+        def _btr_status(val: float) -> str:
+            if not np.isfinite(val): return "ok"
+            if val < 10.0: return "ok"
+            if val < 20.0: return "watch"
+            return "alert"
+        status_fn = _btr_status
+
+    # Build discrete points with statuses at a coarse step
+    start_ts = df.index.min()
+    end_ts   = df.index.max()
+    if pd.isna(start_ts) or pd.isna(end_ts):
+        return []
+
+    times = pd.date_range(start=start_ts, end=end_ts, freq=f"{max(1, step_min)}min")
+    vhi_interp = vhi.reindex(times, method="nearest", tolerance=pd.Timedelta(minutes=step_min))
+    ser_interp = series.reindex(times, method="nearest", tolerance=pd.Timedelta(minutes=step_min))
+
+    pts = []
+    for ts in times:
+        v = float(vhi_interp.get(ts)) if pd.notna(vhi_interp.get(ts)) else float("nan")
+        s = float(ser_interp.get(ts)) if pd.notna(ser_interp.get(ts)) else float("nan")
+        pts.append({
+            "ts": ts.to_pydatetime(),
+            "vhi_status": _hi_status(v, vthr),
+            "aux_status": status_fn(s),
+        })
+
+    # Merge into segments per KPI
+    def merge_segments(label: str, status_key: str) -> List[Dict[str, Any]]:
+        segs: List[Dict[str, Any]] = []
+        cur_status = None
+        seg_start: Optional[datetime.datetime] = None
+        for p in pts:
+            st = p[status_key]
+            t  = p["ts"]
+            if cur_status is None:
+                cur_status = st; seg_start = t
+                continue
+            if st != cur_status:
+                segs.append({
+                    "start_ts": seg_start.isoformat() if seg_start else None,
+                    "end_ts":   t.isoformat(),
+                    "status":   cur_status,
+                    "kpi":      label,
+                    "note":     None,
+                })
+                cur_status = st; seg_start = t
+        # tail
+        if seg_start is not None and cur_status is not None:
+            segs.append({
+                "start_ts": seg_start.isoformat(),
+                "end_ts":   end_ts.to_pydatetime().isoformat(),
+                "status":   cur_status,
+                "kpi":      label,
+                "note":     None,
+            })
+        return segs
+
+    seg_vhi = merge_segments("VHI", "vhi_status")
+    seg_aux = merge_segments(kpi_name, "aux_status")
+    return seg_vhi + seg_aux
+
+# -------------------------
+# PM endpoints with BQ-or-mock fallback (always arrays)
 # -------------------------
 from fastapi import status as _status
 
 @app.api_route("/pm/trends", methods=["GET", "HEAD"])
-def pm_trends_view():
-    """
-    Read from view: {project}.{VIEW_DATASET}.pm_trends_last2h
-    Columns: ts, vhi_health_index, mci_percent, bearing_temp_rise_C
-    """
-    if not _BQ_ENABLED or _bq_client is None:
-        raise HTTPException(status_code=503, detail=_BQ_ERR or "BigQuery unavailable")
-    sql = f"""
-      SELECT ts, vhi_health_index, mci_percent, bearing_temp_rise_C
-      FROM `{_pm_trends_view()}`
-      ORDER BY ts
-    """
-    rows = _bq_query(sql)
-    out = []
-    for r in rows:
-        d = dict(r)
-        ts = d.get("ts")
-        d["ts"] = ts.isoformat() if isinstance(ts, datetime.datetime) else str(ts)
-        out.append(d)
-    return out
+def pm_trends_view(minutes: int = Query(default=120, ge=1, le=24*60)):
+    try:
+        if _BQ_ENABLED and _bq_client is not None:
+            try:
+                sql = f"""
+                  SELECT ts, vhi_health_index, mci_percent, bearing_temp_rise_C
+                  FROM `{_pm_trends_view()}`
+                  ORDER BY ts
+                """
+                rows = _bq_query(sql)
+                out = []
+                for r in rows:
+                    d = dict(r)
+                    ts = d.get("ts")
+                    d["ts"] = ts.isoformat() if isinstance(ts, datetime.datetime) else (str(ts) if ts is not None else None)
+                    out.append(d)
+                return out
+            except Exception as e:
+                logging.warning("pm_trends BQ error; falling back to mock: %s", e)
+        return _pm_mock_trends(minutes=minutes)
+    except Exception as e:
+        logging.error("pm_trends fatal: %s", e)
+        return []
 
-# Trailing-slash alias and explicit OPTIONS for /pm/trends
 @app.api_route("/pm/trends/", methods=["GET", "HEAD"])
-def pm_trends_view_slash():
-    return pm_trends_view()
+def pm_trends_view_slash(minutes: int = Query(default=120, ge=1, le=24*60)):
+    return pm_trends_view(minutes=minutes)
 
 @app.options("/pm/trends")
 def options_pm_trends(request: Request):
@@ -1477,20 +1757,12 @@ def options_pm_trends(request: Request):
 
 @app.options("/pm/trends/")
 def options_pm_trends_slash(request: Request):
-    origin = request.headers.get("origin")
-    return Response(status_code=_status.HTTP_204_NO_CONTENT, headers=_cors_hdrs_for(origin) | {"Allow": "GET, HEAD, OPTIONS"})
+    return options_pm_trends(request)
 
-# >>>>>>>>>>>> HARDENED: GET+HEAD + alias + OPTIONS + minutes filter
-@app.api_route("/pm/segments", methods=["GET", "HEAD"])
-def pm_segments_view(minutes: Optional[int] = Query(default=None, ge=1, le=24*60)):
-    """
-    Read from view: {project}.{VIEW_DATASET}.pm_segments_last3h
-    Columns: start_ts, end_ts, status ("ok"|"watch"|"alert"), optional kpi/note.
-    If ?minutes is provided, filter to that recent window on start_ts.
-    """
-    if not _BQ_ENABLED or _bq_client is None:
-        raise HTTPException(status_code=503, detail=_BQ_ERR or "BigQuery unavailable")
-
+# ---- segments ----
+def _pm_segments_bq_safe(minutes: Optional[int]):
+    if not (_BQ_ENABLED and _bq_client is not None):
+        raise RuntimeError("BQ unavailable")
     if minutes is None:
         sql = f"""
           SELECT start_ts, end_ts, status, kpi, note
@@ -1507,27 +1779,64 @@ def pm_segments_view(minutes: Optional[int] = Query(default=None, ge=1, le=24*60
           ORDER BY start_ts
         """
         rows = _bq_query(sql, params=[bigquery.ScalarQueryParameter("m", "INT64", minutes)])
-
     out = []
     for r in rows:
         d = dict(r)
         st = d.get("start_ts")
         et = d.get("end_ts")
-        d["start_ts"] = st.isoformat() if isinstance(st, datetime.datetime) else str(st)
-        d["end_ts"]   = et.isoformat() if isinstance(et, datetime.datetime) else (str(et) if et else None)
-        out.append({k: v for k, v in d.items() if k in ("start_ts","end_ts","status","kpi","note")})
+        out.append({
+            "start_ts": st.isoformat() if isinstance(st, datetime.datetime) else (str(st) if st is not None else None),
+            "end_ts":   et.isoformat() if isinstance(et, datetime.datetime) else (str(et) if et is not None else None),
+            "status": d.get("status"),
+            "kpi":    d.get("kpi"),
+            "note":   d.get("note"),
+        })
     return out
 
-# Friendly alias because your UI sometimes calls /segments/pm
-@app.api_route("/segments/pm", methods=["GET", "HEAD"])
-def pm_segments_view_alias(minutes: Optional[int] = Query(default=None, ge=1, le=24*60)):
-    return pm_segments_view(minutes=minutes)
+@app.get("/pm/segments")
+def pm_segments_get(
+    minutes: Optional[int] = Query(default=None, ge=1, le=24*60),
+    step_min: int = Query(default=10, ge=1, le=60),
+):
+    try:
+        if _BQ_ENABLED and _bq_client is not None:
+            try:
+                return _pm_segments_bq_safe(minutes)
+            except Exception as e:
+                logging.warning("pm_segments BQ failed; using mock: %s", e)
+        return _pm_mock_segments(minutes=minutes or 180, step_min=step_min)
+    except Exception as e:
+        logging.error("pm_segments fatal: %s", e)
+        return []
 
-# Explicit OPTIONS (some proxies/hosts are picky)
+@app.get("/pm/segments/")
+def pm_segments_get_slash(
+    minutes: Optional[int] = Query(default=None, ge=1, le=24*60),
+    step_min: int = Query(default=10, ge=1, le=60),
+):
+    return pm_segments_get(minutes=minutes, step_min=step_min)
+
+@app.head("/pm/segments")
+def pm_segments_head(minutes: Optional[int] = Query(default=None, ge=1, le=24*60)):
+    return Response(status_code=_status.HTTP_204_NO_CONTENT)
+
+@app.head("/pm/segments/")
+def pm_segments_head_slash(minutes: Optional[int] = Query(default=None, ge=1, le=24*60)):
+    return pm_segments_head(minutes=minutes)
+
 @app.options("/pm/segments")
 def options_pm_segments(request: Request):
     origin = request.headers.get("origin")
     return Response(status_code=_status.HTTP_204_NO_CONTENT, headers=_cors_hdrs_for(origin) | {"Allow": "GET, HEAD, OPTIONS"})
+
+@app.options("/pm/segments/")
+def options_pm_segments_slash(request: Request):
+    return options_pm_segments(request)
+
+@app.api_route("/segments/pm", methods=["GET", "HEAD"])
+def pm_segments_view_alias(minutes: Optional[int] = Query(default=None, ge=1, le=24*60),
+                           step_min: int = Query(default=10, ge=1, le=60)):
+    return pm_segments_get(minutes=minutes, step_min=step_min)
 
 @app.options("/segments/pm")
 def options_segments_pm(request: Request):
@@ -1798,8 +2107,7 @@ def optimize_routine(req: RoutineOptimizeReq):
         schema = _bq_get_schema(tbl)
         proposed_for_bq = proposed_final
         if schema.get("proposed_setpoints") == "JSON" and isinstance(proposed_for_bq, (dict, list)):
-            proposed_for_bq = _as_json_string(proposed_for_bq)
-
+            proposed_for_bq = proposed_for_bq  # keep native
         suggestion_row = {
             "suggestion_id": suggestion_id,
             "created_at": created_at,
@@ -2322,93 +2630,39 @@ def predict_spower_route(doc: dict = Body(default={})):
     return {"input": params, "prediction": pred}
 
 # -------------------------
-# NEW: Predictive Maintenance helpers + endpoints (generic HI)
+# NEW: Predictive Maintenance endpoints (HI / anomalies)
 # -------------------------
-def _df_recent(minutes:int=240, limit:int=5000) -> pd.DataFrame:
-    """
-    Returns a DataFrame indexed by ts with numeric columns.
-    Works on mock (_HIST) or BigQuery snapshots base table.
-    """
-    if USE_MOCK:
-        cutoff = _now_ts() - datetime.timedelta(minutes=minutes)
-        rows = [p for p in list(_HIST) if datetime.datetime.fromisoformat(p["ts"].replace("Z","")).astimezone(datetime.timezone.utc) >= cutoff]
-        df = pd.DataFrame(rows[-limit:])
-    else:
-        if not _BQ_ENABLED or _bq_client is None:
-            return pd.DataFrame()
-        table = _snapshots_table()
-        sql = f"""
-          SELECT ts,
-                 production_tph, kiln_feed_tph, separator_dp_pa,
-                 id_fan_flow_Nm3_h, cooler_airflow_Nm3_h,
-                 kiln_speed_rpm, o2_percent, specific_power_kwh_per_ton
-          FROM `{table}`
-          WHERE ts >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @m MINUTE)
-          ORDER BY ts ASC
-          LIMIT @lim
-        """
-        from google.cloud import bigquery  # type: ignore
-        job = _bq_client.query(
-            sql, location=BQ_LOCATION,
-            job_config=bigquery.QueryJobConfig(
-                query_parameters=[
-                    bigquery.ScalarQueryParameter("m", "INT64", minutes),
-                    bigquery.ScalarQueryParameter("lim", "INT64", limit),
-                ]
-            )
-        )
-        rows = list(job.result())
-        df = pd.DataFrame([dict(r) for r in rows])
-    if df.empty:
-        return df
-    # normalize ts → datetime
-    if "ts" in df.columns:
-        df["ts"] = pd.to_datetime(df["ts"])
-        df = df.sort_values("ts")
-        df = df.set_index("ts")
-    # keep numeric
-    for c in df.columns:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df
-
-def _pm_select_signals(df: pd.DataFrame) -> pd.DataFrame:
-    keys = ["vibration","vibe","accel","bearing","brg","temp","temperature",
-            "motor","current","amp","amps","load","rpm","speed","pressure","press",
-            "fan","kiln","separator","cooler","o2","specific_power"]
-    num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-    cols = [c for c in num_cols if any(k in str(c).lower() for k in keys)]
-    return df[cols] if cols else df[num_cols[:6]]
-
-def _pm_compute(df: pd.DataFrame):
-    sel = _pm_select_signals(df)
-    if sel.empty: 
-        return pd.Series(dtype=float), 0.0, pd.DataFrame()
-    win = max(10, min(500, int(len(sel)*0.05)))
-    roll_mean = sel.rolling(win, min_periods=max(5, win//3)).mean()
-    roll_std  = sel.rolling(win, min_periods=max(5, win//3)).std()
-    z = (sel - roll_mean) / (roll_std + 1e-9)
-    hi = z.abs().mean(axis=1)   # Health Index
-    mad = (hi - hi.median()).abs().median()
-    thresh = hi.median() + 3.5 * (mad if mad > 0 else hi.std())
-    anomalies = sel[hi > thresh]
-    return hi, float(thresh if np.isfinite(thresh) else 0.0), anomalies
-
-class PMHealthPoint(BaseModel):
+class VHIPoint(BaseModel):
     ts: str
     health_index: float
     threshold: float
+    status: str  # "ok" | "watch" | "alert"
 
 class PMAnomaly(BaseModel):
     ts: str
     signals: Dict[str, float]
 
-@app.get("/pm/health_index", response_model=List[PMHealthPoint])
+class MCIPoint(BaseModel):
+    ts: str
+    value: float
+    kpi: str  # "MCI_percent" or "BearingTempRise_C"
+
+def _status_from_hi(hi_val: float, thresh: float) -> str:
+    if thresh is None or not np.isfinite(thresh) or thresh <= 0:
+        return "ok"
+    if hi_val < 0.5 * thresh:
+        return "ok"
+    if hi_val < 1.0 * thresh:
+        return "watch"
+    return "alert"
+
+@app.get("/pm/health_index", response_model=List[VHIPoint])
 def pm_health_index(minutes: int = Query(default=240, ge=10, le=24*60)):
     df = _df_recent(minutes=minutes)
     if df.empty:
         return []
-    hi, thresh, _ = _pm_compute(df)
-    out = [{"ts": ts.isoformat(), "health_index": float(v), "threshold": float(thresh)} for ts, v in hi.dropna().items()]
+    hi, thresh, _ = _compute_vhi(df)
+    out = [{"ts": ts.isoformat(), "health_index": float(v), "threshold": float(thresh), "status": _status_from_hi(float(v), float(thresh))} for ts, v in hi.dropna().items()]
     return out
 
 @app.get("/pm/anomalies", response_model=List[PMAnomaly])
@@ -2416,7 +2670,7 @@ def pm_anomalies(minutes: int = Query(default=240, ge=10, le=24*60), max_rows:in
     df = _df_recent(minutes=minutes)
     if df.empty:
         return []
-    _, _, anomalies = _pm_compute(df)
+    _, _, anomalies = _compute_vhi(df)
     out: List[PMAnomaly] = []
     for ts, row in anomalies.tail(max_rows).iterrows():
         sigs = {k: float(row[k]) for k in row.index if pd.notna(row[k])}
@@ -2448,7 +2702,6 @@ def kpi_predictions_latest(
     horizon_min: int = Query(..., ge=1, le=24*60),
     limit: int = Query(2880, ge=1, le=100000),
 ):
-    # Memory fallback
     mem = _PRED_LATEST_MEM.get((kpi_name, horizon_min))
     if mem and (not _BQ_ENABLED or _bq_client is None):
         return mem[:limit]
@@ -2489,7 +2742,6 @@ def kpi_predictions_future(
     kpi_name: str = Query(..., description="KPI name, e.g. 'production_tph'"),
     limit: int = Query(500, ge=1, le=100000),
 ):
-    # Memory fallback
     mem = _PRED_FUTURE_MEM.get(kpi_name)
     if mem and (not _BQ_ENABLED or _bq_client is None):
         return mem[:limit]
@@ -2523,159 +2775,10 @@ def kpi_predictions_future(
     return out
 
 # -------------------------
-# NEW: Condition Monitoring KPI models and helpers (VHI + MCI)
-# -------------------------
-class VHIPoint(BaseModel):
-    ts: str
-    health_index: float
-    threshold: float
-    status: str  # "ok" | "watch" | "alert"
-
-class MCIPoint(BaseModel):
-    ts: str
-    value: float
-    kpi: str  # "MCI_percent" or "BearingTempRise_C"
-
-# ---- Robust column matching (improved) ----
-def _pick_col(df: pd.DataFrame, names: List[str]) -> Optional[str]:
-    """
-    Find a column by exact/loose name match (case-insensitive):
-    - exact
-    - underscore-insensitive exact
-    - startswith
-    - contains
-    """
-    cols = list(df.columns)
-    low = [c.lower() for c in cols]
-    for n in names:
-        nlow = n.lower()
-        if nlow in low:
-            return cols[low.index(nlow)]
-        for i, cl in enumerate(low):
-            if cl.replace("_", "") == nlow.replace("_", ""):
-                return cols[i]
-        for i, cl in enumerate(low):
-            if cl.startswith(nlow) or (nlow in cl):
-                return cols[i]
-    return None
-
-def _select_vibration_cols(df: pd.DataFrame) -> List[str]:
-    keys = ["vibration", "vibe", "accel", "acceleration", "bearing", "brg"]
-    num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-    vib_cols = [c for c in num_cols if any(k in str(c).lower() for k in keys)]
-    return vib_cols
-
-def _compute_vhi(df: pd.DataFrame):
-    vib_cols = _select_vibration_cols(df)
-    if not vib_cols:
-        return pd.Series(dtype=float), 0.0, pd.DataFrame()
-    sel = df[vib_cols].copy()
-    win = max(10, min(500, int(len(sel) * 0.05)))
-    roll_mean = sel.rolling(win, min_periods=max(5, win // 3)).mean()
-    roll_std  = sel.rolling(win, min_periods=max(5, win // 3)).std()
-    z = (sel - roll_mean) / (roll_std + 1e-9)
-    hi = z.abs().mean(axis=1)  # VHI
-    mad = (hi - hi.median()).abs().median()
-    thresh = hi.median() + 3.5 * (mad if mad > 0 else (hi.std() if np.isfinite(hi.std()) else 0.0))
-    anomalies = sel[hi > thresh]
-    return hi, float(thresh if np.isfinite(thresh) else 0.0), anomalies
-
-def _status_from_hi(hi_val: float, thresh: float) -> str:
-    if thresh is None or not np.isfinite(thresh) or thresh <= 0:
-        return "ok"
-    if hi_val < 0.5 * thresh:
-        return "ok"
-    if hi_val < 1.0 * thresh:
-        return "watch"
-    return "alert"
-
-def _compute_mci_series(df: pd.DataFrame) -> pd.Series:
-    # broadened to catch motor_current_a/b/c too
-    cand_a = ["ia","i_a","phase_a","phase a","current_a","current a","motor_current_a","motor current a"]
-    cand_b = ["ib","i_b","phase_b","phase b","current_b","current b","motor_current_b","motor current b"]
-    cand_c = ["ic","i_c","phase_c","phase c","current_c","current c","motor_current_c","motor current c"]
-    ca = _pick_col(df, cand_a + [s.upper() for s in cand_a])
-    cb = _pick_col(df, cand_b + [s.upper() for s in cand_b])
-    cc = _pick_col(df, cand_c + [s.upper() for s in cand_c])
-    if not ca or not cb or not cc:
-        return pd.Series(index=df.index, dtype=float)
-    sA = pd.to_numeric(df[ca], errors="coerce")
-    sB = pd.to_numeric(df[cb], errors="coerce")
-    sC = pd.to_numeric(df[cc], errors="coerce")
-    avg = (sA + sB + sC) / 3.0
-    mci = (pd.concat([sA,sB,sC], axis=1).max(axis=1) - pd.concat([sA,sB,sC], axis=1).min(axis=1)) / (avg + 1e-9) * 100.0
-    mci[(avg <= 0) | (~np.isfinite(mci))] = np.nan
-    return mci
-
-def _compute_bearing_temp_rise_series(df: pd.DataFrame) -> pd.Series:
-    # accept _C suffixed and common variants
-    cand_brg = ["bearing_temp","bearing_temp_c","brg_temp","brg_temp_c","bearing temperature","bearing"]
-    cand_inl = ["suction_temp","suction_temp_c","inlet_temp","inlet_temp_c","inlet temperature","suction temperature"]
-    cand_amb = ["ambient_temp","ambient_temp_c","ambient temperature","room_temp","room temperature"]
-    cb = _pick_col(df, cand_brg + [s.upper() for s in cand_brg])
-    ci = _pick_col(df, cand_inl + [s.upper() for s in cand_inl])
-    ca = _pick_col(df, cand_amb + [s.upper() for s in cand_amb])
-    if not cb:
-        return pd.Series(index=df.index, dtype=float)
-    b = pd.to_numeric(df[cb], errors="coerce")
-    base = None
-    if ci:
-        base = pd.to_numeric(df[ci], errors="coerce")
-    elif ca:
-        base = pd.to_numeric(df[ca], errors="coerce")
-    else:
-        return pd.Series(index=df.index, dtype=float)
-    return b - base
-
-# -------------------------
-# >>> VHI SHIMS so Pylance is happy (only used if your project didn't define them)
-# -------------------------
-if "_compute_vhi_series" not in globals():
-    def _compute_vhi_series(df: pd.DataFrame) -> pd.Series:
-        """
-        Fallback: compute a Vibration Health Index time series from vibration-ish numeric columns.
-        Robust rolling z-scores averaged across selected columns.
-        """
-        cols = _select_vibration_cols(df)
-        if not cols:
-            # Consider generic numeric cols as a very last resort
-            num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-            cols = num_cols
-        if not cols:
-            return pd.Series(index=getattr(df, "index", []), dtype=float)
-
-        sel = df[cols].copy()
-        win = max(10, min(500, int(len(sel) * 0.05))) or 10
-        roll_mean = sel.rolling(win, min_periods=max(5, win // 3)).mean()
-        roll_std  = sel.rolling(win, min_periods=max(5, win // 3)).std()
-        z = (sel - roll_mean) / (roll_std + 1e-9)
-        hi = z.abs().mean(axis=1)
-        return hi
-
-if "_vhi_threshold" not in globals():
-    def _vhi_threshold(vhi: pd.Series) -> float:
-        """
-        Fallback: robust threshold as median + 3*MAD, with a floor at P95 to avoid being too low.
-        """
-        v = pd.to_numeric(vhi, errors="coerce").dropna()
-        if v.empty:
-            return float("nan")
-        med = float(np.median(v.values))
-        mad = float(np.median(np.abs(v.values - med)))
-        robust_thr = med + 3.0 * (1.4826 * mad)
-        p95 = float(np.percentile(v.values, 95))
-        return max(robust_thr, p95)
-
-# -------------------------
-# VHI + MCI endpoints
+# CM (VHI/MCI) convenience endpoints to log/inspect
 # -------------------------
 @app.get("/cm/vhi", response_model=List[VHIPoint])
 def cm_vhi(minutes: int = Query(default=240, ge=10, le=24*60)):
-    """
-    Vibration Health Index over the window. Higher is worse.
-    Threshold is robust (median+3.5*MAD). Status bands:
-      ok (<0.5*thr), watch (0.5*thr..thr), alert (>=thr).
-    """
     df = _df_recent(minutes=minutes)
     if df.empty:
         return []
@@ -2692,23 +2795,16 @@ def cm_vhi(minutes: int = Query(default=240, ge=10, le=24*60)):
 
 @app.post("/cm/vhi/log")
 def cm_vhi_log(source: str = Body(default="scheduler")):
-    """
-    Compute latest VHI point and append to cm_kpis (if BQ enabled).
-    Adds aux.status and aux.threshold so segments & UI can classify it.
-    """
     df = _df_recent(minutes=240)
     if df.empty:
         raise HTTPException(status_code=404, detail="No data for VHI")
 
-    # Compute series
-    vhi = _compute_vhi_series(df)  # shim ensures this exists
-    vhi = vhi.dropna()
+    vhi = _compute_vhi_series(df).dropna()
     if vhi.empty:
         raise HTTPException(status_code=404, detail="VHI not computable")
 
-    # Threshold (prefer existing helper if present; else robust fallback)
     try:
-        thr = float(_vhi_threshold(vhi))  # shim ensures this exists
+        thr = float(_vhi_threshold(vhi))
     except Exception:
         med = float(np.median(vhi.values))
         mad = float(np.median(np.abs(vhi.values - med)))
@@ -2717,7 +2813,6 @@ def cm_vhi_log(source: str = Body(default="scheduler")):
     val_ts = vhi.index[-1]
     val = float(vhi.iloc[-1])
 
-    # Status bands
     def _vhi_status(v: float, t: float) -> str:
         if not np.isfinite(v):
             return "ok"
@@ -2735,7 +2830,6 @@ def cm_vhi_log(source: str = Body(default="scheduler")):
 
     status = _vhi_status(val, thr)
 
-    # ---- BigQuery insert ----
     tbl_name = _cm_table() or os.getenv("CM_KPIS_TABLE")
     if not tbl_name:
         raise HTTPException(status_code=500, detail="CM KPIs table not configured")
@@ -2768,11 +2862,6 @@ def cm_vhi_log(source: str = Body(default="scheduler")):
 
 @app.get("/cm/mci", response_model=List[MCIPoint])
 def cm_mci(minutes: int = Query(default=240, ge=10, le=24*60)):
-    """
-    Computes time series for:
-      - MCI (%) if Ia/Ib/Ic present
-      - else Bearing Temp Rise (°C) as fallback
-    """
     df = _df_recent(minutes=minutes)
     if df.empty:
         return []
@@ -2791,10 +2880,6 @@ def cm_mci(minutes: int = Query(default=240, ge=10, le=24*60)):
 
 @app.post("/cm/mci/log")
 def cm_mci_log(source: str = Body(default="scheduler")):
-    """
-    Compute latest MCI (or Bearing Temp Rise) point and append to cm_kpis table (if BQ enabled).
-    Adds aux.status so segments can classify it.
-    """
     df = _df_recent(minutes=240)
     if df.empty:
         raise HTTPException(status_code=404, detail="No data for MCI")
@@ -3019,3 +3104,14 @@ def _log_routes_on_startup():
 def _start_forecaster():
     if FORECAST_PM_ENABLE:
         threading.Thread(target=_forecast_loop, daemon=True).start()
+
+# -------------------------
+# debugging helper: list routes
+# -------------------------
+@app.get("/debug/routes")
+def debug_routes():
+    out = []
+    for r in app.routes:
+        methods = sorted(list(getattr(r, "methods", []) or []))
+        out.append({"path": r.path, "methods": methods})
+    return out
