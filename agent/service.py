@@ -1064,6 +1064,8 @@ def root():
             "/debug/physics_flags",
             # NEW condition monitoring endpoints
             "/cm/vhi", "/cm/vhi/log", "/cm/mci", "/cm/mci/log",
+            # alias explicitly exposed
+            "/segments/pm",
         ],
         "bq_enabled": _BQ_ENABLED,
         "sched_period_sec": SCHED_PERIOD_SEC,
@@ -1414,23 +1416,36 @@ def pm_trends_view():
         out.append(d)
     return out
 
-# >>>>>>>>>>>> HARDENED: GET+HEAD + alias + OPTIONS (fixes 405s)
+# >>>>>>>>>>>> HARDENED: GET+HEAD + alias + OPTIONS (fixes 405s) + minutes filter
 from fastapi import status as _status
 
 @app.api_route("/pm/segments", methods=["GET", "HEAD"])
-def pm_segments_view(minutes: int = Query(default=None, ge=1, le=24*60)):
+def pm_segments_view(minutes: Optional[int] = Query(default=None, ge=1, le=24*60)):
     """
     Read from view: {project}.{VIEW_DATASET}.pm_segments_last3h
-    Columns: start_ts, end_ts, status ("ok"|"watch"|"alert")
+    Columns: start_ts, end_ts, status ("ok"|"watch"|"alert"), optional kpi/note.
+    If ?minutes is provided, filter to that recent window on start_ts.
     """
     if not _BQ_ENABLED or _bq_client is None:
         raise HTTPException(status_code=503, detail=_BQ_ERR or "BigQuery unavailable")
-    sql = f"""
-      SELECT start_ts, end_ts, status
-      FROM `{_pm_segments_view()}`
-      ORDER BY start_ts
-    """
-    rows = _bq_query(sql)
+
+    if minutes is None:
+        sql = f"""
+          SELECT start_ts, end_ts, status, kpi, note
+          FROM `{_pm_segments_view()}`
+          ORDER BY start_ts
+        """
+        rows = _bq_query(sql)
+    else:
+        from google.cloud import bigquery  # type: ignore
+        sql = f"""
+          SELECT start_ts, end_ts, status, kpi, note
+          FROM `{_pm_segments_view()}`
+          WHERE start_ts >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @m MINUTE)
+          ORDER BY start_ts
+        """
+        rows = _bq_query(sql, params=[bigquery.ScalarQueryParameter("m", "INT64", minutes)])
+
     out = []
     for r in rows:
         d = dict(r)
@@ -1438,12 +1453,12 @@ def pm_segments_view(minutes: int = Query(default=None, ge=1, le=24*60)):
         et = d.get("end_ts")
         d["start_ts"] = st.isoformat() if isinstance(st, datetime.datetime) else str(st)
         d["end_ts"]   = et.isoformat() if isinstance(et, datetime.datetime) else (str(et) if et else None)
-        out.append(d)
+        out.append({k: v for k, v in d.items() if k in ("start_ts","end_ts","status","kpi","note")})
     return out
 
 # Friendly alias because your UI sometimes calls /segments/pm
 @app.api_route("/segments/pm", methods=["GET", "HEAD"])
-def pm_segments_view_alias(minutes: int = Query(default=None, ge=1, le=24*60)):
+def pm_segments_view_alias(minutes: Optional[int] = Query(default=None, ge=1, le=24*60)):
     return pm_segments_view(minutes=minutes)
 
 # Explicit OPTIONS (some proxies/hosts are picky)

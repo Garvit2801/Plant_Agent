@@ -293,6 +293,9 @@ export default function PlantAgentDashboard() {
   const cronProbeRef = useRef<number | null>(null);
   const lastCronRef = useRef<string | null>(null);
 
+  // FIX 1: define thelpRef to satisfy dangling usage if present in JSX/styles elsewhere.
+  const thelpRef = useRef<HTMLDivElement | null>(null);
+
   /* Health/version */
   const fetchHealth = useCallback(async () => {
     if (!base) return;
@@ -378,7 +381,7 @@ export default function PlantAgentDashboard() {
     }
   }, [base, getHeaders, pmTrendSource]);
 
-  /* PM segments (status windows) */
+  /* PM segments (status windows) — FIX 2: strict narrow status to union */
   const fetchPmSegments = useCallback(async () => {
     if (!base) return;
     try {
@@ -387,17 +390,36 @@ export default function PlantAgentDashboard() {
         "/pm/segments?minutes=120",
         "/segments/pm?minutes=180",
       ]);
+
       if (Array.isArray(json)) {
-        const cleaned: PMSegment[] = json
-          .map((s: any) => ({
-            start_ts: s.start_ts || s.start || s.begin || s.ts || s.from,
-            end_ts: s.end_ts ?? s.end ?? s.until ?? null,
-            status: (s.status || s.state || "ok").toLowerCase(),
-            kpi: s.kpi || s.signal || undefined,
-            note: s.note || s.msg || undefined,
-          }))
-          .filter((s: PMSegment) => !!s.start_ts && (s.status === "ok" || s.status === "watch" || s.status === "alert"));
-        setPmSegs(cleaned.slice(-60));
+        const cleaned: PMSegment[] = (json as any[])
+          .map((raw: any) => {
+            const start_ts: string | undefined =
+              raw.start_ts || raw.start || raw.begin || raw.ts || raw.from;
+            if (!start_ts) return null;
+
+            const rawStatus = String(raw.status ?? raw.state ?? "ok").toLowerCase();
+            const status: PMSegment["status"] =
+              rawStatus === "ok" || rawStatus === "watch" || rawStatus === "alert"
+                ? rawStatus
+                : "ok";
+
+            const end_ts: string | null =
+              (raw.end_ts ?? raw.end ?? raw.until ?? null) || null;
+
+            const seg: PMSegment = {
+              start_ts,
+              end_ts,
+              status,
+              kpi: raw.kpi || raw.signal || undefined,
+              note: raw.note || raw.msg || undefined,
+            };
+            return seg;
+          })
+          .filter((s: PMSegment | null): s is PMSegment => s !== null)
+          .slice(-60);
+
+        setPmSegs(cleaned);
       }
     } catch (e:any) {
       info("PM segments fetch failed", e?.message ?? e);
@@ -913,7 +935,7 @@ export default function PlantAgentDashboard() {
             {pmTrends.length ? `Loaded ${pmTrends.length} PM points` : "Waiting for PM data…"}
           </div>
 
-          <div className="h-56 w-full" /* chartBoxRef reused only for height; width responsive */>
+          <div className="h-56 w-full">
             {(pmTrends.length && chartBoxSize.w>0) ? (
               <LineChart width={chartBoxSize.w} height={chartBoxSize.h} data={pmTrends} margin={{ top: 8, right: 32, left: 8, bottom: 8 }}>
                 <CartesianGrid stroke="#e2e8f0" strokeDasharray="3 3" />
