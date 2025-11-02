@@ -12,6 +12,7 @@ import math
 import hashlib
 from typing import Any, Dict, List, Optional, Tuple
 from collections import deque
+from typing import Optional, Literal
 
 import yaml
 import pandas as pd
@@ -19,7 +20,7 @@ import numpy as np
 import datetime
 from fastapi import FastAPI, HTTPException, Body, Query, Response, Request, status as _status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, constr  # <-- added constr
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
@@ -559,7 +560,7 @@ class RoutineOptimizeReq(BaseModel):
 
 class LoadOptimizeReq(BaseModel):
     snapshot: Optional[Dict[str, Any]] = None
-    direction: Optional[str] = Field(None, pattern="^(up|down)$")
+    direction: Optional[Literal["up", "down"]] = None
     delta_pct: Optional[float] = Field(None, gt=0, le=50)
     delta_abs: Optional[float] = None
     target_tph: Optional[float] = None
