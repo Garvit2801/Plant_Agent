@@ -4,12 +4,11 @@ import {
 } from "recharts";
 
 /**
- * Plant Agent – Operations Dashboard (No-Auth Variant) — CLEANED
- * - Routine/load “Important Trends”
- * - Separate PM trends card with its own source selector
- * - PM segments (ok/watch/alert) shaded in the PM chart
- * - VHI (index), MCI (%), BearingTempRise (°C) supported
- * - PM segments fetch tries GET, then POST {minutes}, backs off on 405/404
+ * Plant Agent – Operations Dashboard (No-Auth Variant)
+ * - Important Trends + PM Trends (own source selector)
+ * - PM segments (ok/watch/alert) as shaded bands in the PM chart
+ * - GET→POST fallback for endpoints that return 405 to GET
+ * - Alias-tolerant trend cleaning so PM data renders even if keys differ
  */
 
 const RECOMMENDED_HOST = "https://plant-agent-i32khy5nrq-el.a.run.app";
@@ -37,9 +36,11 @@ function cls(...xs: (string | false | undefined | null)[]) { return xs.filter(Bo
 function fmt(n: number | undefined | null, d = 3) { if (n == null || Number.isNaN(n)) return "-"; return Number(n).toFixed(d); }
 function normalizeBase(u: string) { if (!u) return ""; let s = u.trim(); s = s.replace(/\/+$/, ""); s = s.replace(/\/snapshot$/i, ""); return s; }
 function info(msg: string, extra?: any) { if (getDebug()) console.log(`[PlantUI] ${msg}`, extra ?? ""); }
+
+/** parse numbers even if they come like "12 %", "1,234.5kWh/t" */
 function parseNum(v: any): number {
   if (v == null) return NaN;
-  const s = typeof v === "string" ? v.replace(/,/g, "") : String(v);
+  const s = String(v).replace(/,/g, "").replace(/[^\d.+\-eE]/g, "");
   const n = Number(s);
   return Number.isFinite(n) ? n : NaN;
 }
@@ -122,8 +123,8 @@ type LoadResp = {
 
 /* PM segments */
 type PMSegment = {
-  start_ts: string;            // ISO timestamp
-  end_ts?: string | null;      // optional (ongoing)
+  start_ts: string;
+  end_ts?: string | null;
   status: "ok" | "watch" | "alert";
   kpi?: "VHI" | "MCI_percent" | "BearingTempRise_C" | string;
   note?: string;
@@ -134,72 +135,53 @@ type PMSegment = {
    ========================= */
 function pickLatestTimestamp(j: any): string | null { return j?.created_at || j?.createdAt || j?.ts || j?.timestamp || null; }
 function pickProposal(j: any): Record<string, number> | undefined { return j?.proposed_setpoints || j?.proposal?.setpoints || j?.top?.proposed_setpoints; }
-
-async function getJsonCandidates(base: string, headers: Record<string, string>, paths: string[]) {
-  let last: any;
-  for (const p of paths) {
-    const url = `${base}${p}`;
-    try {
-      const r = await fetch(url, { headers });
-      if (r.ok) return { json: await r.json(), path: p, status: r.status, method: "GET" as const };
-      const txt = await r.text().catch(()=> "");
-      last = new Error(`GET ${p} ${r.status}${txt ? ` – ${txt.slice(0,140)}` : ""}`);
-    } catch (e) { last = e; }
-  }
-  throw last ?? new Error("No candidate path succeeded");
+function tsToLabel(ts: string) {
+  try { return new Date(ts).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" }); } catch { return ""; }
 }
 
-async function methodFallback(base: string, getHeaders: Record<string,string>, postHeaders: Record<string,string>, paths: string[]) {
-  let last: any;
-  for (const p of paths) {
-    const url = `${base}${p}`;
-    try {
-      const g = await fetch(url, { headers: getHeaders });
-      if (g.ok) return { json: await g.json(), path: p, method: "GET" as const, status: g.status };
-      if (g.status === 405) {
-        try {
-          const pr = await fetch(url, { method: "POST", headers: postHeaders, body: "{}" });
-          if (pr.ok) return { json: await pr.json(), path: p, method: "POST" as const, status: pr.status };
-          const txt = await pr.text().catch(()=> "");
-          last = new Error(`POST ${p} ${pr.status}${txt ? ` – ${txt.slice(0,140)}` : ""}`);
-        } catch (e) { last = e; }
-      } else {
-        const txt = await g.text().catch(()=> "");
-        last = new Error(`GET ${p} ${g.status}${txt ? ` – ${txt.slice(0,140)}` : ""}`);
-      }
-    } catch (e) { last = e; }
-  }
-  throw last ?? new Error("No candidate path via GET/POST");
+/** pick first present key from row */
+function pickField(row: any, keys: string[]) {
+  for (const k of keys) if (row[k] !== undefined && row[k] !== null) return row[k];
+  return null;
 }
 
-/* trend cleaning — includes VHI/MCI/BTR if present */
+/** alias-tolerant cleaner so different backends still plot */
 function cleanTrends(rows: any[]): TrendPoint[] {
-  const sorted = rows.slice().sort((a,b)=>new Date(a.ts??0).getTime()-new Date(b.ts??0).getTime());
+  const sorted = rows.slice().sort((a,b)=>new Date(
+    a.ts ?? a.timestamp ?? a.time ?? a.datetime ?? 0
+  ).getTime()-new Date(
+    b.ts ?? b.timestamp ?? b.time ?? b.datetime ?? 0
+  ).getTime());
+
   const out: TrendPoint[] = [];
   let lastProd: number | undefined;
 
   for (const row of sorted) {
-    const prod = parseNum(row.production_tph);
-    const o2 = parseNum(row.o2_percent);
-    const sp = parseNum(row.specific_power_kwh_per_ton);
-    const vhi = parseNum(row.vhi_health_index);
-    const mci = parseNum(row.mci_percent);
-    const btr = parseNum(row.bearing_temp_rise_C);
+    // process KPIs (with generous aliases)
+    const prod = parseNum(pickField(row, ["production_tph","Production_tph","prod_tph","production"]));
+    const o2   = parseNum(pickField(row, ["o2_percent","O2_percent","o2","O2"]));
+    const sp   = parseNum(pickField(row, ["specific_power_kwh_per_ton","specific_power","sp_kwh_t","spower"]));
 
+    const vhi  = parseNum(pickField(row, ["vhi_health_index","VHI","vhi","vhi_index","VHI_index","vhi_idx"]));
+    const mci  = parseNum(pickField(row, ["mci_percent","MCI_percent","mci","MCI"]));
+    const btr  = parseNum(pickField(row, ["bearing_temp_rise_C","bearing_delta_t_C","bearing_deltaC","bearing_temp_rise","BTR","btr_C"]));
+
+    // guards
     const prodGood = Number.isFinite(prod) && prod >= 0.5 && prod < 1000;
-    const o2Good   = Number.isFinite(o2) && o2 >= 0 && o2 < 30;
-    const spGood   = Number.isFinite(sp) && sp > 0 && sp < 200;
+    const o2Good   = Number.isFinite(o2)   && o2 >= 0   && o2 < 30;
+    const spGood   = Number.isFinite(sp)   && sp > 0    && sp < 200;
 
-    const vhiGood  = Number.isFinite(vhi) && vhi >= 0 && vhi < 50;
-    const mciGood  = Number.isFinite(mci) && mci >= 0 && mci < 100;
-    const btrGood  = Number.isFinite(btr) && Math.abs(btr) < 200;
+    const vhiGood  = Number.isFinite(vhi)  && vhi >= 0  && vhi < 100;  // a bit wider
+    const mciGood  = Number.isFinite(mci)  && mci >= 0  && mci < 100;
+    const btrGood  = Number.isFinite(btr)  && Math.abs(btr) < 400;
 
     const spike = lastProd && prodGood ? Math.abs(prod-lastProd)/Math.max(1e-9,lastProd) > 0.30 : false;
     const keepProd = prodGood && !spike ? prod : null;
     if (keepProd !== null) lastProd = keepProd;
 
-    const ts = row.ts ? new Date(row.ts) : null;
-    const label = ts ? ts.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "";
+    const tsRaw = pickField(row, ["ts","timestamp","time","datetime"]);
+    const ts    = tsRaw ? new Date(tsRaw) : null;
+    const label = ts ? ts.toLocaleTimeString(undefined, { hour:"2-digit", minute:"2-digit", second:"2-digit" }) : "";
 
     out.push({
       t: label,
@@ -212,25 +194,6 @@ function cleanTrends(rows: any[]): TrendPoint[] {
     });
   }
   return out;
-}
-
-function statusTone(s?: string | null) {
-  switch (s) {
-    case "ok": return "green";
-    case "watch": return "amber";
-    case "alert": return "rose";
-    default: return "slate";
-  }
-}
-
-/* PM segment visuals */
-function segTone(s: PMSegment["status"]) {
-  if (s === "alert") return { stroke: "#ef4444", fill: "#ef4444" };
-  if (s === "watch") return { stroke: "#f59e0b", fill: "#f59e0b" };
-  return { stroke: "#22c55e", fill: "#22c55e" }; // ok
-}
-function tsToLabel(ts: string) {
-  try { return new Date(ts).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" }); } catch { return ""; }
 }
 
 /* =========================
@@ -287,7 +250,7 @@ export default function PlantAgentDashboard() {
   const [routineBefore, setRoutineBefore] = useState<Snapshot | null>(null);
   const [routineAfter, setRoutineAfter] = useState<Snapshot | null>(null);
 
-  const [metrics, setMetrics] = useState<any>(null); // diagnostics
+  const [metrics, setMetrics] = useState<any>(null);
   const [metricsErr, setMetricsErr] = useState<string>("");
 
   const pollRef = useRef<number | null>(null);
@@ -296,8 +259,7 @@ export default function PlantAgentDashboard() {
   const cronProbeRef = useRef<number | null>(null);
   const lastCronRef = useRef<string | null>(null);
 
-  // present if hooked in styles elsewhere
-  const thelpRef = useRef<HTMLDivElement | null>(null);
+  const thelpRef = useRef<HTMLDivElement | null>(null); // in case referenced elsewhere
 
   /* Health/version */
   const fetchHealth = useCallback(async () => {
@@ -317,7 +279,7 @@ export default function PlantAgentDashboard() {
     }
   }, [base, getHeaders]);
 
-  /* Snapshot & trends */
+  /* Snapshot & trend helpers */
   const pushHistory = useCallback((s: Snapshot, tLabel?: string) => {
     setHistory(prev => [...prev.slice(-240), {
       t: tLabel ?? new Date().toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" }),
@@ -346,6 +308,43 @@ export default function PlantAgentDashboard() {
     const s = await fetchSnapshotFast();
     if (!s) setErrorMsg("Failed to fetch snapshot");
   }, [fetchSnapshotFast]);
+
+  async function getJsonCandidates(base: string, headers: Record<string, string>, paths: string[]) {
+    let last: any;
+    for (const p of paths) {
+      const url = `${base}${p}`;
+      try {
+        const r = await fetch(url, { headers });
+        if (r.ok) return { json: await r.json(), path: p, status: r.status, method: "GET" as const };
+        const txt = await r.text().catch(()=> "");
+        last = new Error(`GET ${p} ${r.status}${txt ? ` – ${txt.slice(0,140)}` : ""}`);
+      } catch (e) { last = e; }
+    }
+    throw last ?? new Error("No candidate path succeeded");
+  }
+
+  async function methodFallback(base: string, getHeaders: Record<string,string>, postHeaders: Record<string,string>, paths: string[]) {
+    let last: any;
+    for (const p of paths) {
+      const url = `${base}${p}`;
+      try {
+        const g = await fetch(url, { headers: getHeaders });
+        if (g.ok) return { json: await g.json(), path: p, method: "GET" as const, status: g.status };
+        if (g.status === 405) {
+          try {
+            const pr = await fetch(url, { method: "POST", headers: postHeaders, body: "{}" });
+            if (pr.ok) return { json: await pr.json(), path: p, method: "POST" as const, status: pr.status };
+            const txt = await pr.text().catch(()=> "");
+            last = new Error(`POST ${p} ${pr.status}${txt ? ` – ${txt.slice(0,140)}` : ""}`);
+          } catch (e) { last = e; }
+        } else {
+          const txt = await g.text().catch(()=> "");
+          last = new Error(`GET ${p} ${g.status}${txt ? ` – ${txt.slice(0,140)}` : ""}`);
+        }
+      } catch (e) { last = e; }
+    }
+    throw last ?? new Error("No candidate path via GET/POST");
+  }
 
   const fetchTrends = useCallback(async () => {
     if (!base) return;
@@ -384,36 +383,28 @@ export default function PlantAgentDashboard() {
     }
   }, [base, getHeaders, pmTrendSource]);
 
-  /* PM segments — single, type-safe implementation */
-  type PMFetchResult = {
-    ok: boolean;
-    json: any;
-    status: number;
-    via: "GET" | "POST";
-    path?: string;
-  };
-
+  /* PM segments (GET→POST fallback, with typed via = "GET" | "POST") */
   const fetchPmSegments = useCallback(async () => {
     if (!base || pmSegsDisabledRef.current) return;
 
+    type PMFetchResult = {
+      ok: boolean;
+      json: any;
+      status: number;
+      via: "GET" | "POST";
+      path?: string;
+    };
+
     const tryGet = async (minutes: number): Promise<PMFetchResult> => {
-      const paths = [
-        `/pm/segments?minutes=${minutes}`,
-        `/segments/pm?minutes=${minutes}`,
-      ];
+      const paths = [`/pm/segments?minutes=${minutes}`, `/segments/pm?minutes=${minutes}`];
       for (const p of paths) {
         try {
           const r = await fetch(`${base}${p}`, { headers: getHeaders });
-          if (r.ok) {
-            const j = await r.json();
-            return { ok: true, json: j, status: r.status, via: "GET", path: p };
-          }
+          if (r.ok) return { ok: true, json: await r.json(), status: r.status, via: "GET", path: p };
           if (r.status !== 404 && r.status !== 405) {
-            return { ok: false, json: await r.text().catch(() => ""), status: r.status, via: "GET", path: p };
+            return { ok: false, json: await r.text().catch(()=>""), status: r.status, via: "GET", path: p };
           }
-        } catch {
-          /* keep trying next path */
-        }
+        } catch { /* continue */ }
       }
       return { ok: false, json: null, status: 405, via: "GET" };
     };
@@ -427,26 +418,18 @@ export default function PlantAgentDashboard() {
             headers: { ...postHeaders },
             body: JSON.stringify({ minutes }),
           });
-          if (r.ok) {
-            const j = await r.json();
-            return { ok: true, json: j, status: r.status, via: "POST", path: p };
-          }
+          if (r.ok) return { ok: true, json: await r.json(), status: r.status, via: "POST", path: p };
           if (r.status !== 404 && r.status !== 405) {
-            return { ok: false, json: await r.text().catch(() => ""), status: r.status, via: "POST", path: p };
+            return { ok: false, json: await r.text().catch(()=>""), status: r.status, via: "POST", path: p };
           }
-        } catch {
-          /* continue */
-        }
+        } catch { /* continue */ }
       }
       return { ok: false, json: null, status: 405, via: "POST" };
     };
 
     try {
-      // 1) Try GET first (180, then 120)
-      let res: PMFetchResult = await tryGet(180);
+      let res = await tryGet(180);
       if (!res.ok) res = await tryGet(120);
-
-      // 2) If not available, try POST with JSON body
       if (!res.ok) {
         res = await tryPost(180);
         if (!res.ok) res = await tryPost(120);
@@ -462,35 +445,19 @@ export default function PlantAgentDashboard() {
       if (Array.isArray(res.json)) {
         const cleaned: PMSegment[] = (res.json as any[])
           .map((raw: any) => {
-            const start_ts: string | undefined =
-              raw.start_ts || raw.start || raw.begin || raw.ts || raw.from;
+            const start_ts: string | undefined = raw.start_ts || raw.start || raw.begin || raw.ts || raw.from;
             if (!start_ts) return null;
-
             const rawStatus = String(raw.status ?? raw.state ?? "ok").toLowerCase();
-            const status: PMSegment["status"] =
-              rawStatus === "ok" || rawStatus === "watch" || rawStatus === "alert"
-                ? rawStatus
-                : "ok";
-
-            const end_ts: string | null =
-              (raw.end_ts ?? raw.end ?? raw.until ?? null) || null;
-
-            const seg: PMSegment = {
-              start_ts,
-              end_ts,
-              status,
-              kpi: raw.kpi || raw.signal || undefined,
-              note: raw.note || raw.msg || undefined,
-            };
-            return seg;
+            const status: PMSegment["status"] = rawStatus === "ok" || rawStatus === "watch" || rawStatus === "alert" ? rawStatus : "ok";
+            const end_ts: string | null = (raw.end_ts ?? raw.end ?? raw.until ?? null) || null;
+            return { start_ts, end_ts, status, kpi: raw.kpi || raw.signal || undefined, note: raw.note || raw.msg || undefined };
           })
           .filter((s: PMSegment | null): s is PMSegment => s !== null)
           .slice(-60);
-
         setPmSegs(cleaned);
-        setPmSegsNote(`${res.via}${res.path ? ` ${res.path}` : ""}`); // e.g., "GET /pm/segments?minutes=180"
+        setPmSegsNote(`${res.via} ${res.path ?? ""}`.trim());
       }
-    } catch (e: any) {
+    } catch (e:any) {
       info("PM segments fetch failed", e?.message ?? e);
     }
   }, [base, getHeaders, postHeaders]);
@@ -832,7 +799,7 @@ export default function PlantAgentDashboard() {
           )}
         </section>
 
-        {/* KPI Tiles — includes VHI & MCI */}
+        {/* KPI Tiles */}
         <section className="grid md:grid-cols-7 gap-4">
           {[
             { label: "Production (tph)", val: kpi?.production_tph },
@@ -846,12 +813,10 @@ export default function PlantAgentDashboard() {
               <div className="text-2xl font-semibold mt-1">{fmt(t.val, 3)}</div>
             </div>
           ))}
-          {/* MCI tile */}
           <div className="tile">
             <div className="text-xs text-slate-500">Motor Current Imbalance (%)</div>
             <div className="text-2xl font-semibold mt-1">{fmt(kpi?.mci_percent ?? null, 2)}</div>
           </div>
-          {/* VHI tile with status */}
           <div className="tile">
             <div className="flex items-center justify-between">
               <div className="text-xs text-slate-500">Vibration Health Index</div>
@@ -997,9 +962,7 @@ export default function PlantAgentDashboard() {
                 <option value="pm_only">pm_only</option>
               </select>
               <span className="text-[11px]">from <span className="font-mono">{pmTrendEndpoint}</span></span>
-              {pmSegsNote && (
-                <span className="ml-2 text-[11px] text-slate-500">• {pmSegsNote}</span>
-              )}
+              {pmSegsNote && <span className="ml-2 text-[11px] text-slate-500">• {pmSegsNote}</span>}
             </div>
           </div>
 
@@ -1093,6 +1056,7 @@ export default function PlantAgentDashboard() {
         <section className="card">
           <div className="flex items-center justify-between">
             <div className="font-semibold">Load Planning</div>
+            <div className="text-xs text-slate-500">latest plan: {loadOut?.created_at ? new Date(loadOut.created_at).toLocaleString() : "-" } • id: {loadOut?.plan_id || "-"}</div>
           </div>
           <div className="mt-3 grid md:grid-cols-7 gap-3 items-end">
             <div>
@@ -1127,7 +1091,7 @@ export default function PlantAgentDashboard() {
 
           {loadOut && (
             <div className="mt-4">
-              <div className="text-sm text-slate-600">mode: {loadOut.mode} • latest plan: {new Date(loadOut.created_at).toLocaleString()} • id: {loadOut.plan_id}</div>
+              <div className="text-sm text-slate-600">mode: {loadOut.mode}</div>
               <div className="mt-2 grid md:grid-cols-2 gap-4">
                 <div>
                   <div className="text-sm font-medium mb-1">Stages</div>
@@ -1270,6 +1234,22 @@ export default function PlantAgentDashboard() {
   );
 }
 
+function statusTone(s?: string | null) {
+  switch (s) {
+    case "ok": return "green";
+    case "watch": return "amber";
+    case "alert": return "rose";
+    default: return "slate";
+  }
+}
+
+/* PM segment visuals */
+function segTone(s: PMSegment["status"]) {
+  if (s === "alert") return { stroke: "#ef4444", fill: "#ef4444" };
+  if (s === "watch") return { stroke: "#f59e0b", fill: "#f59e0b" };
+  return { stroke: "#22c55e", fill: "#22c55e" };
+}
+
 /* Small chip + styles */
 function Chip({ children, tone="slate" }: { children: React.ReactNode; tone?: "slate" | "green" | "rose" | "amber" | "indigo" }) {
   const map: Record<string, string> = {
@@ -1293,6 +1273,8 @@ function MetricsBlock({ base, getHeaders, metrics, metricsErr, onRefresh }: { ba
 }
 
 /* ======= minimal styles (Tailwind-friendly) =======
+   Put these in your global.css if you’re using Tailwind.
+
 .card { @apply bg-white border border-slate-200 rounded-2xl p-4; }
 .tile { @apply bg-white border border-slate-200 rounded-2xl p-3; }
 .btn-outline { @apply px-3 py-2 border rounded-xl text-sm hover:bg-slate-50; }
@@ -1309,4 +1291,5 @@ function MetricsBlock({ base, getHeaders, metrics, metricsErr, onRefresh }: { ba
 .chip-rose { @apply bg-rose-50 text-rose-700 border-rose-200; }
 .chip-amber { @apply bg-amber-50 text-amber-700 border-amber-200; }
 .chip-indigo { @apply bg-indigo-50 text-indigo-700 border-indigo-200; }
+
 ==================================================== */
