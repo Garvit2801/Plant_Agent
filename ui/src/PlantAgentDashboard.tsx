@@ -135,7 +135,8 @@ type PMSegment = {
    ========================= */
 function pickLatestTimestamp(j: any): string | null { return j?.created_at || j?.createdAt || j?.ts || j?.timestamp || null; }
 function pickProposal(j: any): Record<string, number> | undefined { return j?.proposed_setpoints || j?.proposal?.setpoints || j?.top?.proposed_setpoints; }
-function tsToLabel(ts: string) {
+function tsToLabel(ts: string | null | undefined) {
+  if (!ts) return "";
   try { return new Date(ts).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" }); } catch { return ""; }
 }
 
@@ -171,7 +172,7 @@ function cleanTrends(rows: any[]): TrendPoint[] {
     const o2Good   = Number.isFinite(o2)   && o2 >= 0   && o2 < 30;
     const spGood   = Number.isFinite(sp)   && sp > 0    && sp < 200;
 
-    const vhiGood  = Number.isFinite(vhi)  && vhi >= 0  && vhi < 100;  // a bit wider
+    const vhiGood  = Number.isFinite(vhi)  && vhi >= 0  && vhi < 100;
     const mciGood  = Number.isFinite(mci)  && mci >= 0  && mci < 100;
     const btrGood  = Number.isFinite(btr)  && Math.abs(btr) < 400;
 
@@ -230,6 +231,7 @@ export default function PlantAgentDashboard() {
   const [pmSegs, setPmSegs] = useState<PMSegment[]>([]);
   const pmSegsDisabledRef = useRef(false);
   const [pmSegsNote, setPmSegsNote] = useState<string>("");
+  const pmSegsNextTryAtRef = useRef<number>(0); // debounce window (ms epoch)
 
   const [lastRuns, setLastRuns] = useState<LastRuns | null>(null);
   const [countdown, setCountdown] = useState<number | null>(null);
@@ -383,17 +385,17 @@ export default function PlantAgentDashboard() {
     }
   }, [base, getHeaders, pmTrendSource]);
 
-  /* PM segments (GET→POST fallback, with typed via = "GET" | "POST") */
+  /* PM segments — debounced; permanently disables on 404/405 to stop spam */
   const fetchPmSegments = useCallback(async () => {
     if (!base || pmSegsDisabledRef.current) return;
 
-    type PMFetchResult = {
-      ok: boolean;
-      json: any;
-      status: number;
-      via: "GET" | "POST";
-      path?: string;
-    };
+    // Debounce: max 1 attempt/min from the poller
+    const now = Date.now();
+    if (now < pmSegsNextTryAtRef.current) return;
+
+    type PMFetchResult =
+      | { ok: true; json: any; status: number; via: "GET" | "POST"; path?: string }
+      | { ok: false; status: number; via: "GET" | "POST"; path?: string };
 
     const tryGet = async (minutes: number): Promise<PMFetchResult> => {
       const paths = [`/pm/segments?minutes=${minutes}`, `/segments/pm?minutes=${minutes}`];
@@ -401,12 +403,11 @@ export default function PlantAgentDashboard() {
         try {
           const r = await fetch(`${base}${p}`, { headers: getHeaders });
           if (r.ok) return { ok: true, json: await r.json(), status: r.status, via: "GET", path: p };
-          if (r.status !== 404 && r.status !== 405) {
-            return { ok: false, json: await r.text().catch(()=>""), status: r.status, via: "GET", path: p };
-          }
+          if (r.status === 404 || r.status === 405) return { ok: false, status: r.status, via: "GET", path: p };
+          return { ok: false, status: r.status, via: "GET", path: p };
         } catch { /* continue */ }
       }
-      return { ok: false, json: null, status: 405, via: "GET" };
+      return { ok: false, status: 405, via: "GET" };
     };
 
     const tryPost = async (minutes: number): Promise<PMFetchResult> => {
@@ -419,30 +420,40 @@ export default function PlantAgentDashboard() {
             body: JSON.stringify({ minutes }),
           });
           if (r.ok) return { ok: true, json: await r.json(), status: r.status, via: "POST", path: p };
-          if (r.status !== 404 && r.status !== 405) {
-            return { ok: false, json: await r.text().catch(()=>""), status: r.status, via: "POST", path: p };
-          }
+          if (r.status === 404 || r.status === 405) return { ok: false, status: r.status, via: "POST", path: p };
+          return { ok: false, status: r.status, via: "POST", path: p };
         } catch { /* continue */ }
       }
-      return { ok: false, json: null, status: 405, via: "POST" };
+      return { ok: false, status: 405, via: "POST" };
     };
 
     try {
-      let res = await tryGet(180);
+      let res: PMFetchResult = await tryGet(180);
       if (!res.ok) res = await tryGet(120);
       if (!res.ok) {
         res = await tryPost(180);
         if (!res.ok) res = await tryPost(120);
       }
 
-      if (!res.ok) {
+      // hard disable on explicit 404/405
+      if (!res.ok && (res.status === 404 || res.status === 405)) {
         pmSegsDisabledRef.current = true;
+        pmSegsNextTryAtRef.current = Number.POSITIVE_INFINITY;
         setPmSegs([]);
-        setPmSegsNote("PM segments disabled (405/404). Endpoint likely POST-only or not exposed on this deploy.");
+        setPmSegsNote("PM segments disabled (404/405). Endpoint not exposed on this deploy.");
         return;
       }
 
-      // NEW (explicit narrowing; fixes TS2322)
+      // soft failure → back off for 60s
+      if (!res.ok) {
+        pmSegsNextTryAtRef.current = now + 60_000;
+        return;
+      }
+
+      // success → parse & set, and still rate limit to 60s
+      pmSegsNextTryAtRef.current = now + 60_000;
+      setPmSegsNote(`${res.via} ${res.path ?? ""}`.trim());
+
       if (Array.isArray(res.json)) {
         const mapped = (res.json as any[]).map((raw: any): PMSegment | null => {
           const start_ts: string | undefined = raw.start_ts || raw.start || raw.begin || raw.ts || raw.from;
@@ -462,10 +473,10 @@ export default function PlantAgentDashboard() {
 
         const cleaned: PMSegment[] = mapped.filter((s): s is PMSegment => s !== null).slice(-60);
         setPmSegs(cleaned);
-        setPmSegsNote(`${res.via} ${res.path ?? ""}`.trim());
       }
-
     } catch (e:any) {
+      // network error → soft backoff
+      pmSegsNextTryAtRef.current = Date.now() + 60_000;
       info("PM segments fetch failed", e?.message ?? e);
     }
   }, [base, getHeaders, postHeaders]);
@@ -487,7 +498,7 @@ export default function PlantAgentDashboard() {
     }
   }, [base, getHeaders, postHeaders]);
 
-  const fetchRoutineLatest = useCallback(async () => {
+  const fetchRoutineLatest = useCallback(() => (async () => {
     if (!base) return false;
     try {
       const { json } = await getJsonCandidates(base, getHeaders, ["/routine/latest", "/routine/latest/"]);
@@ -506,7 +517,7 @@ export default function PlantAgentDashboard() {
     } catch {
       return false;
     }
-  }, [base, getHeaders, latestSeenAt]);
+  })(), [base, getHeaders, latestSeenAt]);
 
   const startCronProbe = useCallback(() => {
     if (cronProbeRef.current) window.clearInterval(cronProbeRef.current);
@@ -1218,7 +1229,7 @@ export default function PlantAgentDashboard() {
             <div className="mt-3 flex gap-2">
               <button className="btn-outline" onClick={()=>fetchTrends()}>Re-fetch trends</button>
               <button className="btn-outline" onClick={()=>fetchPmTrends()}>Re-fetch PM trends</button>
-              <button className="btn-outline" onClick={()=>fetchPmSegments()}>Re-fetch PM segments</button>
+              <button className="btn-outline" onClick={()=>{ pmSegsNextTryAtRef.current = 0; fetchPmSegments(); }}>Re-fetch PM segments</button>
               <button className="btn-outline" onClick={()=>{ disableLastRunsRef.current=false; fetchLastRuns(); }}>Re-fetch last_runs</button>
               <button className="btn-outline" onClick={()=>fetchRoutineLatest()}>Fetch /routine/latest now</button>
               <button className="btn-outline" onClick={()=>getMetrics()}>Refresh metrics</button>
