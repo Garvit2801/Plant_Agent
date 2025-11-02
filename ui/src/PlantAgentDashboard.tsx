@@ -197,8 +197,11 @@ function cleanTrends(rows: any[]): TrendPoint[] {
     const keepProd = prodGood && !spike ? prod : null;
     if (keepProd !== null) lastProd = keepProd;
 
+    const ts = row.ts ? new Date(row.ts) : null;
+    const label = ts ? ts.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "";
+
     out.push({
-      t: row.ts ? new Date(row.ts).toLocaleTimeString() : "",
+      t: label,
       production_tph: keepProd,
       o2_percent: o2Good ? o2 : null,
       specific_power_kwh_per_ton: spGood ? sp : null,
@@ -226,7 +229,7 @@ function segTone(s: PMSegment["status"]) {
   return { stroke: "#22c55e", fill: "#22c55e" }; // ok
 }
 function tsToLabel(ts: string) {
-  try { return new Date(ts).toLocaleTimeString(); } catch { return ""; }
+  try { return new Date(ts).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" }); } catch { return ""; }
 }
 
 /* =========================
@@ -311,7 +314,7 @@ export default function PlantAgentDashboard() {
   /* Snapshot & trend helpers */
   const pushHistory = useCallback((s: Snapshot, tLabel?: string) => {
     setHistory(prev => [...prev.slice(-240), {
-      t: tLabel ?? new Date().toLocaleTimeString(),
+      t: tLabel ?? new Date().toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" }),
       production_tph: s.production_tph,
       o2_percent: s.o2_percent,
       specific_power_kwh_per_ton: s.specific_power_kwh_per_ton,
@@ -1196,8 +1199,9 @@ function MetricsBlock({ base, getHeaders, metrics, metricsErr, onRefresh }: { ba
   );
 }
 
-/* ======= minimal styles (Tailwind-friendly) ======= */
-/* In your global.css (or keep utility classes). This block assumes you already use Tailwind.
+/* ======= minimal styles (Tailwind-friendly) =======
+   Put these in your global.css if you’re using Tailwind. Kept here as a reference.
+
 .card { @apply bg-white border border-slate-200 rounded-2xl p-4; }
 .tile { @apply bg-white border border-slate-200 rounded-2xl p-3; }
 .btn-outline { @apply px-3 py-2 border rounded-xl text-sm hover:bg-slate-50; }
@@ -1213,4 +1217,6 @@ function MetricsBlock({ base, getHeaders, metrics, metricsErr, onRefresh }: { ba
 .chip-green { @apply bg-emerald-50 text-emerald-700 border-emerald-200; }
 .chip-rose { @apply bg-rose-50 text-rose-700 border-rose-200; }
 .chip-amber { @apply bg-amber-50 text-amber-700 border-amber-200; }
-.chip-indigo { @apply bg-indigo-50 text-indigo-700 border-indigo-200; } */
+.chip-indigo { @apply bg-indigo-50 text-indigo-700 border-indigo-200; }
+
+==================================================== */

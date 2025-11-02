@@ -129,6 +129,11 @@ PROJECT_ID = (
 BQ_LOCATION = os.getenv("BQ_LOCATION", "asia-south2")
 MODEL_NAME = os.getenv("BQ_MODEL_NAME", "spower_reg")
 
+# NEW: dataset/envs used for views
+VIEW_DATASET = os.getenv("VIEW_DATASET", "plant_ops")
+RAW_DATASET = os.getenv("RAW_DATASET", "plant_ops")  # kept for consistency if needed
+RAW_TABLE = os.getenv("RAW_TABLE", "raw_signals")     # not used by the PM view readers but retained
+
 # Table envs
 BQ_SNAPSHOTS_TABLE_ENV = os.getenv("BQ_SNAPSHOTS_TABLE")
 BQ_SNAPSHOTS_VIEW_ENV = os.getenv("BQ_SNAPSHOTS_VIEW")
@@ -147,10 +152,25 @@ SPOWER_TOL = float(os.getenv("SPOWER_TOL", "0.005"))       # 0.5% relative toler
 LOG_PHYSICS = os.getenv("LOG_PHYSICS", "0") in ("1","true","yes")
 
 # --- Condition Monitoring KPIs (new) ---
-# Single wide table for logging latest KPI points (append-only)
 # schema suggestion:
 #   ts TIMESTAMP, kpi STRING, value FLOAT64, aux JSON, source STRING
 BQ_CM_KPI_TABLE_ENV = os.getenv("BQ_CM_KPI_TABLE")  # e.g. myproj.plant_ops.cm_kpis
+
+# ---- Forecasting toggles (NEW) ----
+FORECAST_PM_ENABLE = os.getenv("FORECAST_PM_ENABLE", "1") in ("1", "true", "yes")
+FORECAST_PM_INTERVAL_SEC = int(os.getenv("FORECAST_PM_INTERVAL_SEC", "60"))
+FORECAST_PM_HORIZON_MIN = int(os.getenv("FORECAST_PM_HORIZON_MIN", "60"))
+FORECAST_PM_STEP_MIN = int(os.getenv("FORECAST_PM_STEP_MIN", "5"))
+PM_KPIS = [
+    "specific_power_kwh_per_ton",
+    "vibration_axial_mm_s",
+    "vibration_radial_mm_s",
+    "motor_current_a",
+    "motor_current_b",
+    "motor_current_c",
+    "bearing_temp_C",
+    "suction_temp_C",
+]
 
 # -------------------------
 # App & CORS
@@ -185,7 +205,9 @@ app.add_middleware(
     allow_origins=UI_ORIGINS,
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type", "X-Confirm-Apply"],
+    allow_headers=["*"],  # <— allow any request header (fixes custom header preflights)
+    expose_headers=["X-Service-Version", "X-Sched-Period-Sec"],
+    max_age=86400,
 )
 
 def _origin_allowed(origin: Optional[str]) -> bool:
@@ -196,7 +218,7 @@ def _cors_hdrs_for(origin: Optional[str]) -> Dict[str, str]:
         return {
             "Access-Control-Allow-Origin": origin,
             "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-            "Access-Control-Allow-Headers": "authorization, content-type, x-confirm-apply",
+            "Access-Control-Allow-Headers": "*",  # <— mirror the middleware
             "Access-Control-Max-Age": "86400",
             "Vary": "Origin",
         }
@@ -360,6 +382,16 @@ _STATE["_spower_drivers"] = {
     "separator_dp_pa_sp": _STATE["sp"]["separator_dp_pa"],
     "o2_percent": _STATE["o2_percent"],
 }
+# NEW: PM variables
+_STATE.update({
+    "vibration_axial_mm_s": 2.0,
+    "vibration_radial_mm_s": 1.8,
+    "motor_current_a": 145.0,
+    "motor_current_b": 147.0,
+    "motor_current_c": 143.0,
+    "bearing_temp_C": 58.0,
+    "suction_temp_C": 34.0,
+})
 
 _HIST = deque(maxlen=int(os.getenv("MOCK_HISTORY_MAX", "2000")))
 
@@ -369,6 +401,14 @@ def _append_history(snapshot: Dict[str, Any]):
         "production_tph": snapshot.get("production_tph"),
         "o2_percent": snapshot.get("o2_percent"),
         "specific_power_kwh_per_ton": snapshot.get("specific_power_kwh_per_ton"),
+        # PM signals
+        "vibration_axial_mm_s": snapshot.get("vibration_axial_mm_s"),
+        "vibration_radial_mm_s": snapshot.get("vibration_radial_mm_s"),
+        "motor_current_a": snapshot.get("motor_current_a"),
+        "motor_current_b": snapshot.get("motor_current_b"),
+        "motor_current_c": snapshot.get("motor_current_c"),
+        "bearing_temp_C": snapshot.get("bearing_temp_C"),
+        "suction_temp_C": snapshot.get("suction_temp_C"),
     })
 
 def _log_phys(tag: str, **kw):
@@ -454,6 +494,33 @@ def _physics_tick(state: Dict[str, float], dt_sec: float) -> None:
         prev_sp = state["specific_power_kwh_per_ton"]
         state["specific_power_kwh_per_ton"] = round(prev_sp + k_alpha * (k_base - prev_sp), 3)
         _log_phys("APPLY_SP", mode=SPOWER_MODE, prev=f"{prev_sp:.3f}", new=f"{state['specific_power_kwh_per_ton']:.3f}")
+
+    # ---- PM sensor dynamics (NEW) ----
+    sep = float(sp.get("separator_dp_pa", state["separator_dp_pa"]))
+    o2  = float(state["o2_percent"])
+    prod = float(state["production_tph"])
+
+    rng = 0.02
+    def walk(cur, drift, lo, hi):
+        nxt = cur + drift + np.random.uniform(-rng, rng)
+        return float(clamp(nxt, lo, hi))
+
+    vib_drift = 0.0005*((sep-600)/100.0) + 0.002*max(0.0, 2.6 - o2)
+    state["vibration_axial_mm_s"] = walk(state["vibration_axial_mm_s"], vib_drift, 0.5, 7.0)
+    state["vibration_radial_mm_s"] = walk(state["vibration_radial_mm_s"], vib_drift*0.8, 0.5, 7.0)
+
+    base_i = 130.0 + 1.6*prod
+    ub = 3.0
+    state["motor_current_a"] = walk(state["motor_current_a"], (base_i - state["motor_current_a"]) * 0.1, 80, 260)
+    state["motor_current_b"] = walk(state["motor_current_b"], (base_i + 0.6*ub - state["motor_current_b"]) * 0.1, 80, 260)
+    state["motor_current_c"] = walk(state["motor_current_c"], (base_i - 0.6*ub - state["motor_current_c"]) * 0.1, 80, 260)
+
+    tgt_suction = 33.0 + 0.05*(prod-10.0)
+    state["suction_temp_C"] = walk(state["suction_temp_C"], (tgt_suction - state["suction_temp_C"])*0.1, 20, 60)
+
+    rise = 10.0 + 2.5*(state["vibration_axial_mm_s"] - 2.0)
+    tgt_brg = state["suction_temp_C"] + clamp(rise, 5, 35)
+    state["bearing_temp_C"] = walk(state["bearing_temp_C"], (tgt_brg - state["bearing_temp_C"])*0.08, 30, 120)
 
 def _physics_step(state: Dict[str, float]) -> None:
     _physics_tick(state, dt_sec=MOCK_TICK_SEC)
@@ -541,6 +608,18 @@ def _effective_project() -> str:
         return _bq_client.project  # type: ignore[attr-defined]
     raise HTTPException(status_code=500, detail="PROJECT_ID not found for BigQuery")
 
+def _view_dataset() -> str:
+    return VIEW_DATASET or "plant_ops"
+
+def _pm_trends_view() -> str:
+    return f"{_effective_project()}.{_view_dataset()}.pm_trends_last2h"
+
+def _pm_segments_view() -> str:
+    return f"{_effective_project()}.{_view_dataset()}.pm_segments_last3h"
+
+def _pm_forecast_view() -> str:
+    return f"{_effective_project()}.{_view_dataset()}.pm_forecast_next60m"
+
 def _snapshots_table() -> str:
     return BQ_SNAPSHOTS_TABLE_ENV or f"{_effective_project()}.plant_ops.snapshots"
 
@@ -559,7 +638,6 @@ def _routine_table() -> str:
 def _suggestions_table() -> str:
     return BQ_SUGGESTIONS_TABLE_ENV or f"{_effective_project()}.plant_ops.suggestions_v1"
 
-# NEW: KPI prediction tables
 def _kpi_pred_latest_table() -> str:
     return BQ_KPI_PRED_LATEST_ENV or f"{_effective_project()}.plant_ops.kpi_predictions_latest"
 
@@ -569,7 +647,6 @@ def _kpi_pred_future_table() -> str:
 def _bq_model_fqn() -> str:
     return f"{_effective_project()}.plant_ops.{MODEL_NAME}"
 
-# NEW: Condition monitoring KPI table
 def _cm_table() -> Optional[str]:
     try:
         return BQ_CM_KPI_TABLE_ENV or f"{_effective_project()}.plant_ops.cm_kpis"
@@ -938,6 +1015,25 @@ def _maybe_parse_json(v: Any) -> Any:
         return v
 
 # -------------------------
+# In-memory prediction stores (NEW)
+# -------------------------
+_PRED_LATEST_MEM: Dict[Tuple[str, int], List[Dict[str, Any]]] = {}
+_PRED_FUTURE_MEM: Dict[str, List[Dict[str, Any]]] = {}
+
+def _mem_pred_latest_write(kpi: str, horizon: int, points: List[Dict[str, Any]], pred_run_ts: datetime.datetime):
+    _PRED_LATEST_MEM[(kpi, horizon)] = [
+        dict(p, kpi_name=kpi, horizon_min=horizon, pred_run_ts=pred_run_ts.isoformat())
+        for p in points
+    ]
+
+def _mem_pred_future_write(kpi: str, horizon: int, points: List[Dict[str, Any]], pred_run_ts: datetime.datetime):
+    pred_ts = pred_run_ts.isoformat()
+    _PRED_FUTURE_MEM[kpi] = [
+        dict(p, kpi_name=kpi, horizon_min=horizon, pred_ts=pred_ts)
+        for p in points
+    ]
+
+# -------------------------
 # Routes
 # -------------------------
 @app.get("/")
@@ -956,6 +1052,7 @@ def root():
             "/debug/config", "/debug/tables", "/debug/bq_recent", "/debug/last_runs",
             "/snapshot", "/snapshot/set",
             "/trends",
+            "/pm/trends", "/pm/segments", "/pm/forecast",
             "/pm/health_index", "/pm/anomalies",
             "/optimize/routine", "/optimize/load", "/cron/routine",
             "/routine/latest",
@@ -1031,6 +1128,11 @@ def debug_config():
         "spower_mode": SPOWER_MODE,
         "spower_tol": SPOWER_TOL,
         "log_physics": LOG_PHYSICS,
+        "pm_views": {
+            "trends": _pm_trends_view(),
+            "segments": _pm_segments_view(),
+            "forecast": _pm_forecast_view(),
+        }
     }
 
 @app.get("/debug/tables")
@@ -1052,8 +1154,14 @@ def debug_tables():
         "kpi_predictions_future": _kpi_pred_future_table(),
         # NEW: condition monitoring table
         "cm_kpis": _cm_table(),
+        "pm_views": {
+            "trends": _pm_trends_view(),
+            "segments": _pm_segments_view(),
+            "forecast": _pm_forecast_view(),
+        },
         "bq_enabled": _BQ_ENABLED,
         "bq_location": BQ_LOCATION,
+        "view_dataset": _view_dataset(),
     }
 
 @app.get("/debug/bq_recent")
@@ -1080,6 +1188,9 @@ def debug_bq_recent():
             "kpi_predictions_latest": _kpi_pred_latest_table(),
             "kpi_predictions_future": _kpi_pred_future_table(),
             "cm_kpis": _cm_table(),
+            "pm_trends_view": _pm_trends_view(),
+            "pm_segments_view": _pm_segments_view(),
+            "pm_forecast_view": _pm_forecast_view(),
         },
         "enabled": _BQ_ENABLED,
         "bq_error": _BQ_ERR,
@@ -1172,7 +1283,7 @@ def snapshot_set(req: SnapshotSetReq):
     return {"ok": True, "state": snap}
 
 # -------------------------
-# /trends
+# /trends (historical plant KPIs from snapshots)
 # -------------------------
 def _sanitize_trend_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     def _f(v):
@@ -1279,6 +1390,97 @@ def trends(
     return out
 
 # -------------------------
+# NEW: PM View Readers (BigQuery views you created)
+# -------------------------
+@app.get("/pm/trends")
+def pm_trends_view():
+    """
+    Read from view: {project}.{VIEW_DATASET}.pm_trends_last2h
+    Columns: ts, vhi_health_index, mci_percent, bearing_temp_rise_C
+    """
+    if not _BQ_ENABLED or _bq_client is None:
+        raise HTTPException(status_code=503, detail=_BQ_ERR or "BigQuery unavailable")
+    sql = f"""
+      SELECT ts, vhi_health_index, mci_percent, bearing_temp_rise_C
+      FROM `{_pm_trends_view()}`
+      ORDER BY ts
+    """
+    rows = _bq_query(sql)
+    out = []
+    for r in rows:
+        d = dict(r)
+        ts = d.get("ts")
+        d["ts"] = ts.isoformat() if isinstance(ts, datetime.datetime) else str(ts)
+        out.append(d)
+    return out
+
+# >>>>>>>>>>>> HARDENED: GET+HEAD + alias + OPTIONS (fixes 405s)
+from fastapi import status as _status
+
+@app.api_route("/pm/segments", methods=["GET", "HEAD"])
+def pm_segments_view(minutes: int = Query(default=None, ge=1, le=24*60)):
+    """
+    Read from view: {project}.{VIEW_DATASET}.pm_segments_last3h
+    Columns: start_ts, end_ts, status ("ok"|"watch"|"alert")
+    """
+    if not _BQ_ENABLED or _bq_client is None:
+        raise HTTPException(status_code=503, detail=_BQ_ERR or "BigQuery unavailable")
+    sql = f"""
+      SELECT start_ts, end_ts, status
+      FROM `{_pm_segments_view()}`
+      ORDER BY start_ts
+    """
+    rows = _bq_query(sql)
+    out = []
+    for r in rows:
+        d = dict(r)
+        st = d.get("start_ts")
+        et = d.get("end_ts")
+        d["start_ts"] = st.isoformat() if isinstance(st, datetime.datetime) else str(st)
+        d["end_ts"]   = et.isoformat() if isinstance(et, datetime.datetime) else (str(et) if et else None)
+        out.append(d)
+    return out
+
+# Friendly alias because your UI sometimes calls /segments/pm
+@app.api_route("/segments/pm", methods=["GET", "HEAD"])
+def pm_segments_view_alias(minutes: int = Query(default=None, ge=1, le=24*60)):
+    return pm_segments_view(minutes=minutes)
+
+# Explicit OPTIONS (some proxies/hosts are picky)
+@app.options("/pm/segments")
+def options_pm_segments(request: Request):
+    origin = request.headers.get("origin")
+    return Response(status_code=_status.HTTP_204_NO_CONTENT, headers=_cors_hdrs_for(origin) | {"Allow": "GET, HEAD, OPTIONS"})
+
+@app.options("/segments/pm")
+def options_segments_pm(request: Request):
+    origin = request.headers.get("origin")
+    return Response(status_code=_status.HTTP_204_NO_CONTENT, headers=_cors_hdrs_for(origin) | {"Allow": "GET, HEAD, OPTIONS"})
+# <<<<<<<<<<< HARDENED BLOCK END
+
+@app.get("/pm/forecast")
+def pm_forecast_view():
+    """
+    Optional: reads {project}.{VIEW_DATASET}.pm_forecast_next60m if present.
+    Expected columns: ts, vhi_pred, mci_pred, btr_pred
+    """
+    if not _BQ_ENABLED or _bq_client is None:
+        raise HTTPException(status_code=503, detail=_BQ_ERR or "BigQuery unavailable")
+    view_fqn = _pm_forecast_view()
+    try:
+        sql = f"SELECT ts, vhi_pred, mci_pred, btr_pred FROM `{view_fqn}` ORDER BY ts"
+        rows = _bq_query(sql)
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=f"Forecast view not found or query failed: {view_fqn}. {e}")
+    out = []
+    for r in rows:
+        d = dict(r)
+        ts = d.get("ts")
+        d["ts"] = ts.isoformat() if isinstance(ts, datetime.datetime) else str(ts)
+        out.append(d)
+    return out
+
+# -------------------------
 # Internal: threshold filter & optional neutral nudge
 # -------------------------
 def _build_per_lever_audit(s: Dict[str, Any],
@@ -1316,7 +1518,7 @@ def _build_per_lever_audit(s: Dict[str, Any],
         }
     return out
 
-def _apply_threshold_filters(per: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+def _apply_threshold_filters(per: Dict[str, Any]) -> Tuple[Dict[str, float], Dict[str, Any]]:
     filtered: Dict[str, float] = {}
     for k, info in per.items():
         cur = info["current"]
@@ -1715,8 +1917,8 @@ def optimize_load(req: LoadOptimizeReq):
 
     def _has_moves(stages_list: List[Dict[str, Any]]) -> bool:
         for st in stages_list or []:
-            sp = st.get("setpoints") or {}
-            if any(abs(float(sp[k]) - float(s.get(k, sp[k]))) > 1e-6 for k in sp.keys()):
+            spv = st.get("setpoints") or {}
+            if any(abs(float(spv[k]) - float(s.get(k, spv[k]))) > 1e-6 for k in spv.keys()):
                 return True
         return False
 
@@ -2100,7 +2302,6 @@ def _pm_compute(df: pd.DataFrame):
     sel = _pm_select_signals(df)
     if sel.empty: 
         return pd.Series(dtype=float), 0.0, pd.DataFrame()
-    # rolling z
     win = max(10, min(500, int(len(sel)*0.05)))
     roll_mean = sel.rolling(win, min_periods=max(5, win//3)).mean()
     roll_std  = sel.rolling(win, min_periods=max(5, win//3)).std()
@@ -2167,11 +2368,17 @@ def kpi_predictions_latest(
     limit: int = Query(2880, ge=1, le=100000),
 ):
     """
-    Returns the "clean" latest-run line for the given KPI & horizon,
-    ordered by target_ts (what the chart needs).
+    Returns the latest-run line for the given KPI & horizon,
+    ordered by target_ts (what the chart needs). Falls back to in-memory when BQ is disabled.
     """
+    # Memory fallback
+    mem = _PRED_LATEST_MEM.get((kpi_name, horizon_min))
+    if mem and (not _BQ_ENABLED or _bq_client is None):
+        return mem[:limit]
+
     if not _BQ_ENABLED or _bq_client is None:
         raise HTTPException(status_code=503, detail=_BQ_ERR or "BigQuery unavailable")
+
     from google.cloud import bigquery  # type: ignore
     table = _kpi_pred_latest_table()
     sql = f"""
@@ -2207,10 +2414,16 @@ def kpi_predictions_future(
 ):
     """
     Returns all future points across runs (pred_ts DESC, target_ts ASC)
-    capped by limit — good for multi-run ribbon plots.
+    capped by limit — good for multi-run ribbon plots. Falls back to in-memory when BQ is disabled.
     """
+    # Memory fallback
+    mem = _PRED_FUTURE_MEM.get(kpi_name)
+    if mem and (not _BQ_ENABLED or _bq_client is None):
+        return mem[:limit]
+
     if not _BQ_ENABLED or _bq_client is None:
         raise HTTPException(status_code=503, detail=_BQ_ERR or "BigQuery unavailable")
+
     from google.cloud import bigquery  # type: ignore
     table = _kpi_pred_future_table()
     sql = f"""
@@ -2251,21 +2464,12 @@ class MCIPoint(BaseModel):
     kpi: str  # "MCI_percent" or "BearingTempRise_C"
 
 def _select_vibration_cols(df: pd.DataFrame) -> List[str]:
-    """Pick vibration/accel channels for VHI."""
     keys = ["vibration", "vibe", "accel", "acceleration", "bearing", "brg"]
     num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
     vib_cols = [c for c in num_cols if any(k in str(c).lower() for k in keys)]
     return vib_cols
 
 def _compute_vhi(df: pd.DataFrame):
-    """
-    Rolling z-score based health index: mean(|z|) across selected vibration channels.
-    Threshold via robust MAD around median. Status bands:
-      - ok     : hi < 0.5 * thresh
-      - watch  : 0.5 * thresh <= hi < thresh
-      - alert  : hi >= thresh
-    Returns (series_hi, float_threshold, dataframe_anom)
-    """
     vib_cols = _select_vibration_cols(df)
     if not vib_cols:
         return pd.Series(dtype=float), 0.0, pd.DataFrame()
@@ -2297,11 +2501,6 @@ def _pick_col(df: pd.DataFrame, names: List[str]) -> Optional[str]:
     return None
 
 def _compute_mci_series(df: pd.DataFrame) -> pd.Series:
-    """
-    Motor Current Imbalance (%)
-      MCI = (max(Ia,Ib,Ic) - min(Ia,Ib,Ic)) / ((Ia+Ib+Ic)/3) * 100
-    Returns NaN where any phase is missing or invalid.
-    """
     cand_a = [ "ia", "i_a", "phase_a", "phase a", "current_a", "current a" ]
     cand_b = [ "ib", "i_b", "phase_b", "phase b", "current_b", "current b" ]
     cand_c = [ "ic", "i_c", "phase_c", "phase c", "current_c", "current c" ]
@@ -2322,10 +2521,6 @@ def _compute_mci_series(df: pd.DataFrame) -> pd.Series:
     return mci
 
 def _compute_bearing_temp_rise_series(df: pd.DataFrame) -> pd.Series:
-    """
-    Fallback KPI if three-phase currents are unavailable:
-      Bearing Temp Rise (°C) = bearing_temp - (inlet_temp or ambient_temp)
-    """
     cand_brg = ["bearing_temp","brg_temp","bearing temperature","bearing"]
     cand_inl = ["inlet_temp","suction_temp","inlet temperature","suction temperature"]
     cand_amb = ["ambient_temp","ambient temperature","room_temp","room temperature"]
@@ -2517,7 +2712,93 @@ def physics_flags():
     }
 
 # -------------------------
-# Startup diagnostics
+# Forecasting utilities & loop (NEW)
+# -------------------------
+def _collect_series(kpi: str, minutes:int=240, limit:int=5000):
+    df = _df_recent(minutes=minutes, limit=limit)
+    if df.empty or kpi not in df.columns:
+        return [], []
+    s = pd.to_numeric(df[kpi], errors="coerce").dropna()
+    if s.empty:
+        return [], []
+    ts = list(s.index.to_pydatetime())
+    ys = list(map(float, s.values))
+    return ts, ys
+
+def _fit_lr_forecast(ts_list: List[datetime.datetime], y_list: List[float],
+                     horizon_min: int, step_min: int) -> List[Dict[str, Any]]:
+    if len(ts_list) < 5:
+        return []
+    t0 = ts_list[0]
+    x = np.array([(t - t0).total_seconds()/60.0 for t in ts_list], dtype=float)
+    y = np.array(y_list, dtype=float)
+    msk = np.isfinite(x) & np.isfinite(y)
+    x, y = x[msk], y[msk]
+    if len(x) < 5:
+        return []
+    slope, intercept = np.polyfit(x, y, 1)
+    last_t = ts_list[-1]
+    steps = max(1, int(np.ceil(horizon_min/step_min)))
+    pts = []
+    for i in range(1, steps+1):
+        dtm = i*step_min
+        xx = ((last_t + datetime.timedelta(minutes=dtm)) - t0).total_seconds()/60.0
+        yhat = float(intercept + slope*xx)
+        pts.append({"target_ts": (last_t + datetime.timedelta(minutes=dtm)).isoformat(),
+                    "y_hat": yhat})
+    return pts
+
+def _write_preds_bq(kpi: str, horizon: int, latest_pts: List[Dict[str, Any]],
+                    pred_run_ts: datetime.datetime):
+    tbl_latest = _kpi_pred_latest_table() if _BQ_ENABLED else None
+    tbl_future = _kpi_pred_future_table() if _BQ_ENABLED else None
+    err1 = err2 = None
+    if _BQ_ENABLED and tbl_latest and latest_pts:
+        for p in latest_pts:
+            row = {
+                "target_ts": p["target_ts"],
+                "y_hat": p["y_hat"],
+                "y_lo": None,
+                "y_hi": None,
+                "kpi_name": kpi,
+                "horizon_min": horizon,
+                "pred_run_ts": pred_run_ts.isoformat(),
+            }
+            e = _bq_insert_flexible(tbl_latest, row)
+            if e and err1 is None: err1 = e
+    if _BQ_ENABLED and tbl_future and latest_pts:
+        pred_ts = pred_run_ts.isoformat()
+        for p in latest_pts:
+            row = {
+                "pred_ts": pred_ts,
+                "target_ts": p["target_ts"],
+                "y_hat": p["y_hat"],
+                "kpi_name": kpi,
+                "horizon_min": horizon,
+            }
+            e = _bq_insert_flexible(tbl_future, row)
+            if e and err2 is None: err2 = e
+    return err1 or err2
+
+def _forecast_loop():
+    while True:
+        try:
+            if not FORECAST_PM_ENABLE:
+                time.sleep(max(5, FORECAST_PM_INTERVAL_SEC))
+                continue
+            pred_run_ts = _now_ts()
+            for kpi in PM_KPIS:
+                ts_list, y_list = _collect_series(kpi, minutes=max(240, FORECAST_PM_HORIZON_MIN*2))
+                pts = _fit_lr_forecast(ts_list, y_list, FORECAST_PM_HORIZON_MIN, FORECAST_PM_STEP_MIN)
+                _mem_pred_latest_write(kpi, FORECAST_PM_HORIZON_MIN, pts, pred_run_ts)
+                _mem_pred_future_write(kpi, FORECAST_PM_HORIZON_MIN, pts, pred_run_ts)
+                _write_preds_bq(kpi, FORECAST_PM_HORIZON_MIN, pts, pred_run_ts)
+        except Exception as e:
+            logging.warning("forecast loop error: %s", e)
+        time.sleep(max(10, FORECAST_PM_INTERVAL_SEC))
+
+# -------------------------
+# Startup diagnostics & background starters
 # -------------------------
 @app.on_event("startup")
 def _log_routes_on_startup():
@@ -2527,3 +2808,8 @@ def _log_routes_on_startup():
             logging.info("ROUTE path=%s methods=%s name=%s", r.path, methods, r.name)
     except Exception as e:
         logging.info("Route logging failed: %s", e)
+
+@app.on_event("startup")
+def _start_forecaster():
+    if FORECAST_PM_ENABLE:
+        threading.Thread(target=_forecast_loop, daemon=True).start()
