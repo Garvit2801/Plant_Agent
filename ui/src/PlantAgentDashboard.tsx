@@ -2,10 +2,11 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { LineChart, Line, XAxis, YAxis, Tooltip, Legend, CartesianGrid } from "recharts";
 
 /**
- * Plant Agent – Operations Dashboard (No-Auth Variant)
- * - Removed all Authorization bearer handling (no token, no header, no guards)
- * - Kept X-Confirm-Apply: yes for /actuate/apply_stage
- * - Everything else unchanged
+ * Plant Agent – Operations Dashboard (No-Auth Variant) — UPDATED
+ * Adds KPI surfaces for:
+ *  - Vibration Health Index (VHI): shows index, threshold, status badge (ok/watch/alert)
+ *  - Motor Current Imbalance (MCI_percent): shows % and trend
+ * Keeps: O2, Specific Power, Production, etc.
  */
 
 const RECOMMENDED_HOST = "https://plant-agent-i32khy5nrq-el.a.run.app";
@@ -40,9 +41,25 @@ type Snapshot = {
   production_tph: number; kiln_feed_tph: number; separator_dp_pa: number;
   id_fan_flow_Nm3_h: number; cooler_airflow_Nm3_h: number; kiln_speed_rpm: number;
   o2_percent: number; specific_power_kwh_per_ton: number;
+
+  // NEW — vibration and electrical KPIs (optional fields)
+  vhi_health_index?: number | null;           // higher = worse
+  vhi_threshold?: number | null;              // threshold at/over which status flips
+  vhi_status?: "ok" | "watch" | "alert" | null;
+
+  mci_percent?: number | null;                // Motor Current Imbalance %
+  bearing_temp_rise_C?: number | null;        // optional swap-in KPI
 };
 
-type TrendPoint = { t: string; production_tph: number | null; o2_percent: number | null; specific_power_kwh_per_ton: number | null; };
+type TrendPoint = {
+  t: string;
+  production_tph: number | null;
+  o2_percent: number | null;
+  specific_power_kwh_per_ton: number | null;
+  vhi_health_index?: number | null;
+  mci_percent?: number | null;
+  bearing_temp_rise_C?: number | null;
+};
 
 type LastRuns = { last_cron_routine: string | null; last_ingest: string | null; sched_period_sec: number; now: string; next_cron_eta: string | null; seconds_to_next: number | null; };
 
@@ -137,23 +154,58 @@ async function methodFallback(base: string, getHeaders: Record<string,string>, p
   throw last ?? new Error("No candidate path via GET/POST");
 }
 
-/* trend cleaning */
+/* trend cleaning — now also pulls VHI/MCI if present */
 function cleanTrends(rows: any[]): TrendPoint[] {
   const sorted = rows.slice().sort((a,b)=>new Date(a.ts??0).getTime()-new Date(b.ts??0).getTime());
   const out: TrendPoint[] = [];
   let lastProd: number | undefined;
+
+  const parse = (v:any) => {
+    if (v==null) return NaN;
+    const s = typeof v === "string" ? v.replace(/,/g,"") : String(v);
+    const n = Number(s); return Number.isFinite(n)?n:NaN;
+  };
+
   for (const row of sorted) {
-    const parse = (v:any) => { if (v==null) return NaN; const s = typeof v === "string" ? v.replace(/,/g,"") : String(v); const n = Number(s); return Number.isFinite(n)?n:NaN; };
-    const prod = parse(row.production_tph), o2 = parse(row.o2_percent), sp = parse(row.specific_power_kwh_per_ton);
+    const prod = parse(row.production_tph);
+    const o2 = parse(row.o2_percent);
+    const sp = parse(row.specific_power_kwh_per_ton);
+    const vhi = parse(row.vhi_health_index);
+    const mci = parse(row.mci_percent);
+    const btr = parse(row.bearing_temp_rise_C);
+
     const prodGood = Number.isFinite(prod) && prod >= 0.5 && prod < 1000;
-    const o2Good = Number.isFinite(o2) && o2 >= 0 && o2 < 30;
-    const spGood = Number.isFinite(sp) && sp > 0 && sp < 200;
+    const o2Good   = Number.isFinite(o2) && o2 >= 0 && o2 < 30;
+    const spGood   = Number.isFinite(sp) && sp > 0 && sp < 200;
+
+    const vhiGood  = Number.isFinite(vhi) && vhi >= 0 && vhi < 50;          // typical z-index band
+    const mciGood  = Number.isFinite(mci) && mci >= 0 && mci < 100;         // %
+    const btrGood  = Number.isFinite(btr) && Math.abs(btr) < 200;
+
     const spike = lastProd && prodGood ? Math.abs(prod-lastProd)/Math.max(1e-9,lastProd) > 0.30 : false;
     const keepProd = prodGood && !spike ? prod : null;
     if (keepProd !== null) lastProd = keepProd;
-    out.push({ t: row.ts ? new Date(row.ts).toLocaleTimeString() : "", production_tph: keepProd, o2_percent: o2Good?o2:null, specific_power_kwh_per_ton: spGood?sp:null });
+
+    out.push({
+      t: row.ts ? new Date(row.ts).toLocaleTimeString() : "",
+      production_tph: keepProd,
+      o2_percent: o2Good ? o2 : null,
+      specific_power_kwh_per_ton: spGood ? sp : null,
+      vhi_health_index: vhiGood ? vhi : null,
+      mci_percent: mciGood ? mci : null,
+      bearing_temp_rise_C: btrGood ? btr : null,
+    });
   }
   return out;
+}
+
+function statusTone(s?: string | null) {
+  switch (s) {
+    case "ok": return "green";
+    case "watch": return "amber";
+    case "alert": return "rose";
+    default: return "slate";
+  }
 }
 
 /* =========================
@@ -169,15 +221,10 @@ export default function PlantAgentDashboard() {
   const [nudgeFlag, setNudgeFlag] = useLocalStorage(LS_KEYS.NUDGE, "1");
   const [autoApplyRoutine, setAutoApplyRoutine] = useLocalStorage(LS_KEYS.AUTO_APPLY, "0"); // default OFF
 
-  // General GET/POST headers (no auth)
+  // General headers (no auth)
   const getHeaders = useMemo(() => ({} as Record<string,string>), []);
   const postHeaders = useMemo(() => ({"Content-Type":"application/json"} as Record<string,string>), []);
-
-  // Apply headers: MUST include X-Confirm-Apply (no auth)
-  const applyHeaders = useMemo(() => ({
-    "Content-Type": "application/json",
-    "X-Confirm-Apply": "yes",
-  } as Record<string,string>), []);
+  const applyHeaders = useMemo(() => ({ "Content-Type":"application/json", "X-Confirm-Apply":"yes" } as Record<string,string>), []);
 
   const [health, setHealth] = useState<string>("-");
   const [ver, setVer] = useState<string>("-");
@@ -238,9 +285,15 @@ export default function PlantAgentDashboard() {
   const pushHistory = useCallback((s: Snapshot, tLabel?: string) => {
     setHistory(prev => [...prev.slice(-240), {
       t: tLabel ?? new Date().toLocaleTimeString(),
-      production_tph: s.production_tph, o2_percent: s.o2_percent, specific_power_kwh_per_ton: s.specific_power_kwh_per_ton
+      production_tph: s.production_tph,
+      o2_percent: s.o2_percent,
+      specific_power_kwh_per_ton: s.specific_power_kwh_per_ton,
+      vhi_health_index: s.vhi_health_index ?? null,
+      mci_percent: s.mci_percent ?? null,
+      bearing_temp_rise_C: s.bearing_temp_rise_C ?? null,
     }]);
   }, []);
+
   const fetchSnapshotFast = useCallback(async (): Promise<Snapshot | null> => {
     if (!base) return null;
     for (const p of ["/snapshot","/snapshot?source=bq"]) {
@@ -252,6 +305,7 @@ export default function PlantAgentDashboard() {
     }
     return null;
   }, [base, getHeaders, pushHistory]);
+
   const fetchSnapshot = useCallback(async () => {
     const s = await fetchSnapshotFast();
     if (!s) setErrorMsg("Failed to fetch snapshot");
@@ -477,6 +531,7 @@ export default function PlantAgentDashboard() {
     if (!loadBefore || !loadAfter) return null;
     const keys: (keyof Snapshot)[] = [
       "production_tph","o2_percent","specific_power_kwh_per_ton","kiln_feed_tph","separator_dp_pa","id_fan_flow_Nm3_h","cooler_airflow_Nm3_h","kiln_speed_rpm",
+      "vhi_health_index","mci_percent"
     ];
     return keys.map((k) => {
       const b = Number((loadBefore as any)[k]); const a = Number((loadAfter as any)[k]);
@@ -490,6 +545,7 @@ export default function PlantAgentDashboard() {
     if (!routineBefore || !routineAfter) return null;
     const keys: (keyof Snapshot)[] = [
       "production_tph","o2_percent","specific_power_kwh_per_ton","kiln_feed_tph","separator_dp_pa","id_fan_flow_Nm3_h","cooler_airflow_Nm3_h","kiln_speed_rpm",
+      "vhi_health_index","mci_percent"
     ];
     return keys.map((k) => {
       const b = Number((routineBefore as any)[k]); const a = Number((routineAfter as any)[k]);
@@ -588,8 +644,8 @@ export default function PlantAgentDashboard() {
           )}
         </section>
 
-        {/* KPI Tiles */}
-        <section className="grid md:grid-cols-5 gap-4">
+        {/* KPI Tiles — now includes VHI & MCI */}
+        <section className="grid md:grid-cols-7 gap-4">
           {[
             { label: "Production (tph)", val: kpi?.production_tph },
             { label: "O₂ (%)", val: kpi?.o2_percent },
@@ -602,6 +658,22 @@ export default function PlantAgentDashboard() {
               <div className="text-2xl font-semibold mt-1">{fmt(t.val, 3)}</div>
             </div>
           ))}
+          {/* MCI tile */}
+          <div className="tile">
+            <div className="text-xs text-slate-500">Motor Current Imbalance (%)</div>
+            <div className="text-2xl font-semibold mt-1">{fmt(kpi?.mci_percent ?? null, 2)}</div>
+          </div>
+          {/* VHI tile with status */}
+          <div className="tile">
+            <div className="flex items-center justify-between">
+              <div className="text-xs text-slate-500">Vibration Health Index</div>
+              <Chip tone={statusTone(kpi?.vhi_status)}>{kpi?.vhi_status ?? "—"}</Chip>
+            </div>
+            <div className="mt-1">
+              <div className="text-2xl font-semibold">{fmt(kpi?.vhi_health_index ?? null, 2)}</div>
+              <div className="text-[11px] text-slate-500 mt-1">threshold: {fmt(kpi?.vhi_threshold ?? null, 2)}</div>
+            </div>
+          </div>
         </section>
 
         {/* Suggestions */}
@@ -695,9 +767,12 @@ export default function PlantAgentDashboard() {
                   <YAxis yAxisId="left" domain={["auto","auto"]} tick={{ fill: "#334155", fontSize: 12 }} axisLine={{ stroke: "#94a3b8" }} tickLine={{ stroke: "#94a3b8" }} />
                   <YAxis yAxisId="right" orientation="right" domain={["auto","auto"]} tick={{ fill: "#334155", fontSize: 12 }} axisLine={{ stroke: "#94a3b8" }} tickLine={{ stroke: "#94a3b8" }} />
                   <Tooltip /><Legend wrapperStyle={{ paddingTop: 8 }} />
-                  <Line yAxisId="left" type="monotone" dataKey="production_tph" name="Production (tph)" stroke="#0ea5e9" strokeWidth={2} dot={{ r: 2 }} isAnimationActive={false} connectNulls />
+                  <Line yAxisId="left"  type="monotone" dataKey="production_tph" name="Production (tph)" stroke="#0ea5e9" strokeWidth={2} dot={{ r: 2 }} isAnimationActive={false} connectNulls />
                   <Line yAxisId="right" type="monotone" dataKey="o2_percent" name="O₂ (%)" stroke="#22c55e" strokeWidth={2} dot={{ r: 2 }} isAnimationActive={false} connectNulls />
                   <Line yAxisId="right" type="monotone" dataKey="specific_power_kwh_per_ton" name="Specific Power (kWh/t)" stroke="#f59e0b" strokeWidth={2} dot={{ r: 2 }} isAnimationActive={false} connectNulls />
+                  {/* NEW lines */}
+                  <Line yAxisId="left"  type="monotone" dataKey="mci_percent" name="MCI (%)" stroke="#6366f1" strokeWidth={2} dot={{ r: 2 }} isAnimationActive={false} connectNulls />
+                  <Line yAxisId="left"  type="monotone" dataKey="vhi_health_index" name="VHI (index)" stroke="#ef4444" strokeWidth={2} dot={{ r: 2 }} isAnimationActive={false} connectNulls />
                 </LineChart>
               ) : (
                 <div className="h-full grid place-items-center text-slate-400 text-sm">No data to chart</div>
@@ -712,7 +787,7 @@ export default function PlantAgentDashboard() {
                 {Object.entries(snap).map(([k,v])=>(
                   <div key={k} className="flex justify-between border-b py-1">
                     <span className="text-slate-500">{k}</span>
-                    <span className="font-mono">{fmt(Number(v))}</span>
+                    <span className="font-mono">{typeof v === "number" ? fmt(v) : String(v ?? "—")}</span>
                   </div>
                 ))}
               </div>
